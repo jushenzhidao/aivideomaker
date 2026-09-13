@@ -326,6 +326,12 @@ def record_account(
     captcha_required: bool | None = None,
     reachable: bool | None = None,
     source: str = "",
+    plan_id: str | None = None,
+    plan_price_cents: int | None = None,
+    sub_status: str | None = None,
+    concurrency_limit: int | None = None,
+    days_to_renewal: float | None = None,
+    identity: str | None = None,
 ) -> None:
     """把一个账号的状态上报为 Logfire 指标（号池监控）。
 
@@ -343,6 +349,25 @@ def record_account(
     # `pid` 用来分辨是哪个进程报的：gunicorn 多 worker 时每个 worker 都会报一份
     # （采样器是进程内的），看板按 pid 过滤即可，不必因此关掉上报。
     attrs = {"upstream": upstream, "account": account, "source": source, "pid": os.getpid()}
+    # 订阅类字段走**标签**（低基数、便于按套餐分组），只有"还剩几天扣费"做成时间序列 ——
+    # 它对号池是可排期事件（到期/停订阅会让整条线不可用）。
+    # ⚠️ `identity`（邮箱）默认**不上报**（PII）：需要时由
+    # `AVM_ACCOUNT_REPORT_IDENTITY=1` 显式打开。
+    for key, val in (
+        ("plan_id", plan_id),
+        ("plan_price_cents", plan_price_cents),
+        ("sub_status", sub_status),
+        ("concurrency_limit", concurrency_limit),
+        ("identity", identity),
+    ):
+        if val is not None and val != "":
+            attrs[key] = val
+    if days_to_renewal is not None:
+        _gauge(
+            "avm.account.days_to_renewal",
+            unit="days",
+            description="距下次扣费还有几天（号池可排期事件）",
+        ).set(days_to_renewal, attributes=attrs)
     if credits is not None:
         _gauge(
             "avm.account.credits", unit="credits", description="账号剩余积分（号池监控）"

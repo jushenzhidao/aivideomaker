@@ -298,22 +298,86 @@ def _pool_accounts(app) -> list[tuple[str, str, str, object]]:
     return out
 
 
-def _sample_account(kind: str, up) -> dict:
-    """只读采样一个账号。**不抛异常**（抛了会让整轮上报断掉）。"""
-    sample = {"reachable": False, "credits": None, "captcha_required": None}
+# 套餐 → 并发上限。**来源是站点自己的 Stripe 商品描述，不是猜的**：
+#   prod_SymV739ojwmGEN  name="premium"  "… and 2 concurrent jobs so you can create faster."
+#   prod_SwAdxHcUSHOJIK  name="pro"      "… the ability to run 4 concurrent jobs—…"
+# 站点 FAQ 同口径：「高级套餐可拥有两个并发任务，专业套餐可拥有四个并发任务。」
+# 上游错误原文也只说 "The premium plan can only run 2 task at a time."。
+# 未知 planId ⇒ 报 `None` 并只告警一次（**不猜**，别把"没映射"读成"没限制"）。
+_PLAN_ID_CONCURRENCY = {
+    "prod_SymV739ojwmGEN": 2,
+    "prod_SwAdxHcUsHOJIK": 4,
+}
+_unknown_plans_warned: set = set()
+
+
+def _plan_concurrency(plan_id) -> int | None:
+    pid = str(plan_id or "").strip()
+    if not pid:
+        return None
+    if pid in _PLAN_ID_CONCURRENCY:
+        return _PLAN_ID_CONCURRENCY[pid]
+    if pid not in _unknown_plans_warned:
+        _unknown_plans_warned.add(pid)
+        logger.warning("号池：未知套餐 {} ⇒ 并发上限按未知处理（补 _PLAN_ID_CONCURRENCY）", pid)
+    return None
+
+
+def _sample_account(kind: str, up, settings) -> dict:
+    """只读采样一个账号（余额 / 闸门 / 订阅）。**不抛异常**（抛了会让整轮上报断掉）。"""
+    sample = {
+        "reachable": False, "credits": None, "captcha_required": None,
+        "plan_id": None, "plan_price_cents": None, "sub_status": None,
+        "concurrency_limit": None, "days_to_renewal": None, "identity": None,
+    }
     try:
         sample["credits"] = up.balance()
         sample["reachable"] = True
-    except Exception as e:  # noqa: BLE001 会话过期 / Key 失效 / 上游抖动都算"不可达"
+    except Exception as e:  # noqa: BLE001 会话过期 / 上游抖动都算"不可达"
         logger.warning(f"号池采样失败 upstream={kind}：{type(e).__name__}: {e}")
         return sample
-    if kind == "web":
-        # 闸门是**动态**的（按速率翻转），所以每轮都要现问，不能缓存 —— 这里
-        # 顺带把"开了多久才衰减"变成一条可回看的时间序列。
+    if kind != "web":
+        return sample
+
+    # 闸门是**动态**的（按速率翻转），每轮现问，不能缓存 —— 顺带把
+    # "开了多久才衰减"变成可回看的时间序列。
+    try:
+        sample["captcha_required"] = bool(up.client.needs_captcha())
+    except Exception as e:  # noqa: BLE001 问不到闸门不影响余额这一项
+        logger.warning(f"号池闸门探测失败：{type(e).__name__}: {e}")
+
+    # 订阅详情：套餐 / 价格 / 状态 / 下次扣费 —— 对号池这是**可排期**信息
+    # （哪天扣费、还剩几天、这个账号到底几并发）。
+    try:
+        sub = up.client.get_subscription() or {}
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"号池订阅探测失败：{type(e).__name__}: {e}")
+        sub = {}
+    if sub:
+        pid = str(sub.get("planId") or "").strip()
+        sample["plan_id"] = pid or None
+        sample["concurrency_limit"] = _plan_concurrency(pid)
+        price = sub.get("price")
+        sample["plan_price_cents"] = int(price) if isinstance(price, (int, float)) else None
+        sample["sub_status"] = str(sub.get("status") or "").strip() or None
+        nxt = str(sub.get("nextPaymentDate") or "").strip()
+        if nxt:
+            try:
+                from datetime import datetime, timezone
+
+                dt = datetime.fromisoformat(nxt.replace("Z", "+00:00"))
+                sample["days_to_renewal"] = round(
+                    (dt - datetime.now(timezone.utc)).total_seconds() / 86400, 2
+                )
+            except ValueError:
+                pass
+
+    if getattr(settings, "account_report_identity", False):
+        # PII 默认不开：只有显式 AVM_ACCOUNT_REPORT_IDENTITY=1 才把邮箱带上
         try:
-            sample["captcha_required"] = bool(up.client.needs_captcha())
-        except Exception as e:  # noqa: BLE001 问不到闸门不影响余额这一项
-            logger.warning(f"号池闸门探测失败：{type(e).__name__}: {e}")
+            sample["identity"] = str((up.client.get_user() or {}).get("email") or "") or None
+        except Exception:  # noqa: BLE001
+            pass
     return sample
 
 
@@ -321,7 +385,7 @@ async def _report_pool_once(app) -> list[tuple[str, str, str, dict]]:
     """采一轮并上报，返回本轮明细。**测试直接调它**，不必等定时器。"""
     out: list[tuple[str, str, str, dict]] = []
     for kind, account, source, up in _pool_accounts(app):
-        sample = await asyncio.to_thread(_sample_account, kind, up)
+        sample = await asyncio.to_thread(_sample_account, kind, up, app.state.settings)
         record_account(upstream=kind, account=account, source=source, **sample)
         out.append((kind, account, source, sample))
     return out
@@ -340,6 +404,8 @@ async def _account_reporter(app, seconds: int) -> None:
                         f"{kind}:{source}:{account[:6]}="
                         f"{sample['credits'] if sample['reachable'] else 'unreachable'}"
                         f"{'/captcha' if sample.get('captcha_required') else ''}"
+                        f"{('/plan=' + sample['plan_id']) if sample.get('plan_id') else ''}"
+                        f"{('/conc=%d' % sample['concurrency_limit']) if sample.get('concurrency_limit') else ''}"
                         for kind, account, source, sample in rows
                     ),
                 )

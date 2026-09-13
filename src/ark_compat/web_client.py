@@ -265,6 +265,19 @@ class WebClient:
         r = self.trpc("credits.getCredits", None, meta=VOID_INPUT, timeout=self.probe_timeout)
         return (r or {}).get("totalRemaining")
 
+    def get_subscription(self) -> dict | None:
+        """订阅详情（`billing.subscription`，只读）。
+
+        站点返回的是 `{id, userId, customerId, status, planId, price, variantId,
+        nextPaymentDate, startDate}` —— **没有套餐名**（"premium"/"pro" 只存在于站点
+        自己的商品描述里，见 app._PLAN_ID_CONCURRENCY 的注释）。
+
+        ⚠️ 返回值里有 `userId`/`customerId`，上报时**只取套餐与日期字段**，
+        账号身份一律用指纹（见 `observability.record_account`）。
+        """
+        r = self.trpc("billing.subscription", None, meta=VOID_INPUT, timeout=self.probe_timeout)
+        return r if isinstance(r, dict) else None
+
     def needs_captcha(self) -> bool:
         """这个账号现在要不要过 Turnstile？
 

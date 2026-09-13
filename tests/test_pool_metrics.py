@@ -62,10 +62,23 @@ class FakeWebUp:
     kind = "web"
     supports_cancel = False
 
-    def __init__(self, credits=796, captcha=False, boom=False):
+    # 站点返回的订阅形状（billing.subscription，实测字段）：没有套餐名，只有 planId
+    SUB = {
+        "status": "ACTIVE",
+        "planId": "prod_SymV739ojwmGEN",          # premium ⇒ 2 并发
+        "price": 4999,
+        "nextPaymentDate": "2099-12-10T03:50:58.000Z",
+    }
+
+    def __init__(self, credits=796, captcha=False, boom=False, sub=None, email="a@b.c"):
         self._credits = credits
         self._boom = boom
-        self.client = SimpleNamespace(needs_captcha=lambda: captcha)
+        _sub = self.SUB if sub is None else sub
+        self.client = SimpleNamespace(
+            needs_captcha=lambda: captcha,
+            get_subscription=lambda: _sub,
+            get_user=lambda: {"email": email},
+        )
 
     def balance(self):
         if self._boom:
@@ -304,6 +317,106 @@ def asyncio_run(coro):
     import asyncio
 
     return asyncio.run(coro)
+
+
+
+class TestSubscriptionReporting(MetricsCase):
+    """订阅信息也要进遥测（号池的可排期信息：套餐、并发上限、还有几天扣费）。"""
+
+    def test_subscription_fields_land_in_attributes_and_gauge(self):
+        O.record_account(
+            upstream="web", account="abc", source="process",
+            credits=796, captcha_required=False, reachable=True,
+            plan_id="prod_SymV739ojwmGEN", plan_price_cents=4999,
+            sub_status="ACTIVE", concurrency_limit=2, days_to_renewal=87.5,
+        )
+        attrs = self.named("avm.account.credits")[0][2]
+        self.assertEqual(attrs["plan_id"], "prod_SymV739ojwmGEN")
+        self.assertEqual(attrs["plan_price_cents"], 4999)
+        self.assertEqual(attrs["sub_status"], "ACTIVE")
+        self.assertEqual(attrs["concurrency_limit"], 2)
+        ren = self.named("avm.account.days_to_renewal")
+        self.assertEqual([p[1] for p in ren], [87.5], "距扣费天数要做成时间序列")
+        self.assertEqual(ren[0][2]["account"], "abc")
+
+    def test_absent_fields_are_not_reported(self):
+        O.record_account(upstream="web", account="abc", credits=1)
+        attrs = self.named("avm.account.credits")[0][2]
+        for k in ("plan_id", "plan_price_cents", "sub_status", "concurrency_limit"):
+            self.assertNotIn(k, attrs)
+        self.assertEqual(self.named("avm.account.days_to_renewal"), [])
+
+
+class TestPlanMapping(unittest.TestCase):
+    """套餐 → 并发数：来源是站点自己的商品描述，**未知就不猜**。"""
+
+    def test_verified_plan_ids(self):
+        from ark_compat.app import _plan_concurrency
+
+        self.assertEqual(_plan_concurrency("prod_SymV739ojwmGEN"), 2)   # premium
+        self.assertEqual(_plan_concurrency("prod_SwAdxHcUsHOJIK"), 4)   # pro
+
+    def test_unknown_plan_is_none_and_warns_only_once(self):
+        from ark_compat import app as app_mod
+
+        app_mod._unknown_plans_warned.clear()
+        self.assertIsNone(app_mod._plan_concurrency("prod_NEW_UNKNOWN"))
+        self.assertIsNone(app_mod._plan_concurrency("prod_NEW_UNKNOWN"))
+        self.assertEqual(len(app_mod._unknown_plans_warned), 1, "同一未知套餐只该记一次")
+
+    def test_empty_plan_is_none(self):
+        from ark_compat.app import _plan_concurrency
+
+        self.assertIsNone(_plan_concurrency(""))
+
+
+class TestSamplerCollectsSubscription(unittest.TestCase):
+    def setUp(self):
+        O.reset_gauge_cache()
+
+    def test_sample_carries_plan_and_renewal_days(self):
+        from ark_compat.app import _sample_account
+
+        up = FakeWebUp(credits=920)
+        s = settings()
+        sample = _sample_account("web", up, s)
+        self.assertTrue(sample["reachable"])
+        self.assertEqual(sample["credits"], 920)
+        self.assertEqual(sample["plan_id"], "prod_SymV739ojwmGEN")
+        self.assertEqual(sample["concurrency_limit"], 2)
+        self.assertEqual(sample["sub_status"], "ACTIVE")
+        self.assertEqual(sample["plan_price_cents"], 4999)
+        self.assertIsInstance(sample["days_to_renewal"], float)
+        self.assertGreater(sample["days_to_renewal"], 0)
+
+    def test_identity_is_opt_in(self):
+        from ark_compat.app import _sample_account
+
+        up = FakeWebUp()
+        self.assertIsNone(_sample_account("web", up, settings())["identity"],
+                          "默认不上报 PII")
+        self.assertEqual(
+            _sample_account("web", up, settings(account_report_identity=True))["identity"],
+            "a@b.c",
+        )
+
+    def test_subscription_failure_does_not_break_the_sample(self):
+        from ark_compat.app import _sample_account
+
+        def boom():
+            raise RuntimeError("billing down")
+
+        up = FakeWebUp(credits=1)
+        up.client.get_subscription = boom
+        sample = _sample_account("web", up, settings())
+        self.assertEqual(sample["credits"], 1, "订阅读不到不该影响余额")
+        self.assertIsNone(sample["plan_id"])
+
+    def test_settings_knob(self):
+        self.assertFalse(Settings.from_env({}).account_report_identity)
+        self.assertTrue(
+            Settings.from_env({"AVM_ACCOUNT_REPORT_IDENTITY": "1"}).account_report_identity
+        )
 
 
 if __name__ == "__main__":
