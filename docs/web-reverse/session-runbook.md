@@ -339,4 +339,3 @@ node tools/session-diagnose.mjs --submit
 | TTL 怎么测出来的、同批 cookie 各自何时过期 | [`cookies.md`](./cookies.md) |
 | tRPC 内部接口清单、Prisma 数据模型、积分池口径 | [`README.md`](./README.md) |
 | 适配层如何对外暴露 OpenAI / MiniMax / Ark 协议 | [`src/web-adapter/README.md`](../../src/web-adapter/README.md) |
-| 官方 API（不过期、无验证码）怎么用 | 官方线：`docs/official/` 与 skill `aivideomaker-api` |

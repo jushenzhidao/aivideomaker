@@ -213,7 +213,7 @@ report.probes.push(user);
 const gate = await sendGet('model.needsCaptcha', cookie, { userId: user.sent ? (user.data?.id ?? null) : null });
 report.probes.push(gate);
 
-// 3. credit pool (shared with the official API)
+// 3. credit pool（站点账号余额）
 const credits = await sendGet('credits.getCredits', cookie, null, VOID_INPUT);
 report.probes.push(credits);
 

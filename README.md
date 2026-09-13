@@ -42,7 +42,7 @@ aivideomaker/
 ├── .env.example                       环境变量模板
 ├── requirements.txt                   兼容层依赖（fastapi/uvicorn/httpx/loguru/logfire）
 ├── Dockerfile                         非 root 镜像
-├── docker-compose.yml                 容器编排（默认 web，但会被 .env 覆盖 —— 见「部署」）
+├── docker-compose.yml                 容器编排（web 线）
 ├── .github/workflows/release.yml      打 tag 发版：Release + GHCR 多架构镜像
 ├── src/
 │   ├── ark_compat/                    ★ 火山方舟 Seedance 协议兼容层（FastAPI）
@@ -59,7 +59,7 @@ aivideomaker/
 │       ├── submit-queue.mjs           提交队列（并发闸门 + 延迟执行 + 退避重试）
 │       ├── tests/                     端到端测试（fixtures/ 内素材、archive/ 一次性探针）
 │       └── tools/                     check-session / session-diagnose / credit-report / collect-tasks / upload
-├── tests/                             Python 单测（241 项，零消耗、零外发）
+├── tests/                             Python 单测（220 项，零消耗、零外发）
 ├── docs/
 │   ├── web-reverse/
 │   │   ├── README.md                  调研笔记（接口形态、数据模型、待办）
@@ -118,15 +118,18 @@ npm run credits   # 积分消耗对账
 pip install -r requirements.txt
 
 export AVM_COOKIE="auth_session=…"     # 唯一需要的凭据
-export AVM_UPSTREAM=web                # ⚠️ 必设：代码默认值是 official
 export AVM_GATE_KEY=sk-local           # 本机闸门（不设则对任何调用方开放）
 
 python3 src/ark_server.py --port 8808  # base_url: http://127.0.0.1:8808/api/v3
 ```
 
-> ⚠️ **`AVM_UPSTREAM=web` 必须显式设置。**
-> `src/ark_compat/settings.py` 里的默认值是 `official`（官方线上游：提交即计费、无免费窗口）。
-> 容器编排（`docker-compose.yml`）已把默认值写成 `web`，但**直接跑 `ark_server.py` 不会应用该默认值**。
+> ⚠️ **`AVM_UPSTREAM` 已废弃。** 本项目只剩 web 一条上游（official 线已移除），不再需要选线。
+> 旧配置里若还留着它且值不是 `web`，服务会在启动时**明确报错**并要求删掉 —— 这是刻意的：
+> 静默忽略会让调用方以为自己还在用另一条线。
+>
+> **多租户场景改用透传**：`export AVM_PASSTHROUGH_COOKIE=1`，调用方的
+> `Authorization: Bearer` 直接携带自己的网页会话 cookie，本进程不再需要 `AVM_COOKIE`；
+> 它与 `AVM_GATE_KEY` 互斥（同一个 Bearer 不可能既是闸门密钥又是上游凭据）。
 
 ```python
 from arkruntime import Ark

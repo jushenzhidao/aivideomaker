@@ -15,7 +15,6 @@
 // env:
 //   AVM_COOKIE   raw Cookie header value (required)
 //   AVM_USER_ID  optional; auto-resolved via auth.user
-//   AVM_KEY      optional; if set, /generate uses the official /api/v1 API
 //   PORT         8787
 
 import http from 'node:http';
@@ -44,7 +43,6 @@ if (!cookie) {
 }
 
 const avm = new AvmClient({ cookie, userId: process.env.AVM_USER_ID });
-const useOfficialApi = !!process.env.AVM_KEY;
 
 // warm up: resolve userId + captcha requirement so /healthz can report it
 const boot = { userId: null, needsCaptcha: null, error: null };
@@ -54,7 +52,7 @@ try {
 } catch (e) {
   boot.error = e.message;
 }
-console.log(`[avm-proxy] userId=${boot.userId} needsCaptcha=${boot.needsCaptcha} officialApi=${useOfficialApi}`);
+console.log(`[avm-proxy] userId=${boot.userId} needsCaptcha=${boot.needsCaptcha}`);
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -67,7 +65,6 @@ const server = http.createServer(async (req, res) => {
         userId: boot.userId,
         needsCaptcha: boot.needsCaptcha,
         visitorId: avm.visitorId,
-        mode: useOfficialApi ? 'api' : 'web',
         bootError: boot.error,
       });
     }
@@ -123,19 +120,8 @@ server.listen(PORT, () => console.log(`[avm-proxy] listening on :${PORT}`));
 async function handleGenerate(params, url, res) {
   const t0 = Date.now();
 
-  if (useOfficialApi) {
-    const r = await fetch('https://aivideomaker.ai/api/v1/generate/minimax', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'user-agent': 'Mozilla/5.0', key: process.env.AVM_KEY },
-      body: JSON.stringify(buildBody(params)),
-    });
-    const txt = await r.text();
-    let parsed; try { parsed = JSON.parse(txt); } catch { parsed = txt; }
-    return send(res, 200, { mode: 'api', ms: Date.now() - t0, upstreamStatus: r.status, upstream: parsed });
-  }
-
   const taskId = await avm.create(params);
-  const out = { mode: 'web', taskId, ms: Date.now() - t0 };
+  const out = { taskId, ms: Date.now() - t0 };
 
   if (url.searchParams.get('wait') === '1') {
     const w = await avm.waitForTask(taskId, { timeoutMs: +(url.searchParams.get('timeoutMs') || 600_000) });

@@ -1,19 +1,14 @@
 # web 逆向侧
 
-aivideomaker.ai 对外提供两套能力，本项目按两条线分别维护：
+本项目只对接 aivideomaker.ai 的**网页端内部接口**：
 
-| 线 | 入口 | 认证 | 状态 |
-|---|---|---|---|
-| **官方 API** | `https://aivideomaker.ai/api/v1/*` | `key` 请求头（[在设置页创建](https://aivideomaker.ai/zh/app/settings/account/api-keys)） | ✅ 已打通，文档见 `docs/official/` |
-| **web 逆向** | 网页端内部接口（tRPC over `/api/*`） | 登录会话 Cookie（`auth_session`） | ✅ 已实现，代码见 `src/web-adapter/` |
+| 入口 | 认证 | 状态 |
+|---|---|---|
+| 网页端内部接口（tRPC over `/api/*`） | 登录会话 Cookie（`auth_session`） | ✅ 已实现，代码见 `src/web-adapter/` |
 
 > 本目录是**调研笔记**（接口形态、数据模型、模型清单、Cookie 机制）；
 > **实现与对接文档**在 [`src/web-adapter/README.md`](../../src/web-adapter/README.md)，两者互补。
 > 会话检测工具：`src/web-adapter/tools/check-session.mjs`（Node）与 `src/web_session.py`（Python）。
-
-官方 `llms.txt` 声明「API credits 与网站订阅是两回事」——该说法针对**订阅权益**成立；
-但实测**积分池是同一个**：`credits.getCredits` 的 `totalRemaining` 与
-官方 API `GET /api/v1/account` 的 `currentBalance` 数值一致（2026-09-13 实测均为 796）。
 
 ---
 
@@ -23,7 +18,7 @@ aivideomaker.ai 对外提供两套能力，本项目按两条线分别维护：
 
 抓取并归档了公开页面与前端 JS，从中提取出关键情报：
 
-1. **网页端模型清单（11 个）**，其中 **7 个官方 API 未开放**：
+1. **网页端模型清单（11 个）**，其中 **7 个是网页端独家**：
    `seedance2`、`seedance25`、`kling2_5`、`kling3`、`ltx23`、`veo3Fast`、`veo31Fast`。
    完整对照表见 [`model-inventory.md`](./model-inventory.md)。
 

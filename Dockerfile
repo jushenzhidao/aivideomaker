@@ -8,7 +8,7 @@
 # load_dotenv），所以 .env 既不需要也不应该进镜像。compose 会在启动时把 .env 里的
 # 值通过 environment 注入。
 #
-#   docker run --rm -p 8808:8808 -e AVM_KEY=ak_xxx -v avm-tasks:/data \
+#   docker run --rm -p 8808:8808 -e AVM_COOKIE="auth_session=…" -v avm-tasks:/data \
 #     ghcr.io/yuanjie-ai/aivideomaker:latest
 #
 # 注：这里刻意**不用** `# syntax=docker/dockerfile:1` —— 该指令会强制去 Docker Hub
@@ -22,7 +22,7 @@ FROM python:3.12-slim
 ARG APP_VERSION=dev
 
 LABEL org.opencontainers.image.title="aivideomaker ark-compat" \
-      org.opencontainers.image.description="aivideomaker.ai → 火山方舟 Seedance 协议兼容层（official + web 双上游）" \
+      org.opencontainers.image.description="aivideomaker.ai → 火山方舟 Seedance 协议兼容层（上游：网页端内部接口）" \
       org.opencontainers.image.source="https://github.com/yuanjie-ai/aivideomaker" \
       org.opencontainers.image.version="${APP_VERSION}"
 

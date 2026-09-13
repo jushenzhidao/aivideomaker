@@ -39,7 +39,6 @@ AVM_COOKIE='auth_session=xxx; NEXT_LOCALE=zh; ...' node proxy.mjs
 | `AVM_COOKIE` | 读 `cookies.json` | 原始 Cookie 头，必需 |
 | `AVM_USER_ID` | 自动从 `auth.user` 解析 | 列表接口要用 |
 | `COOKIES_FILE` | `./cookies.json` | cookie 文件备选来源 |
-| `AVM_KEY` | — | 设了就走官方 `/api/v1/generate/minimax` |
 | `PORT` | `8787` | 监听端口 |
 
 ## 路由
@@ -495,7 +494,7 @@ await fetch(uploadUrl, { method: 'PUT', headers, body });
 
 - **取消任务：站点没有暴露端点。** 探测过 `model-status/cancel|delete|abort`、`ai.cancelTask|cancel|deleteTask|delete|remove`、`task.cancel`、`video.delete` 等 13 个候选，全部 404。（`POST /v1/responses/:id/cancel` 因此返回 400。）
   注意：**删记录**是有接口的（`model.deleteModel`，见上），但删记录 ≠ 取消生成。
-- **账号要验证码时此路不通**（且这是动态的，见上）。可用 BYO token、等衰减、或 `AVM_KEY` 官方接口。
+- **账号要验证码时此路不通**（且这是动态的，见上）。可用 BYO token，或等闸门衰减。
 - **`model-status/token` 会 429。** 高频轮询别走 SSE 路径；`/api/model-status` 对未接单任务还会挂死，已加超时。
 - **响应记录registry在内存里**，重启后 `resp_xxx` 失效（MiniMax 侧无状态，不受影响）。
 - **session 会过期**，cookie 失效后重新导一份。

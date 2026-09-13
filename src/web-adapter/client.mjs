@@ -172,9 +172,8 @@ export class AvmClient {
   /**
    * Authoritative credit balance — tRPC `credits.getCredits`.
    *
-   * The web account's credits pool is SHARED with the official API: this
-   * `totalRemaining` equals `GET /api/v1/account` → `currentBalance`
-   * (both were 796 on 2026-09-13).  So this doubles as the API-side balance.
+   * 这是**站点账号**的积分余额，消耗的就是这份池子（免费窗口省下的也是它）。
+   * 2026-09-13 实测 `totalRemaining` = 796。
    */
   async getCredits() {
     const r = await this.trpc('credits.getCredits', null, { meta: VOID_INPUT });
@@ -216,7 +215,7 @@ export class AvmClient {
         'account currently requires a Turnstile captcha (model.needsCaptcha=true). ' +
         'This is a dynamic, velocity-based gate, not an account property. ' +
         'Supply a fresh Turnstile token via params.token, wait for it to decay, ' +
-        'or use the official API with AVM_KEY.',
+        'or spread the submissions out.',
       );
       err.code = 'CAPTCHA_REQUIRED';
       throw err;

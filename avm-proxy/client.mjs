@@ -113,7 +113,7 @@ export class AvmClient {
         'account currently requires a Turnstile captcha (model.needsCaptcha=true). ' +
         'This is a dynamic, velocity-based gate, not an account property. ' +
         'Supply a fresh Turnstile token via params.token, wait for it to decay, ' +
-        'or use the official API with AVM_KEY.',
+        'or spread the submissions out.',
       );
       err.code = 'CAPTCHA_REQUIRED';
       throw err;

@@ -1,6 +1,6 @@
 # aivideomaker ark 兼容层 —— compose 部署
 #
-#   cp .env.example .env      # 填 AVM_KEY / AVM_COOKIE（.env 已被 gitignore）
+#   cp .env.example .env      # 填 AVM_COOKIE（.env 已被 gitignore）
 #   docker compose up -d      # 拉 GHCR 上的镜像
 #   docker compose up -d --build   # 或从当前源码本地构建
 #   docker compose logs -f
@@ -34,25 +34,15 @@ services:
       ARK_HOST: 0.0.0.0
       ARK_PORT: "8808"
 
-      # ---- 两条上游（都配齐就都能用，不是二选一）----
-      # 本项目**主要跑免费档**，而免费窗口只在 web 线：tier=turbo 且 duration ≤8s
-      # （translate.FREE_MAX_DURATION=8）。official 线**提交即计费、没有免费窗口**，
-      # 所以这里默认取 web —— 把默认落在计费线上是这套配置里最贵的一个坑。
-      # 要改用 official 线请显式设 AVM_UPSTREAM=official，并配好 AVM_OFFICIAL_MAX_CREDITS
-      # （官方线不设全局上限时，每个请求必须自带 max_credits，否则一律 400 拒绝）。
-      AVM_UPSTREAM: ${AVM_UPSTREAM:-web}
-      AVM_KEY: ${AVM_KEY:-}
+      # ---- 上游：只有 web 线（网页端内部接口）----
+      # 免费窗口只在这里：tier=turbo 且 duration ≤8s（translate.FREE_MAX_DURATION=8）。
       AVM_COOKIE: ${AVM_COOKIE:-}
       AVM_BASE_URL: ${AVM_BASE_URL:-https://aivideomaker.ai}
       AVM_VISITOR_ID: ${AVM_VISITOR_ID:-}
       AVM_USER_ID: ${AVM_USER_ID:-}
-      # official 线全局支出上限；留空则每个请求必须自带 max_credits，否则 400
-      AVM_OFFICIAL_MAX_CREDITS: ${AVM_OFFICIAL_MAX_CREDITS:-}
-      AVM_OFFICIAL_MODEL: ${AVM_OFFICIAL_MODEL:-}
-      # 透传：调用方自带凭据（Bearer 即上游凭据）。**与上面的 AVM_GATE_KEY 互斥**
-      # —— 单一 Bearer 不可能既是闸门密钥又是上游凭据，同设时服务拒绝启动并说明原因。
-      # 只开 AVM_PASSTHROUGH_COOKIE 时记得同时写 AVM_UPSTREAM=web。
-      AVM_PASSTHROUGH_KEY: ${AVM_PASSTHROUGH_KEY:-0}
+      # 透传模式：调用方的 Bearer 就是网页会话 cookie，本容器不再需要 AVM_COOKIE。
+      # ⚠️ 它与 AVM_GATE_KEY **互斥**：同一个 Authorization: Bearer 不可能既是闸门
+      #    密钥又是上游凭据，同设会在 Settings.validate() 处直接拒绝启动。
       AVM_PASSTHROUGH_COOKIE: ${AVM_PASSTHROUGH_COOKIE:-0}
 
       # ---- 服务自身 ----
@@ -64,9 +54,9 @@ services:
       # ---- 上游闸门与 worker（见 src/gunicorn_conf.py 顶部两条硬约束）----
       # 默认组合 workers=2 + 全局额度 2 ⇒ 每 worker 1、实际全局仍是 2：
       # 拿到了 worker 级故障隔离，又没有超出上游"同时只跑 2 个"的限制。
-      # ⚠️ 免费档全部走 web 线，因此这个 **2 槽位就是免费请求的吞吐上限** ——
-      #    加 worker 不会提高吞吐（上游不放行），只会增加故障隔离。要提吞吐只有
-      #    两条路：缩短单次占用时间，或走 official 线（计费）。
+      # ⚠️ 闸门只有 2 个槽位，所以这个 **2 就是请求吞吐上限** —— 加 worker 不会提高
+      #    吞吐（上游不放行），只会增加故障隔离。要提吞吐只有一条路：缩短单次占用
+      #    时间（注意超过 8s 就跨进计费区了）。
       AVM_MAX_CONCURRENT: ${AVM_MAX_CONCURRENT:-2}
       AVM_WORKERS: ${AVM_WORKERS:-2}
       AVM_POLL_SECONDS: ${AVM_POLL_SECONDS:-10}
