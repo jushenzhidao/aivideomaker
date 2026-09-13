@@ -3,12 +3,23 @@
 
 2026-09-14 实测（node-064 / Ubuntu 22.04 / Chrome 153 / 出口 64.81.112.31）：
 
-| 模式              | 结果                              |
-|-------------------|-----------------------------------|
-| `--headless=new`  | **0/4**，每个 46 秒 TIMEOUT（挂死）|
-| 有头（xvfb-run）  | **8/8**，平均 **3.7 秒/个**        |
+| 模式                        | 结果                                 |
+|-----------------------------|--------------------------------------|
+| `--headless=new`            | **0/4**，每个 46 秒 TIMEOUT（挂死）   |
+| 有头（xvfb-run）            | **8/8**，平均 **3.7 秒/个**           |
 
 ⇒ **headless 不可行，Xvfb 有头可行**。别再为省资源去试无头。
+
+**性能对照（同机同 Chrome，量“秒/个”）：**
+
+| 方案                                            | 秒/个 | 说明                                  |
+|-------------------------------------------------|-------|---------------------------------------|
+| 每个 token 新开标签页 + 加载应用页              | 3.38  | 最笨的做法                            |
+| 一个热页面反复 render                           | 2.39  | 省掉标签页与页面加载（**-29%**）      |
+| **同 origin 的轻量页 + 注入 CF api.js**（默认） | **1.72** | 省掉整个 Next.js bundle（**-49%**） |
+
+⚠️ **但铸造不是瓶颈**：pro 账号 4 并发 × 任务 ~2 分钟 ⇒ 只需 **1 token / 30 秒**，
+而本工具 **1.7 秒/个（≈17 倍富余）**。要提吞吐该去加账号，别在这里抠速度。
 
 用法:
     N=3 /usr/bin/python3 /tmp/minter.py               # 有头（Xvfb）
@@ -34,6 +45,12 @@ import websocket
 PORT = 9222
 SITEKEY = os.environ.get("SITEKEY", "0x4AAAAAABrddy3Hsje8mwB_")
 ORIGIN = os.environ.get("ORIGIN", "https://aivideomaker.ai/zh/ai-video-generator")
+# 同 origin 的轻量页（sitekey 按域名生效，任何同源页面都行）—— 比加载整个应用页快一倍
+LIGHT_URL = os.environ.get("LIGHT_URL", "https://aivideomaker.ai/robots.txt")
+CF_API = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+INJECT_API = ("(()=>{if(window.__cfInjected)return;window.__cfInjected=true;"
+             "const s=document.createElement('script');s.src=%s;s.async=true;"
+             "(document.head||document.documentElement).appendChild(s);})()" % json.dumps(CF_API))
 N = int(os.environ.get("N", "1"))
 HEADLESS = os.environ.get("HEADLESS", "0") == "1"
 KEEP = os.environ.get("KEEP", "0") == "1"
@@ -116,7 +133,56 @@ MINT_JS = """
 PROBE = "typeof window.turnstile + '|' + document.readyState + '|' + location.href"
 
 
+def open_warm_page(bc):
+    """打开一个**轻量页**并注入 CF api.js，返回 (targetId, sessionId)。"""
+    created = bc.call("Target.createTarget", url="about:blank")
+    tid = created["result"]["targetId"]
+    sess = bc.call("Target.attachToTarget", targetId=tid, flatten=True)["result"]["sessionId"]
+    bc.call("Page.enable", session=sess)
+    bc.call("Page.navigate", session=sess, url=LIGHT_URL)
+    time.sleep(1.5)
+    bc.call("Runtime.evaluate", session=sess, returnByValue=True, expression=INJECT_API)
+    return tid, sess
+
+
+def mint_on(bc, sess, i):
+    """在**已预热**的页面上 render 一次（轻量页 ≈1.7s）。"""
+    t0 = time.time()
+    ready = False
+    for _ in range(45):
+        v = val_of(bc.call("Runtime.evaluate", session=sess, returnByValue=True, expression=PROBE)) or ""
+        if v.startswith("object"):
+            ready = True
+            break
+        time.sleep(1)
+    if not ready:
+        v = val_of(bc.call("Runtime.evaluate", session=sess, returnByValue=True, expression=PROBE)) or ""
+        print(f"  #{i} 页面未就绪：{str(v)[:120]}")
+        return None, time.time() - t0
+    val = val_of(bc.call("Runtime.evaluate", session=sess, expression=MINT_JS,
+                         awaitPromise=True, returnByValue=True))
+    dt = time.time() - t0
+    if isinstance(val, dict) and val.get("ok"):
+        print(f"  #{i} token len={len(val['token'])} 铸造耗时={dt:.2f}s head={val['token'][:24]}...")
+        return val["token"], dt
+    print(f"  #{i} 失败：{val}（耗时 {dt:.2f}s）")
+    return None, dt
+
+
 def mint(bc, i):
+    """兼容旧用法：单次铸造（内部开一个轻量页）。"""
+    tid, sess = open_warm_page(bc)
+    try:
+        return mint_on(bc, sess, i)
+    finally:
+        try:
+            bc.call("Target.closeTarget", targetId=tid)
+        except Exception:
+            pass
+
+
+def mint_legacy_app_page(bc, i):
+    """旧路径（加载整个应用页）：轻量页万一失效时回退用。"""
     t0 = time.time()
     created = bc.call("Target.createTarget", url="about:blank")
     tid = created["result"]["targetId"]
@@ -157,11 +223,25 @@ def main():
     print("浏览器：", ver.get("Browser"), "| headless =", HEADLESS)
     bc = CDP(ver["webSocketDebuggerUrl"])
     tokens, times = [], []
-    for i in range(1, N + 1):
-        tok, dt = mint(bc, i)
-        if tok:
-            tokens.append(tok)
-        times.append(dt)
+    if os.environ.get("LEGACY_APP_PAGE", "0") == "1":
+        for i in range(1, N + 1):
+            tok, dt = mint_legacy_app_page(bc, i)
+            if tok:
+                tokens.append(tok)
+            times.append(dt)
+    else:
+        tid, sess = open_warm_page(bc)          # ★ 一个热页面反复用（默认轻量页）
+        try:
+            for i in range(1, N + 1):
+                tok, dt = mint_on(bc, sess, i)
+                if tok:
+                    tokens.append(tok)
+                times.append(dt)
+        finally:
+            try:
+                bc.call("Target.closeTarget", targetId=tid)
+            except Exception:
+                pass
     with open("/tmp/tokens.txt", "w") as f:
         f.write("\n".join(tokens))
     if times:
