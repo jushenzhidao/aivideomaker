@@ -236,6 +236,20 @@ class TestPoolSampling(MetricsCase):
 class TestReporterWiring(unittest.TestCase):
     """`0` 要真的关掉，`>0` 要真的起来 —— 且**不依赖遥测出口是否可用**。"""
 
+    def setUp(self):
+        # 必须**先真正 configure 一次**（send_to_logfire=False）：否则把
+        # `_LOGFIRE_READY` 置真之后，上报循环里的 `logfire.metric_gauge()` 会触发
+        # logfire 的**自动初始化**，它会在自己的线程池里发起外发连接 ——
+        # 测试进程里就凭空多出一次出网（实测由 socket.connect 拦截定位到
+        # `logfire/_internal/integrations/executors.py`）。
+        self.reader = InMemoryMetricReader()
+        logfire.configure(
+            send_to_logfire=False,
+            console=False,
+            metrics=logfire.MetricsOptions(additional_readers=[self.reader]),
+        )
+        self.addCleanup(O.reset_gauge_cache)
+
     def _run_app(self, seconds: int, logfire_ready: bool) -> dict:
         from fastapi.testclient import TestClient
 
