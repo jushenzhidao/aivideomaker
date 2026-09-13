@@ -324,6 +324,33 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
 - **函数参数不自动记录**：`inspect_arguments=False`（参数里可能有 key/token）。
 - 装配失败只降级、不致命（`/healthz` 的 `logfire` 字段会显示 `false`）。
 
+### 号池指标（余额 / 闸门 / 可达性）
+
+透传之后，"这个进程手里有哪些账号、各剩多少积分、闸门开没开"必须看得见。做法是
+**周期性的只读采样 → Logfire 指标**（`AVM_ACCOUNT_REPORT_SECONDS`，默认 300s，`0`=关）：
+
+| 指标 | 含义 |
+|---|---|
+| `avm.account.credits` | 剩余积分。**两线是同一个积分池**，所以 official 与 web 采到的是同一个数 |
+| `avm.account.captcha_required` | 当前是否需要 Turnstile（`1`=需要）。它**按速率动态翻转**，只有时间序列才看得出"开多久会衰减" |
+| `avm.account.reachable` | 凭据是否可用（`0`=会话过期 / API Key 失效） |
+
+- 标签只有：`upstream` / `account`（**凭据 sha256 前 16 位**）/ `source`
+  （`process`=本进程持凭据，`passthrough`=调用方自带）/ `pid`。
+  🔴 **凭据原文绝不进遥测** —— `tests/test_pool_metrics.py` 专门守这条，并做了变异测试。
+- **只读**：`credits.getCredits` / `GET /api/v1/account` / `model.needsCaptcha` ——
+  不创建任务、不计费（实测：连续采样期间余额不变）。
+- **采集与出口解耦**：Logfire 未装配或出口不通时**照样采样**，只是指标不可用
+  （启动日志会写明"仅本地日志"，`/healthz.accounts_tracked` 仍给号池规模）。
+  这里踩过坑：曾把两者绑在一起，结果恰恰是"出口坏掉的那一刻"什么都看不到。
+  另实测：服务进程内经沙箱代理导出 logfire 偶尔撞 10s 读超时（`logfire-us.pydantic.dev`
+  单发 curl 是 200 / 4.4s ⇒ 是"慢"不是"不通"），给足时间不打断即可正常导出。
+- **采样失败不影响服务**：某个账号不可达 ⇒ `reachable=0`，且**不报一个假的余额 0**；
+  一轮失败不会让上报停摆（`test_report_survives_repeated_cycles`）。
+- ⚠️ 多 worker 会各报一份（指标带 `pid`，看板过滤一个即可）。
+- `/healthz` **只给数量**（`accounts_tracked`），不列明细 —— 它不鉴权，而透传模式下
+  明细就是别人的账号。
+
 ## 未验证项（诚实清单）
 
 | 项 | 状态 |

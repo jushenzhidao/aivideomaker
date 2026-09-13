@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from contextlib import contextmanager
@@ -289,3 +290,78 @@ def span(name: str, **attrs: Any):
 
 def logfire_ready() -> bool:
     return _LOGFIRE_READY
+
+
+# ------------------------------------------------------- 号池指标（余额 / 闸门）----
+#
+# 为什么是**指标**而不是 span 属性：余额与闸门状态要看的是**时间序列**（"什么时候
+# 掉到 0"、"闸门开了多久才衰减"），而 span 属性只能在 trace 里逐条翻。
+#
+# 为什么走独立采样循环而不是挂在请求路径上：给每个请求加一次上游只读调用，
+# 会把请求延迟和"我们向上游发请求的频次"一起抬上去 —— 而频次恰恰是站点风控
+# （Turnstile 闸门）的触发维度之一。宁可每 N 分钟统一采一次。
+
+_GAUGES: dict = {}
+
+
+def _gauge(name: str, *, unit: str, description: str):
+    """懒建并缓存指标对象。
+
+    每次 `logfire.metric_gauge()` 都新建会让 SDK 侧重复注册同名仪表；而 logfire
+    没装配时提前建也不合适（对象会绑在当时的全局 provider 上）。
+    """
+    g = _GAUGES.get(name)
+    if g is None:
+        import logfire
+
+        g = logfire.metric_gauge(name, unit=unit, description=description)
+        _GAUGES[name] = g
+    return g
+
+
+def record_account(
+    *,
+    upstream: str,
+    account: str,
+    credits: int | None = None,
+    captcha_required: bool | None = None,
+    reachable: bool | None = None,
+    source: str = "",
+) -> None:
+    """把一个账号的状态上报为 Logfire 指标（号池监控）。
+
+    🔴 `account` **必须是凭据指纹**（`sha256(凭据)[:16]`），**绝不能是凭据原文** ——
+    trace / 指标同样是外发数据，把 cookie 或 API Key 写进去等于把凭据交出去。
+    这条由 `tests/test_pool_metrics.py` 专门把关（含变异测试）。
+
+    三项互相独立，缺哪项就不报哪项：
+      - `credits`          剩余积分（站点两线的积分是**同一池**，所以两线数值一致）
+      - `captcha_required` Turnstile 动态闸门是否开启（web 线才有；只读探测）
+      - `reachable`        凭据本身是否可用（会话/Key 有效）
+    """
+    if not _LOGFIRE_READY:
+        return
+    # `pid` 用来分辨是哪个进程报的：gunicorn 多 worker 时每个 worker 都会报一份
+    # （采样器是进程内的），看板按 pid 过滤即可，不必因此关掉上报。
+    attrs = {"upstream": upstream, "account": account, "source": source, "pid": os.getpid()}
+    if credits is not None:
+        _gauge(
+            "avm.account.credits", unit="credits", description="账号剩余积分（号池监控）"
+        ).set(credits, attributes=attrs)
+    if captcha_required is not None:
+        _gauge(
+            "avm.account.captcha_required",
+            unit="1",
+            description="该账号当前是否需要 Turnstile 验证码（1=需要）",
+        ).set(int(bool(captcha_required)), attributes=attrs)
+    if reachable is not None:
+        _gauge(
+            "avm.account.reachable",
+            unit="1",
+            description="凭据是否可用（1=可用；0=会话过期/Key 失效）",
+        ).set(int(bool(reachable)), attributes=attrs)
+
+
+def reset_gauge_cache() -> None:
+    """测试用：丢掉已缓存的指标对象（换了 provider / reader 之后必须重建）。"""
+    _GAUGES.clear()

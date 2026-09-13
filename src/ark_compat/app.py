@@ -52,7 +52,7 @@ import json
 import time
 import uuid
 import warnings
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
@@ -65,6 +65,8 @@ from .observability import (
     clip,
     describe_error,
     instrument_fastapi,
+    logfire_ready,
+    record_account,
     set_upstream_calls,
     setup_observability,
     span,
@@ -323,6 +325,98 @@ def _is_dry_run(request: Request, body: dict) -> bool:
     return isinstance(extra, dict) and extra.get("aivideomaker_dry_run") is True
 
 
+# ------------------------------------------------------------- 号池采样 ----
+#
+# 为什么要它：透传之后"这个进程手里有哪些账号、各自还剩多少积分、闸门开没开"
+# 只能靠翻日志猜。余额是**号池的耗尽信号**，闸门是**免费档的可用性信号**，
+# 两者都需要时间序列，所以做成指标（而不是挂在某个 span 上）。
+#
+# 三条硬约束：
+#   1. **只读**：只用 credits.getCredits / GET /api/v1/account / model.needsCaptcha——
+#      都不创建任务、不计费。
+#   2. **凭据原文绝不外发**：标签用 sha256 前 16 位指纹（`_fingerprint`）。
+#   3. **采样失败不能影响服务**：任何异常都转成 `reachable=0`，并把异常挡在
+#      上报循环内部（一轮失败不该让上报永久停摆）。
+
+
+def _fingerprint(secret: str) -> str:
+    """凭据指纹（sha256 前 16 位）。**绝不外发凭据原文。**"""
+    if not secret:
+        return ""
+    return hashlib.sha256(str(secret).encode()).hexdigest()[:16]
+
+
+def _pool_accounts(app) -> list[tuple[str, str, str, object]]:
+    """号池视图：``(upstream, 凭据指纹, 来源, 上游对象)``。
+
+    来源两种：`process` = 本进程持有凭据（AVM_KEY / AVM_COOKIE）；
+    `passthrough` = 调用方自带凭据（每个凭据一个上游对象）。
+    """
+    s = app.state.settings
+    out: list[tuple[str, str, str, object]] = []
+    for kind, up in sorted(app.state.upstreams.items()):
+        raw = s.upstream_key if kind == "official" else s.cookie
+        out.append((kind, _fingerprint(raw or kind), "process", up))
+    for token, up in list(app.state.passthrough_upstreams.items()):
+        out.append(("official", _fingerprint(token), "passthrough", up))
+    for key, up in list(app.state.passthrough_web.items()):
+        # web 透传的缓存键**本身**就是 cookie 的 sha256[:16]，直接复用
+        out.append(("web", key, "passthrough", up))
+    return out
+
+
+def _sample_account(kind: str, up) -> dict:
+    """只读采样一个账号。**不抛异常**（抛了会让整轮上报断掉）。"""
+    sample = {"reachable": False, "credits": None, "captcha_required": None}
+    try:
+        sample["credits"] = up.balance()
+        sample["reachable"] = True
+    except Exception as e:  # noqa: BLE001 会话过期 / Key 失效 / 上游抖动都算"不可达"
+        logger.warning(f"号池采样失败 upstream={kind}：{type(e).__name__}: {e}")
+        return sample
+    if kind == "web":
+        # 闸门是**动态**的（按速率翻转），所以每轮都要现问，不能缓存 —— 这里
+        # 顺带把"开了多久才衰减"变成一条可回看的时间序列。
+        try:
+            sample["captcha_required"] = bool(up.client.needs_captcha())
+        except Exception as e:  # noqa: BLE001 问不到闸门不影响余额这一项
+            logger.warning(f"号池闸门探测失败：{type(e).__name__}: {e}")
+    return sample
+
+
+async def _report_pool_once(app) -> list[tuple[str, str, str, dict]]:
+    """采一轮并上报，返回本轮明细。**测试直接调它**，不必等定时器。"""
+    out: list[tuple[str, str, str, dict]] = []
+    for kind, account, source, up in _pool_accounts(app):
+        sample = await asyncio.to_thread(_sample_account, kind, up)
+        record_account(upstream=kind, account=account, source=source, **sample)
+        out.append((kind, account, source, sample))
+    return out
+
+
+async def _account_reporter(app, seconds: int) -> None:
+    """周期性上报号池状态。自身永不抛出 —— 观测功能不该拖倒服务。"""
+    while True:
+        try:
+            rows = await _report_pool_once(app)
+            if rows:
+                logger.info(
+                    "号池上报 n={} 明细={}",
+                    len(rows),
+                    " ".join(
+                        f"{kind}:{source}:{account[:6]}="
+                        f"{sample['credits'] if sample['reachable'] else 'unreachable'}"
+                        f"{'/captcha' if sample.get('captcha_required') else ''}"
+                        for kind, account, source, sample in rows
+                    ),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 一轮失败不该让上报停摆
+            logger.warning(f"号池上报这一轮失败：{type(e).__name__}: {e}")
+        await asyncio.sleep(seconds)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
@@ -331,7 +425,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
+        # 号池上报：**只读**探测 + Logfire 指标。
+        # ⚠️ 刻意**不**因"Logfire 未装配/出口不通"就停止采样 —— 采集与出口是两件事。
+        # 本次实测踩到：服务进程内经沙箱代理导出 logfire 会撞 10s 读超时而超时。
+        # 若那时连采样也停掉，就正好在"出口坏了"这个最需要数据的时刻彻底瞎掉；
+        # 现在出口不通时至少还有本地日志里的号池视图。
+        reporter = None
+        if settings.account_report_seconds > 0:
+            reporter = asyncio.create_task(
+                _account_reporter(app, settings.account_report_seconds)
+            )
+            # 挂到 state 上：运维与测试都要能一眼看出"上报到底起没起、指标通不通"
+            app.state.account_reporter = reporter
+            app.state.account_metrics_enabled = logfire_ready()
+            logger.info(
+                "号池上报已启用：每 {}s 采样一次；指标{}",
+                settings.account_report_seconds,
+                "已接入 Logfire" if logfire_ready() else "不可用（Logfire 未装配）⇒ 仅本地日志",
+            )
         yield
+        if reporter is not None:
+            reporter.cancel()
+            with suppress(asyncio.CancelledError):
+                await reporter
         # 停机收尾：把上游客户端关掉。轮询线程是 daemon，会随之结束；这里只做
         # "尽力而为"的连接回收，失败不影响退出码。
         closed = 0
@@ -459,6 +575,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "passthrough_key": s.passthrough_key,
             "passthrough_cookie": s.passthrough_cookie,
             "credentials_from_caller": s.passthrough,
+            # 号池规模：**只给数量，不列明细** —— /healthz 不鉴权，透传模式下明细
+            # 就是别人的账号（余额与指纹）。明细走 Logfire 指标。
+            "accounts_tracked": len(_pool_accounts(request.app)),
             "default_model": s.default_model or None,
             "max_credits": s.max_credits,
             "tasks_tracked": request.app.state.tasks.count(),

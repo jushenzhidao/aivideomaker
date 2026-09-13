@@ -105,6 +105,9 @@ class Settings:
     # False 时忽略 HTTP_PROXY / macOS scutil 代理。本地或对回环上游自测时设
     # AVM_NO_TRUST_ENV=1，否则请求会被代理走并拿到网关的 502。
     trust_env: bool = True
+    # 号池上报周期（秒）：每 N 秒把**每个凭据**的余额 / 闸门状态作为 Logfire 指标
+    # 上报（只读探测）。0 = 关闭；Logfire 未装配时**不采样**（避免白打上游）。
+    account_report_seconds: int = 300
 
     # ---- 任务持久化 ----
     # sqlite 是默认后端（跨重启可读）；memory 是**显式**的开发/测试开关 —— 重启即丢，
@@ -144,6 +147,7 @@ class Settings:
             logfire_capture_headers=_env_flag(env, "AVM_LOGFIRE_CAPTURE_HEADERS"),
             logfire_max_chars=int(env.get("AVM_LOGFIRE_MAX_CHARS") or 20000),
             trust_env=not _env_flag(env, "AVM_NO_TRUST_ENV"),
+            account_report_seconds=int(env.get("AVM_ACCOUNT_REPORT_SECONDS") or 300),
         )
 
     @property
