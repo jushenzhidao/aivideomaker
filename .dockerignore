@@ -1,0 +1,39 @@
+# 构建上下文瘦身 + 防泄漏。
+# ⚠️ 这是独立于 .gitignore 的第二套规则，改一处不要假设另一处跟着变。
+# 本仓库 avm-proxy/ 有 1 万+ 文件（含 node_modules），不加本文件会让每次构建
+# 都把整个目录上传给 docker daemon。
+
+# ---- 凭据与运行态：绝不进镜像 ----
+.env
+.env.*
+!.env.example
+**/cookies.json
+**/cookie_*
+**/.session-state.json
+.ark-tasks.db*
+
+# ---- 运行期不需要（已确认 src/ 只在注释里提到 docs/）----
+docs/
+avm-proxy/
+assets/
+tests/
+*.log
+
+# ---- 工具链与本地状态 ----
+.git/
+.github/
+.workbuddy/
+.gitignore
+.dockerignore
+Dockerfile
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+node_modules/
+**/node_modules/
+.idea/
+.vscode/
+.DS_Store

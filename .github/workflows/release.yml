@@ -1,0 +1,180 @@
+name: Release
+
+# push 到 main 即发版：自增 patch → 打 tag → 建 Release → 推 GHCR 镜像（linux/amd64）。
+# 版本号只存 tag，不写回任何 manifest 文件 —— 写回需要向主干提交，而 GITHUB_TOKEN
+# 推送的提交不会触发任何 workflow，会静默破坏依赖该提交的流水线。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 建 tag / Release
+  packages: write   # 推 ghcr.io
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # 并发会争抢版本号与 tag，必须串行
+
+jobs:
+  release:
+    # 逃生阀：提交信息里带跳过标记就不发版。
+    # ⚠️ 这个字面量不得出现在任何"需要发版"的提交信息里 —— 它匹配整条 message，
+    #    连"给逃生阀写说明"的那次提交自己也会命中，job 直接 skipped。
+    #    中招时用 workflow_dispatch 补跑（该路径 head_commit 为 null，已用 || '' 兜底）。
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message || '', '[skip release]') }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.next }}
+      version_bare: ${{ steps.ver.outputs.next_bare }}
+      prev: ${{ steps.ver.outputs.prev }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 浅克隆拿不到历史 tag ⇒ 版本号永远从 v0.0.1 起算
+
+      - name: Resolve next version
+        id: ver
+        run: |
+          set -euo pipefail
+          # --sort=-v:refname：字典序会把 v1.9.0 判为新于 v1.10.0
+          # glob 限定三段纯数字，顺带把 latest 这类滚动指针排除在外
+          PREV=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
+          BASE="${PREV:-v0.0.0}"
+          CORE="${BASE#v}"
+          IFS=. read -r MA MI PA <<< "$CORE"
+          PA="${PA%%[-+]*}"          # 预发布后缀（v1.2.3-rc.1）会让 $(( )) 报错
+          NEXT="v${MA}.${MI}.$((PA + 1))"
+          {
+            echo "prev=${PREV}"
+            echo "next=${NEXT}"
+            echo "next_bare=${NEXT#v}"
+          } >> "$GITHUB_OUTPUT"
+          echo "prev=${PREV:-<none>} -> next=${NEXT}"
+
+      - name: Build changelog
+        id: log
+        run: |
+          set -euo pipefail
+          PREV='${{ steps.ver.outputs.prev }}'
+          if [ -z "$PREV" ]; then RANGE=HEAD; else RANGE="${PREV}..HEAD"; fi
+          {
+            echo 'body<<CHANGELOG_EOF'
+            echo '## Changes'
+            # --max-count：首个 release 时 RANGE=HEAD 会走完整历史，长仓正文会很大
+            git log "$RANGE" --max-count=50 --pretty='- %s (%h)' --no-merges || echo '- Initial release'
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -a '${{ steps.ver.outputs.version }}' -m 'Release ${{ steps.ver.outputs.version }}'
+          git push origin '${{ steps.ver.outputs.version }}'
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 经 env 传值而不是内联到 shell：提交信息里出现单引号会把
+          # `--notes '...'` 撕开，导致 release 建不出来或正文被截断。
+          BODY: ${{ steps.log.outputs.body }}
+          TAG: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$BODY" > /tmp/notes.md
+          # 本仓是直推 main、没有合并 PR ⇒ --generate-notes 只会产出一行 compare 链接，
+          # 所以 changelog 由上面的 git log 自己生成后经 --notes-file 传入。
+          gh release create "$TAG" \
+            --title "Release $TAG" \
+            --notes-file /tmp/notes.md
+
+  image:
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.version }}   # 构建的必须是刚打的那个 tag
+
+      - name: Build and push (linux/amd64)
+        id: build
+        env:
+          VERSION: ${{ needs.release.outputs.version_bare }}
+        run: |
+          set -euo pipefail
+          IMAGE="${IMAGE,,}"                 # GHCR 要求仓库路径全小写
+          echo "image=${IMAGE}  version=${VERSION}"
+
+          echo '${{ secrets.GITHUB_TOKEN }}' \
+            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+          # 一次 build 出三个 tag。git tag 带 v 前缀，镜像 tag 不带（组织惯例）。
+          docker build \
+            --build-arg APP_VERSION="${VERSION}" \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:sha-$(git rev-parse --short=7 HEAD)" \
+            .
+
+          # digest 只从 push 输出里读。
+          # ⚠️ 不要用 `docker inspect --format '{{.RepoDigests}}'` 比较三个 tag ——
+          #    RepoDigests 是「仓库级」而非「tag 级」，三个 tag 会读到同一个值，
+          #    那样的门禁恒真、永远拦不住任何东西。
+          : > /tmp/digests.txt
+          for T in "${VERSION}" latest "sha-$(git rev-parse --short=7 HEAD)"; do
+            OUT="$(docker push "${IMAGE}:${T}" 2>&1)"
+            printf '%s\n' "$OUT" | tail -n 3
+            D="$(printf '%s' "$OUT" \
+                 | sed -n 's/.*digest: \(sha256:[a-f0-9]\{64\}\).*/\1/p' | tail -n1)"
+            [ -n "$D" ] || { echo "::error::没能从 push 输出里解析出 ${T} 的 digest"; exit 1; }
+            printf '%s -> %s\n' "$T" "$D"
+            printf '%s=%s\n' "$T" "$D" >> /tmp/digests.txt
+          done
+
+          UNIQ="$(cut -d= -f2 /tmp/digests.txt | sort -u | wc -l | tr -d ' ')"
+          cat /tmp/digests.txt
+          if [ "${UNIQ}" -ne 1 ]; then
+            echo "::error::三个 tag 的 manifest digest 不一致（${UNIQ} 种）—— 不是同一次 build"
+            exit 1
+          fi
+          DIGEST="$(cut -d= -f2 /tmp/digests.txt | head -n1)"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+          # 去掉本地 tag，让下面的冒烟测试必须真的回 registry 取
+          for T in "${VERSION}" latest "sha-$(git rev-parse --short=7 HEAD)"; do
+            docker image rm "${IMAGE}:${T}" >/dev/null 2>&1 || true
+          done
+
+      - name: Smoke test the pushed digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IMAGE="${IMAGE,,}"
+          # 按 digest 测，测的是"推上去的那个产物"，不是本地刚 build 的镜像
+          docker pull "${IMAGE}@${DIGEST}"
+
+          CID="$(docker run -d -p 8808:8808 \
+            -e AVM_DISABLE_LOGFIRE=1 \
+            -e AVM_TASK_STORE=memory \
+            "${IMAGE}@${DIGEST}")"
+          trap 'docker logs "${CID}" 2>&1 | tail -n 30 || true; docker rm -f "${CID}" >/dev/null 2>&1 || true' EXIT
+
+          OK=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8808/healthz -o /tmp/healthz.json; then OK=1; break; fi
+            sleep 1
+          done
+          if [ "$OK" -ne 1 ]; then
+            echo "::error::容器 30s 内没有对外提供 /healthz"
+            exit 1
+          fi
+
+          cat /tmp/healthz.json
+          # AVM_DISABLE_LOGFIRE=1 / AVM_TASK_STORE=memory 保证冒烟测试零外发、不落 DB 文件
+          python3 -c "import json;d=json.load(open('/tmp/healthz.json'));assert d.get('ok') is True, d;print('healthz ok |', d.get('service'), '| task_store =', d.get('task_store'))"
