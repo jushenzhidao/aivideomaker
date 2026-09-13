@@ -34,10 +34,6 @@ DEFAULT_BASE_URL = "https://aivideomaker.ai"
 
 TASK_STORES = ("sqlite", "memory")
 
-# 已经取消的选线开关。曾经有 official / web 两条上游，现在只剩 web；
-# 保留这个名字只为在 `validate()` 里对旧配置**明确报错**（见该方法的说明）。
-LEGACY_UPSTREAM_ENV = "AVM_UPSTREAM"
-
 
 def _env_flag(env: Mapping[str, str], key: str) -> bool:
     return str(env.get(key, "")).strip() in ("1", "true", "True", "yes")
@@ -66,12 +62,6 @@ class Settings:
     visitor_id: str = ""
     max_concurrent: int = 2
     poll_interval: float = 10.0
-
-    # ---- 历史配置的报错面 ----
-    # AVM_UPSTREAM 是已取消的选线开关，这里只用于 `validate()` 报错，不参与任何
-    # 决策。静默忽略它会让"以为在跑另一条线"变成没人发现的事实 —— 那正是本项目
-    # 最忌讳的半成品状态（配置写了、代码没读、还不报错）。
-    legacy_upstream: str = ""
 
     # ---- 通用 ----
     base_url: str = DEFAULT_BASE_URL
@@ -115,7 +105,6 @@ class Settings:
             visitor_id=str(env.get("AVM_VISITOR_ID", "")).strip(),
             max_concurrent=int(env.get("AVM_MAX_CONCURRENT") or 2),
             poll_interval=float(env.get("AVM_POLL_SECONDS") or 10),
-            legacy_upstream=str(env.get(LEGACY_UPSTREAM_ENV, "")).strip().lower(),
             base_url=str(env.get("AVM_BASE_URL", DEFAULT_BASE_URL)).rstrip("/"),
             gate_key=str(env.get("AVM_GATE_KEY", "")).strip(),
             # 服务名可用 AVM_SERVICE_NAME 临时覆盖，但默认值只有一个来源
@@ -157,15 +146,6 @@ class Settings:
         if self.task_store not in TASK_STORES:
             raise ValueError(
                 f"AVM_TASK_STORE 必须是 {TASK_STORES} 之一（收到 {self.task_store!r}）"
-            )
-
-        if self.legacy_upstream and self.legacy_upstream != "web":
-            # 旧配置写着 official（本项目已移除该上游）。这里必须**拒绝启动**：
-            # 静默按 web 线跑起来的话，调用方会以为自己还在用那条可取消、有幂等的线，
-            # 实际拿到的却是"没有取消端点"的 web 线 —— 这个误解只在任务卡住时暴露。
-            raise ValueError(
-                f"{LEGACY_UPSTREAM_ENV}={self.legacy_upstream!r}：本项目已移除 official 上游，"
-                "只剩 web 线。请删除该变量（推荐做法），或显式写成 web。"
             )
 
         if self.passthrough_cookie and self.gate_key:

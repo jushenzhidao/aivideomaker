@@ -142,19 +142,6 @@ class TestPassthroughCookieConfig(unittest.TestCase):
         s = Settings.from_env({"AVM_PASSTHROUGH_COOKIE": "1"})
         self.assertTrue(s.passthrough_cookie)
 
-    def test_removed_official_line_is_rejected_loudly(self):
-        # official 上游已移除。旧配置里写着它时必须**拒绝启动** —— 静默按 web 跑起来
-        # 会让调用方以为自己用的是一条可取消、有幂等的线，实际拿到的是"没有取消端点"
-        # 的 web 线；这个误解只在任务卡住时暴露。
-        with self.assertRaises(ValueError) as ctx:
-            settings(legacy_upstream="official").validate()
-        self.assertIn("AVM_UPSTREAM='official'", str(ctx.exception))
-        self.assertIn("web", str(ctx.exception))
-
-    def test_legacy_upstream_web_is_tolerated(self):
-        # 旧配置里写着 web 的属于无意义但无害，不该拦
-        settings(legacy_upstream="web").validate()
-
     def test_gate_and_passthrough_cannot_coexist(self):
         with self.assertRaises(ValueError) as ctx:
             settings(gate_key="sk-gate").validate()
@@ -217,23 +204,17 @@ class TestBearerIsTheCookie(PassthroughHttpCase):
         self.assertTrue(r.json()["dry_run"])
         self.assertEqual(r.json()["upstream"], "web")
 
-    def test_removed_upstream_selector_is_rejected(self):
-        # 旧客户端可能还在发 X-Avm-Upstream: official。明确 400，而不是静默按 web 跑。
-        r = self.client.post(
-            TASKS_PATH,
-            json=body(extra_body={"aivideomaker_dry_run": True}),
-            headers={**auth(TOKEN_A), "X-Avm-Upstream": "official"},
-        )
-        self.assertEqual(r.status_code, 400)
-        self.assertIn("official", r.json()["error"]["message"])
-
-    def test_explicit_web_selector_is_tolerated(self):
-        r = self.client.post(
-            TASKS_PATH,
-            json=body(extra_body={"aivideomaker_dry_run": True}),
-            headers={**auth(TOKEN_A), "X-Avm-Upstream": "web"},
-        )
-        self.assertEqual(r.status_code, 200)
+    def test_upstream_selector_headers_are_ignored(self):
+        """选线已彻底移除：旧的 `X-Avm-Upstream` / `?upstream=` 不再被解析，也不报错 ——
+        请求一律走 web 线。"""
+        for value in ("official", "nope"):
+            r = self.client.post(
+                TASKS_PATH,
+                json=body(extra_body={"aivideomaker_dry_run": True}),
+                headers={**auth(TOKEN_A), "X-Avm-Upstream": value},
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["upstream"], "web")
 
     def test_same_credential_reuses_one_upstream(self):
         before = len(self.builder.calls)

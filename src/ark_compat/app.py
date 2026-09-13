@@ -208,18 +208,6 @@ def _upstream_for(request: Request):
     """
     settings = request.app.state.settings
 
-    # 旧客户端可能还在发选线头。曾经有 official 线，现在没有 —— 明确拒绝，
-    # 而不是静默按 web 跑（那会让调用方以为自己用的是另一条线）。
-    want = str(
-        request.headers.get("x-avm-upstream") or request.query_params.get("upstream") or ""
-    ).strip().lower()
-    if want and want != "web":
-        raise ArkError(
-            400,
-            "InvalidParameter",
-            f"unknown upstream {want!r}：本项目只剩 web 线（official 已移除）",
-        )
-
     if settings.passthrough_cookie:
         raw = _bearer(request)
         if not raw:

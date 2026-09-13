@@ -116,7 +116,7 @@ class WiringTest(unittest.TestCase):
     def test_settings_from_env_expands_bare_token(self):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            s = Settings.from_env({"AVM_COOKIE": TOKEN, "AVM_UPSTREAM": "web"})
+            s = Settings.from_env({"AVM_COOKIE": TOKEN})
         self.assertEqual(s.cookie, f"auth_session={TOKEN}")
         self.assertTrue(s.web_ready)
 

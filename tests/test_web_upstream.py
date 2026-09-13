@@ -7,7 +7,7 @@
 覆盖三块：
   1. `sniff` —— 按真实字节识别媒体类型（不信扩展名）
   2. `WebClient` —— tRPC 信封解包、验证码闸门、上传链路、读任务的三级回落
-  3. `WebSubmitQueue` + app 层 —— 并发闸门、`AVM_UPSTREAM=web` 的对外行为
+  3. `WebSubmitQueue` + app 层 —— 并发闸门与对外 Ark 协议行为
 
 运行：python3 tests/test_web_upstream.py
 """
@@ -541,7 +541,7 @@ def ark_body(**kw) -> dict:
 
 
 class TestWebAppLayer(unittest.TestCase):
-    """`AVM_UPSTREAM=web` 时对外仍是一套 Ark 协议。"""
+    """对外永远是一套 Ark 协议。"""
 
     def setUp(self):
         self.app = create_app(web_settings())
@@ -671,22 +671,12 @@ class TestWebOnlyUpstream(unittest.TestCase):
         self.assertEqual(j["upstream"], "web")
         self.assertFalse(j["effective"]["billed"])  # 480p/5s/turbo 落在免费窗口内
 
-    def test_removed_upstream_selector_is_rejected(self):
-        """旧客户端可能还在发 X-Avm-Upstream: official —— 明确 400，不许静默按 web 跑。"""
-        r = self.client.post(TASKS_PATH, json=ark_body(), headers={"X-Avm-Upstream": "official"})
-        self.assertEqual(r.status_code, 400)
-        self.assertEqual(r.json()["error"]["code"], "InvalidParameter")
-        self.assertIn("official", r.json()["error"]["message"])
-
-    def test_explicit_web_selector_is_tolerated(self):
-        body = ark_body(extra_body={"aivideomaker_dry_run": True})
-        j = self.client.post(TASKS_PATH, json=body, headers={"X-Avm-Upstream": "web"}).json()
-        self.assertEqual(j["upstream"], "web")
-
-    def test_unknown_upstream_is_rejected(self):
-        r = self.client.post(TASKS_PATH, json=ark_body(), headers={"X-Avm-Upstream": "nope"})
-        self.assertEqual(r.status_code, 400)
-        self.assertEqual(r.json()["error"]["code"], "InvalidParameter")
+    def test_upstream_selector_headers_are_ignored(self):
+        """选线已彻底移除：旧的 X-Avm-Upstream / ?upstream= 不再被解析，也不报错。"""
+        for value in ("official", "nope"):
+            body = ark_body(extra_body={"aivideomaker_dry_run": True})
+            j = self.client.post(TASKS_PATH, json=body, headers={"X-Avm-Upstream": value}).json()
+            self.assertEqual(j["upstream"], "web")
 
 
 class TestSettingsContract(unittest.TestCase):
@@ -699,16 +689,6 @@ class TestSettingsContract(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             Settings(cookie="").validate()
         self.assertIn("AVM_COOKIE", str(ctx.exception))
-
-    def test_removed_official_line_is_rejected(self):
-        with self.assertRaises(ValueError) as ctx:
-            Settings(cookie="auth_session=y", legacy_upstream="official").validate()
-        self.assertIn("official", str(ctx.exception))
-
-    def test_from_env_tolerates_the_legacy_web_value(self):
-        s = Settings.from_env({"AVM_UPSTREAM": "WEB", "AVM_COOKIE": "auth_session=x"})
-        self.assertEqual(s.legacy_upstream, "web")
-        s.validate()  # 不应抛
 
 
 if __name__ == "__main__":

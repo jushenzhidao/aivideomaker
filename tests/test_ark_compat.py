@@ -351,16 +351,6 @@ class TestConfig(unittest.TestCase):
             Settings(cookie="").validate()
         Settings(cookie="auth_session=x").validate()  # 不应抛
 
-    def test_legacy_upstream_official_is_rejected(self):
-        # 旧配置写着已移除的 official 线时必须报错，而不是静默按 web 跑
-        with self.assertRaises(ValueError) as ctx:
-            Settings(cookie="auth_session=x", legacy_upstream="official").validate()
-        self.assertIn("official", str(ctx.exception))
-
-    def test_legacy_upstream_web_is_tolerated(self):
-        Settings(cookie="auth_session=x", legacy_upstream="web").validate()
-
-
 class TestObservability(unittest.TestCase):
     """logfire 装配必须可失败降级 —— 追踪装不上不能拖倒服务。"""
 

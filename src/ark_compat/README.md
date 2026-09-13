@@ -109,16 +109,11 @@ cookie 本身**（裸 token 或完整 Cookie 串都行），本进程不再需�
 ## 上游选线（已移除）
 
 早期这里同时支持一条 `official` 上游（aivideomaker 官方 `/api/v1/*`，`key` 头），
-可按 `AVM_UPSTREAM` / `X-Avm-Upstream` / `?upstream=` 切换。**该上游已整体移除**，
-本项目只对接 web 线。
+可按 `AVM_UPSTREAM` / `X-Avm-Upstream` / `?upstream=` 切换。**该上游与选线机制已整体
+移除**，本项目只对接 web 线，且**不保留任何兼容层**：
 
-保留的只有报错面：
-
-- 旧配置里若还有 `AVM_UPSTREAM` 且值不是 `web` → **拒绝启动**并提示删除；
-- 旧客户端若还发 `X-Avm-Upstream: official` → **400 InvalidParameter**（`web` 可放行）。
-
-两处都是刻意报错而非静默忽略：让调用方以为自己还在用另一条线（尤其是一条**可取消**
-的线），比直接失败危险得多。
+- `AVM_UPSTREAM` 不再被读取（`Settings` 里没有这个字段，设了也无效）；
+- `X-Avm-Upstream` / `?upstream=` 不再被解析 —— 发了也一律走 web 线，不报错。
 
 ## 路由
 
@@ -389,5 +384,4 @@ tests/
 | web | `NOT_FOUND` | `TaskNotFound` | 404 |
 | 本地 | 上游未配置 | `UpstreamUnavailable` | 503 |
 | 本地 | 参数不合法 / 上游不具备该能力 | `InvalidParameter` | 400 |
-| 本地 | 已移除的选线头（`X-Avm-Upstream: official`） | `InvalidParameter` | 400 |
 | 任一 | 网络 / 上游 5xx | `NETWORK_ERROR` / `UpstreamError` | 502 |

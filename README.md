@@ -123,10 +123,6 @@ export AVM_GATE_KEY=sk-local           # 本机闸门（不设则对任何调用
 python3 src/ark_server.py --port 8808  # base_url: http://127.0.0.1:8808/api/v3
 ```
 
-> ⚠️ **`AVM_UPSTREAM` 已废弃。** 本项目只剩 web 一条上游（official 线已移除），不再需要选线。
-> 旧配置里若还留着它且值不是 `web`，服务会在启动时**明确报错**并要求删掉 —— 这是刻意的：
-> 静默忽略会让调用方以为自己还在用另一条线。
->
 > **多租户场景改用透传**：`export AVM_PASSTHROUGH_COOKIE=1`，调用方的
 > `Authorization: Bearer` 直接携带自己的网页会话 cookie，本进程不再需要 `AVM_COOKIE`；
 > 它与 `AVM_GATE_KEY` 互斥（同一个 Bearer 不可能既是闸门密钥又是上游凭据）。
@@ -157,11 +153,6 @@ Seedance 2.5「全能参考」上限为**图 4 / 视频 1 / 音频 2**，超限�
 cp .env.example .env      # 填 AVM_COOKIE（.env 已被 gitignore）
 docker compose up -d      # 宿主端口见 AVM_HOST_PORT（默认 8808）
 ```
-
-> ⚠️ **compose 的「默认 web」会被 `.env` 覆盖。** `docker-compose.yml` 里写的是
-> `AVM_UPSTREAM: ${AVM_UPSTREAM:-web}`，但 compose 会读取同目录 `.env` 参与插值，
-> 而 `.env.example` 模板里当前的值是 `AVM_UPSTREAM=official` —— **照模板抄一份就会落到计费线上。**
-> 部署前确认 `.env` 中为 `AVM_UPSTREAM=web`，或直接删掉该行让 compose 的默认值生效。
 
 **多 worker 是这里唯一的坑。** 上游闸门是进程内 `threading.Semaphore`，「全局只跑 2 个」依赖
 单进程：开 N 个 worker 会让实际并发变成 N×2，第 3 个起上游直接返回 `The queue is full`
