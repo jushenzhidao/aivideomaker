@@ -339,3 +339,19 @@ node tools/session-diagnose.mjs --submit
 | TTL 怎么测出来的、同批 cookie 各自何时过期 | [`cookies.md`](./cookies.md) |
 | tRPC 内部接口清单、Prisma 数据模型、积分池口径 | [`README.md`](./README.md) |
 | 适配层如何对外暴露 OpenAI / MiniMax / Ark 协议 | [`src/web-adapter/README.md`](../../src/web-adapter/README.md) |
+
+
+## Turnstile token 铸造器（2026-09-14 定型，见 `tools/turnstile_minter.py`）
+
+闸门开着时 `token: null` 会被静默拒，所以**每次提交都要带一个真 token**。铸造器 = 一个
+常驻的 **Xvfb 有头 Chrome**（不是无头！）＋ 原生 CDP：在**真实 origin** 的页面里
+`turnstile.render({sitekey})`，回调拿到 token（~730~816 字符），约 **3~4 秒/个**。
+
+要点：
+- **必须真实 origin**：sitekey 与页面同源；在 `about:blank` 渲染会 110200。
+  sitekey 可从含 turnstile 的 chunk 里挖（生成器页是 `1474-*.js`）。
+- **单次有效**：提交一次铸一个，别缓存复用。
+- **同出口 IP**：铸造与提交走同一个出口（本仓实测同机连投 OK；跨 IP 未实测）。
+- **无头 0/4 超时、有头 3/4 秒** ⇒ 部署用 `xvfb-run -a`，别用 `--headless=new`。
+- 并发天花板由套餐决定：`ai.queryUserPermission.maxQueueLength`（premium 2 / pro 4），
+  超限原文：`"The queue is full. The <plan> plan can only run N task at a time."`
