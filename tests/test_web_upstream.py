@@ -560,7 +560,7 @@ class TestWebAppLayer(unittest.TestCase):
         j = r.json()
         self.assertEqual(j["upstream"], "web")
         self.assertFalse(j["effective"]["billed"], "turbo / 5s 落在 web 线免费区")
-        self.assertIn("free up to 8s", j["effective"]["billing_note"])
+        self.assertIn("free up to 10s", j["effective"]["billing_note"])
         self.assertIn("web_params", j)
 
     def test_dry_run_tier_base_is_billed(self):
@@ -660,7 +660,7 @@ class TestWebOnlyUpstream(unittest.TestCase):
         j = self.client.get("/healthz").json()
         self.assertEqual(j["available_upstreams"], ["web"])
         self.assertFalse(j["supports_cancel"]["web"], "web 线没有取消端点，不许谎报")
-        self.assertIn("free up to 8s", j["billing_notes"]["web"])
+        self.assertIn("free up to 10s", j["billing_notes"]["web"])
         # 已移除的官方线不该在健康检查里留下任何字段
         for gone in ("switch_via", "max_credits", "default_model", "passthrough_key"):
             self.assertNotIn(gone, j, f"{gone} 属于已移除的 official 线")

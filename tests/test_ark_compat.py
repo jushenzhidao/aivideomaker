@@ -79,7 +79,7 @@ class TestSnapDuration(unittest.TestCase):
     def test_prefer_free_pulls_billed_durations_back_under_the_line(self):
         """`prefer_free` 的用途是**主动省钱**：合法但已计费的时长要能拉回免费区。"""
         self.assertEqual(T.snap_duration(12, "480p"), 12)
-        self.assertEqual(T.snap_duration(12, "480p", prefer_free=True), 8)
+        self.assertEqual(T.snap_duration(12, "480p", prefer_free=True), 10)
 
     def test_prefer_free_leaves_free_durations_alone(self):
         self.assertEqual(T.snap_duration(5, "480p", prefer_free=True), 5)
@@ -114,11 +114,11 @@ class TestTranslateCreate(unittest.TestCase):
         plan = T.translate_create(body(resolution="480p", duration=5))
         self.assertFalse(any("free window" in w or "billed range" in w for w in plan["warnings"]))
         eff, _ = T.billing_view(plan)
-        self.assertIn("free up to 8s", eff["billing_note"])
+        self.assertIn("free up to 10s", eff["billing_note"])
 
 
 class TestBillingView(unittest.TestCase):
-    """计费口径只有一个判据：`tier=base` 一律计费、`turbo` 只在 ≤8s 免费。"""
+    """计费口径只有一个判据：`tier=base` 一律计费、`turbo` 只在 ≤10s 免费。"""
 
     def plan(self, **kw):
         return T.translate_create(body(**kw))
@@ -126,7 +126,7 @@ class TestBillingView(unittest.TestCase):
     def test_free_window_is_reported(self):
         eff, _ = T.billing_view(self.plan(resolution="480p", duration=5))
         self.assertFalse(eff["billed"])
-        self.assertIn("free up to 8s", eff["billing_note"])
+        self.assertIn("free up to 10s", eff["billing_note"])
         self.assertEqual(eff["tier"], "turbo")
 
     def test_base_tier_is_billed_regardless_of_duration(self):
@@ -136,16 +136,17 @@ class TestBillingView(unittest.TestCase):
         self.assertTrue(eff["billed"])
 
     def test_long_turbo_leaves_the_free_window(self):
-        eff, _ = T.billing_view(self.plan(resolution="720p", duration=10))
+        # 免费上界是 10s（2026-09-14 按终态 paid=False 更正），所以取 15s 才越线
+        eff, _ = T.billing_view(self.plan(resolution="720p", duration=15))
         self.assertTrue(eff["billed"])
 
     def test_eight_seconds_is_still_free(self):
         eff, _ = T.billing_view(self.plan(resolution="720p", duration=8))
         self.assertFalse(eff["billed"])
 
-    def test_nine_seconds_crosses_the_line(self):
-        eff, _ = T.billing_view(self.plan(resolution="720p", duration=9))
-        self.assertTrue(eff["billed"])
+    def test_ten_seconds_is_still_free_eleven_crosses_the_line(self):
+        self.assertFalse(T.billing_view(self.plan(resolution="720p", duration=10))[0]["billed"])
+        self.assertTrue(T.billing_view(self.plan(resolution="720p", duration=11))[0]["billed"])
 
     def test_billing_note_names_the_line(self):
         self.assertIn("web", T.billing_note())
