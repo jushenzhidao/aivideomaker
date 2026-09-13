@@ -39,6 +39,13 @@ def main(argv=None) -> int:
     ap.add_argument("--port", type=int, default=int(os.environ.get("ARK_PORT", "8808")))
     args = ap.parse_args(argv)
 
+    # 启动自述必须**立刻**可见：stdout 被重定向到文件/管道时是块缓冲，
+    # 容器里 `docker logs` 的头几秒会是空的 —— 看起来像"服务没起来"或"没读到配置"。
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+    except (AttributeError, OSError):  # 非 TextIOWrapper（测试捕获等）时忽略
+        pass
+
     try:
         import uvicorn
     except ImportError:
@@ -53,15 +60,30 @@ def main(argv=None) -> int:
 
     app = create_app(settings)
     pool = sorted(app.state.upstreams)
-    default_kind = settings.upstream if settings.upstream in pool else (pool[0] if pool else "-")
+    # 透传线的客户端要等凭据才存在，但**能力**要如实上报 —— 否则启动自述会打
+    # "(none)"，把操作者引向"没配凭据"这个错误结论。
+    kinds = sorted(set(pool) | (set(settings.available_upstreams) if settings.passthrough else set()))
+    default_kind = settings.upstream if (settings.upstream in kinds or settings.passthrough) else (
+        kinds[0] if kinds else "-"
+    )
 
     print(f"[ark-compat] Ark SDK base_url : http://{args.host}:{args.port}/api/v3")
-    print(f"[ark-compat] available lines  : {', '.join(pool) or '(none)'}")
+    print(f"[ark-compat] available lines  : {', '.join(kinds) or '(none)'}")
     print(f"[ark-compat] default line     : {default_kind}")
     print("[ark-compat]   switch per request:  X-Avm-Upstream: web|official   (或 ?upstream=)")
-    for kind in pool:
+    for kind in kinds:
         print(f"[ark-compat]   {kind:8} — {billing_note(kind)}")
     print(f"[ark-compat] upstream host    : {settings.base_url}")
+    if settings.passthrough:
+        modes = []
+        if settings.passthrough_key:
+            modes.append("official ← 调用方 API Key")
+        if settings.passthrough_cookie:
+            modes.append("web ← 调用方会话 cookie")
+        print(
+            f"[ark-compat] credentials      : 调用方自带（{'；'.join(modes)}）"
+            " —— 本进程不持有该侧凭据"
+        )
     print(f"[ark-compat] gate             : {settings.gate_key or 'open (建议设 AVM_GATE_KEY)'}")
     if settings.official_ready:
         cap = settings.max_credits

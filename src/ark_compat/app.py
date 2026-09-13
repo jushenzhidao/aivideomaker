@@ -18,6 +18,17 @@
 两条线各有所长，所以都留着：web 线有免费窗口（turbo ≤8s），official 线可取消并全额退积分。
 差异被 `upstreams.py` 吸收，对外协议完全一致。
 
+**鉴权有两种形态**（每条线各有一个透传开关）：
+
+    进程持有凭据      official: `AVM_KEY`        web: `AVM_COOKIE`
+    调用方自带凭据    official: `AVM_PASSTHROUGH_KEY=1`   web: `AVM_PASSTHROUGH_COOKIE=1`
+
+透传时调用方的 `Authorization: Bearer` 就是**上游凭据本身**：official 线放 API Key
+（`ak_…`，官方 `/api/v1/*` 的 `key` 头，见 `docs/official/`），web 线放**网页会话 cookie**
+（`auth_session=…` 裸 token 或完整 Cookie 串，见 `docs/web-reverse/`）。它与闸门
+`AVM_GATE_KEY` **互斥** —— 同一个 Bearer 不可能既是闸门密钥又是上游凭据（`Settings.validate()`
+直接拒绝启动）。透传即多租户：任务表按**凭据指纹**隔离，见 `store.py` 的 `owner`。
+
 四条安全约定：
   1. 官方线**提交即计费**，因此没有支出上限的提交一律 400 拒绝（见 translate.py）。
   2. 两条线的计费口径**不同**，由 `translate.billing_view` 按上游渲染 —— 把 web 线的
@@ -35,16 +46,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import time
 import uuid
+import warnings
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 from loguru import logger
 
 from . import __version__
+from .cookie import AUTH_COOKIE_NAME, normalize_cookie_header
 from .errors import OfficialApiError, ParamError, WebApiError
 from .observability import (
     clip,
@@ -58,12 +73,16 @@ from .observability import (
 from .settings import UPSTREAMS, Settings
 from .store import build_task_store
 from .translate import OFFICIAL_MODELS, billing_note, billing_view, translate_create
-from .upstreams import build_official_for_key, build_upstreams
+from .upstreams import build_official_for_key, build_upstreams, build_web_for_cookie
 
 TASKS_PATH = "/api/v3/contents/generations/tasks"
 
-# 透传模式下缓存"调用方 token -> 上游"。上限只是防止无界增长。
+# 透传模式下缓存"调用方凭据 -> 上游"。上限只是防止无界增长。
 _PASSTHROUGH_CACHE_MAX = 64
+# web 线单独一档：每个凭据要养一个轮询线程，不能无限开
+_PASSTHROUGH_WEB_CACHE_MAX = 64
+# 透传线的能力声明（客户端还没建出来时，健康检查也要能如实回答）
+_PASSTHROUGH_CANCEL = {"official": True, "web": False}
 
 
 class ArkError(Exception):
@@ -134,7 +153,12 @@ def _bearer(request: Request) -> str:
 
 
 async def require_bearer(request: Request, authorization: str | None = Header(default=None)) -> str:
-    """闸门鉴权。未设 AVM_GATE_KEY 时不校验（本地自用）。"""
+    """闸门鉴权。未设 AVM_GATE_KEY 时不校验（本地自用）。
+
+    开了透传（`AVM_PASSTHROUGH_KEY` / `AVM_PASSTHROUGH_COOKIE`）就**不该**再设闸门：
+    此时 Bearer 要拿去当上游凭据，而闸门会先把它挡掉 —— 那种组合在
+    `Settings.validate()` 里直接拒绝启动，不让它变成"每个请求都 401"的线上迷局。
+    """
     gate = request.app.state.settings.gate_key
     if not gate:
         return authorization or ""
@@ -143,6 +167,69 @@ async def require_bearer(request: Request, authorization: str | None = Header(de
     if not hmac.compare_digest(token, gate):
         raise ArkError(401, "AuthenticationError", "invalid or missing bearer token")
     return token
+
+
+def _owner_of(request: Request) -> str:
+    """任务归属 = **凭据指纹**（sha256 前 16 位）。绝不落凭据原文。
+
+    非透传模式返回空串 —— 那时进程内只有一份凭据，所有任务本来就属于同一账号，
+    查询侧也就不做归属过滤。
+    """
+    if not request.app.state.settings.passthrough:
+        return ""
+    token = _bearer(request)
+    return hashlib.sha256(token.encode()).hexdigest()[:16] if token else ""
+
+
+def _visible(request: Request, entry: dict | None) -> bool:
+    """这条任务对本次请求可见吗？归属不符一律当"不存在"，不透露存在性。"""
+    if not entry:
+        return False
+    owner = _owner_of(request)
+    return not owner or (entry.get("owner") or "") == owner
+
+
+def _close_upstream(up: object) -> None:
+    """尽力关掉不再复用的上游客户端 —— 别把 socket 的回收押在 GC 上。"""
+    try:
+        up.client.close()  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001  关闭失败不该影响请求
+        logger.warning(f"关闭透传上游失败：{e}")
+
+
+def _sweep(cache: dict, limit: int, *, idle_only: bool) -> None:
+    """缓存到顶时淘汰，直到 `len(cache) < limit`（除非全都忙）。
+
+    `idle_only` 两侧取舍不同，理由也不同：
+      - official（False）：提交是**一次同步请求**，返回后关掉客户端是安全的。
+      - web（True）：槽位被**后台轮询线程**占到任务终态，关掉正在被轮询的客户端
+        会让那次轮询直接失败（现象是"任务查不到"）⇒ 只淘汰空闲的。
+    """
+    while len(cache) >= limit:
+        if idle_only:
+            key = next((k for k, v in cache.items() if not v.queue.stats()["running"]), None)
+        else:
+            key = next(iter(cache), None)
+        if key is None:
+            logger.warning(
+                "透传上游缓存已满（{} 条）且没有空闲项可淘汰 —— 暂不淘汰，等任务结束", len(cache)
+            )
+            return
+        _close_upstream(cache.pop(key))
+
+
+def _passthrough_web_upstream(request: Request, cookie: str):
+    """按调用方凭据取（或建）一个 web 上游：同一凭据复用同一客户端与并发闸门。"""
+    cache: dict = request.app.state.passthrough_web
+    key = hashlib.sha256(cookie.encode()).hexdigest()[:16]
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    _sweep(cache, _PASSTHROUGH_WEB_CACHE_MAX, idle_only=True)
+    upstream = build_web_for_cookie(request.app.state.settings, cookie)
+    cache[key] = upstream
+    logger.info("透传：为新凭据建立 web 上游（缓存 {} 条）", len(cache))
+    return upstream
 
 
 def _requested_upstream(request: Request) -> str:
@@ -167,16 +254,42 @@ def _upstream_for(request: Request):
         )
 
     if want == "official" and settings.passthrough_key:
-        # 透传模式：用调用方自带的 token 现建（并缓存）
+        # 透传模式：用调用方自带的 API Key 现建（并缓存）
         token = _bearer(request)
         if not token:
-            raise ArkError(401, "AuthenticationError", "passthrough mode requires a bearer token")
+            raise ArkError(
+                401,
+                "AuthenticationError",
+                "passthrough mode requires a bearer token (your aivideomaker API key)",
+            )
         cache: dict = request.app.state.passthrough_upstreams
-        if token not in cache and len(cache) >= _PASSTHROUGH_CACHE_MAX:
-            cache.clear()  # 粗暴但安全的回收，避免无界增长
         if token not in cache:
+            _sweep(cache, _PASSTHROUGH_CACHE_MAX, idle_only=False)
             cache[token] = build_official_for_key(settings, token)
         return cache[token]
+
+    if want == "web" and settings.passthrough_cookie:
+        # 透传模式：调用方的 Bearer 就是**网页会话 cookie**，本进程不再需要 AVM_COOKIE
+        raw = _bearer(request)
+        if not raw:
+            raise ArkError(
+                401,
+                "AuthenticationError",
+                "passthrough mode requires a bearer token (your aivideomaker session cookie)",
+            )
+        # 裸 token 在透传里是**推荐形态**，所以这里不弹"你可能贴错了"的告警：
+        # 那条告警的读者是配 AVM_COOKIE 的人（见 ark_compat/cookie.py 的取舍）。
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            cookie = normalize_cookie_header(raw)
+        if f"{AUTH_COOKIE_NAME}=" not in cookie:
+            raise ArkError(
+                401,
+                "AuthenticationError",
+                f"凭据里没有 {AUTH_COOKIE_NAME} —— 透传请把网页会话 cookie 放在 "
+                f"Authorization: Bearer 里（裸 token 或完整 Cookie 串都行）",
+            )
+        return _passthrough_web_upstream(request, cookie)
 
     pool: dict = request.app.state.upstreams
     if want not in pool:
@@ -216,7 +329,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     logfire_ok = setup_observability(settings)
 
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        yield
+        # 停机收尾：把上游客户端关掉。轮询线程是 daemon，会随之结束；这里只做
+        # "尽力而为"的连接回收，失败不影响退出码。
+        closed = 0
+        for name in ("upstreams", "passthrough_upstreams", "passthrough_web"):
+            for up in list(getattr(app.state, name, {}).values()):
+                _close_upstream(up)
+                closed += 1
+        if closed:
+            logger.info("停机：已关闭 {} 个上游客户端", closed)
+
     app = FastAPI(
+        lifespan=_lifespan,
         title=settings.service_title,
         description="把 aivideomaker 包装成火山方舟 Seedance 协议形状（官方 API / 网页端两条上游并存）。",
         version=__version__,
@@ -226,6 +353,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.upstreams = build_upstreams(settings, log=lambda m: logger.warning(m))
     app.state.passthrough_upstreams = {}
+    # 透传的 web 上游（凭据指纹 -> upstream）。与上面的 official 缓存分开：
+    # 两者的淘汰策略不同（web 的槽位被轮询线程占着，只能淘汰空闲项）。
+    app.state.passthrough_web = {}
     # 任务表**必须持久化**：契约要求 `GET /tasks/{id}` 在保留窗口内始终可查，
     # 而进程内 dict 一重启就让调用方手里正在轮询的 `cgt-*` 凭空 404（实测踩到过）。
     app.state.tasks = build_task_store(
@@ -301,19 +431,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def healthz(request: Request, deep: int = 0):
         s = request.app.state.settings
         pool: dict = request.app.state.upstreams
-        default_kind = s.upstream if s.upstream in pool else (sorted(pool)[0] if pool else None)
+        # 透传线的客户端要等看到凭据才存在，所以"能力"要并上 settings 的声明 ——
+        # 否则 `AVM_PASSTHROUGH_COOKIE=1` 的健康检查会显示"没有可用上游"，
+        # 而服务明明是好的（这会把人引向错误的方向）。
+        kinds = sorted(set(pool) | (set(s.available_upstreams) if s.passthrough else set()))
+        default_kind = s.upstream if (s.upstream in kinds or s.passthrough) else (
+            kinds[0] if kinds else None
+        )
 
         info: dict = {
             "ok": True,
             "service": s.service_name,
             "upstream": default_kind,
-            "available_upstreams": sorted(pool),
+            "available_upstreams": kinds,
             "switch_via": "X-Avm-Upstream: web|official  (或 ?upstream=)",
-            "billing_notes": {k: billing_note(k) for k in sorted(pool)},
-            "supports_cancel": {k: bool(v.supports_cancel) for k, v in pool.items()},
+            "billing_notes": {k: billing_note(k) for k in kinds},
+            "supports_cancel": {
+                k: (
+                    bool(pool[k].supports_cancel)
+                    if k in pool
+                    else _PASSTHROUGH_CANCEL.get(k, False)
+                )
+                for k in kinds
+            },
             "base_url": s.base_url,
             "gate": "required" if s.gate_key else "open",
             "passthrough_key": s.passthrough_key,
+            "passthrough_cookie": s.passthrough_cookie,
+            "credentials_from_caller": s.passthrough,
             "default_model": s.default_model or None,
             "max_credits": s.max_credits,
             "tasks_tracked": request.app.state.tasks.count(),
@@ -332,12 +477,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         if deep:
             # 只有显式 deep=1 才打上游，避免存活探针把上游当依赖
-            upstream = _upstream_for(request)
-            try:
-                with span("ark.healthz.upstream", upstream=upstream.kind):
-                    info.update(await asyncio.to_thread(upstream.health))
-            except Exception as e:  # noqa: BLE001
-                info["upstream_error"] = str(e)
+            if s.passthrough and not _bearer(request):
+                # 透传模式下没凭据就**没法**探上游。这里必须把原因说清楚，而不是让
+                # /healthz?deep=1 抛 401 —— 那看起来像"服务坏了或鉴权错"。
+                info["upstream_probe"] = (
+                    "skipped: 透传模式需要调用方自带凭据（Authorization: Bearer <凭据>）"
+                )
+            else:
+                upstream = _upstream_for(request)
+                try:
+                    with span("ark.healthz.upstream", upstream=upstream.kind):
+                        info.update(await asyncio.to_thread(upstream.health))
+                except Exception as e:  # noqa: BLE001
+                    info["upstream_error"] = str(e)
         return info
 
     @app.post(TASKS_PATH)
@@ -423,6 +575,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "id": ark_id,
             "taskId": task_id,
             "upstream": upstream.kind,
+            # 归属（凭据指纹）：透传模式下 GET /tasks 要靠它做租户隔离
+            "owner": _owner_of(request),
             "model": plan["requested"]["model"],
             "requested": plan["requested"],
             "effective": eff,
@@ -451,13 +605,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         page_size = max(1, min(100, page_size))
         page_num = max(1, page_num)
         store = request.app.state.tasks
+        # 归属过滤必须下推到存储层：先取一页再筛会让页码与 total 双双错位
+        owner = _owner_of(request) or None
         # 分页下推到存储层：sqlite 后端只取当前页，不必把整表读进内存
-        window = store.list_recent(page_size, (page_num - 1) * page_size)
+        window = store.list_recent(page_size, (page_num - 1) * page_size, owner)
         items = [await _task_view(request, e) for e in window]
         # 说明：本服务只知道自己创建过的任务；上游的列表按 key/账号维度，未在此合并。
         return {
             "items": items,
-            "total": store.count(),
+            "total": store.count(owner),
             "page_num": page_num,
             "page_size": page_size,
         }
@@ -465,15 +621,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get(TASKS_PATH + "/{task_id}")
     async def get_task(task_id: str, request: Request, _: str = Depends(require_bearer)):
         entry = request.app.state.tasks.get(task_id)
-        if not entry:
+        if not _visible(request, entry):
             raise ArkError(404, "TaskNotFound", f"task {task_id} not found")
         return await _task_view(request, entry)
 
     @app.delete(TASKS_PATH + "/{task_id}")
     async def delete_task(task_id: str, request: Request, _: str = Depends(require_bearer)):
-        entry = request.app.state.tasks.delete(task_id)
-        if not entry:
+        entry = request.app.state.tasks.get(task_id)
+        if not _visible(request, entry):
             raise ArkError(404, "TaskNotFound", f"task {task_id} not found")
+        request.app.state.tasks.delete(task_id)
         # 用创建时的上游 —— 任务在哪条线上，就该在哪条线上取消
         upstream = _upstream_for(request)
         # 取消失败（web 线根本没有取消端点）时，上游原文是唯一的证据 —— 所以错误

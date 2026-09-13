@@ -7,6 +7,11 @@
 本项目实测踩到过：为了加载一处代码修正而重启服务，正在轮询的任务**立刻查不到**了。
 这类缺陷只在重启时暴露，平时看不出来，所以不能靠"进程内 dict + 记得别重启"。
 
+**归属（owner）**：透传模式下每个调用方带自己的凭据，任务表就变成了多租户的
+——`GET /tasks` 若不过滤，A 会看到 B 的任务（含 `requested` 里的 prompt 原文）。
+所以每条记录带一个 `owner`，其值是**凭据的 sha256 前 16 位**（`app._owner_of`），
+**绝不落凭据原文**。非透传模式 `owner` 为空串且查询不做归属过滤（进程内只有一份凭据）。
+
 后端（`AVM_TASK_STORE`）：
 
 ===========  ================================================================
@@ -35,15 +40,26 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_id    TEXT NOT NULL,
     upstream   TEXT NOT NULL,
     model      TEXT NOT NULL DEFAULT '',
+    owner      TEXT NOT NULL DEFAULT '',
     created_ms INTEGER NOT NULL,
     entry      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks (created_ms DESC);
 """
 
+# ⚠️ owner 索引**不能放进 SCHEMA**：老库的 tasks 表还没有这一列，而
+# `executescript(SCHEMA)` 在补列之前跑 —— 那时建索引会以 "no such column: owner"
+# 直接失败，服务起不来。所以它在 __init__ 里补完列之后再建。
+OWNER_INDEX = "CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks (owner, created_ms DESC)"
+
 DEFAULT_DB_PATH = ".ark-tasks.db"
 DEFAULT_RETENTION_DAYS = 7
 DAY_MS = 86_400_000
+
+
+def _belongs_to(entry: dict, owner: str | None) -> bool:
+    """owner=None 表示**不做归属过滤**（非透传模式），不是"匹配空串"。"""
+    return owner is None or (entry.get("owner") or "") == owner
 
 
 class MemoryTaskStore:
@@ -70,16 +86,15 @@ class MemoryTaskStore:
             row = self._rows.pop(ark_id, None)
             return dict(row) if row else None
 
-    def list_recent(self, limit: int, offset: int = 0) -> list[dict]:
+    def list_recent(self, limit: int, offset: int = 0, owner: str | None = None) -> list[dict]:
         with self._lock:
-            rows = sorted(
-                self._rows.values(), key=lambda e: e.get("createdAtMs") or 0, reverse=True
-            )
-        return [dict(r) for r in rows[offset : offset + limit]]
+            rows = [dict(v) for v in self._rows.values() if _belongs_to(v, owner)]
+        rows.sort(key=lambda e: e.get("createdAtMs") or 0, reverse=True)
+        return rows[offset : offset + limit]
 
-    def count(self) -> int:
+    def count(self, owner: str | None = None) -> int:
         with self._lock:
-            return len(self._rows)
+            return sum(1 for v in self._rows.values() if _belongs_to(v, owner))
 
     def prune(self, retention_days: int = DEFAULT_RETENTION_DAYS) -> int:
         cutoff = int(time.time() * 1000) - retention_days * DAY_MS
@@ -108,6 +123,13 @@ class SqliteTaskStore:
         self._lock = threading.Lock()
         with self._session() as conn:
             conn.executescript(SCHEMA)
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            if "owner" not in cols:
+                # 就地升级：老库补列，不让调用方删库重来。已有行的 owner 为空串 ⇒
+                # 在透传模式下查不到它们；这比"替它们猜一个归属"安全，而保留窗口
+                # 只有 7 天，很快自然淘汰。
+                conn.execute("ALTER TABLE tasks ADD COLUMN owner TEXT NOT NULL DEFAULT ''")
+            conn.execute(OWNER_INDEX)
 
     # ---- plumbing ----------------------------------------------------------
 
@@ -138,13 +160,15 @@ class SqliteTaskStore:
     def put(self, entry: dict) -> None:
         with self._session() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO tasks (id, task_id, upstream, model, created_ms, entry)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO tasks"
+                " (id, task_id, upstream, model, owner, created_ms, entry)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     entry["id"],
                     entry.get("taskId") or "",
                     entry.get("upstream") or "",
                     entry.get("model") or "",
+                    entry.get("owner") or "",
                     int(entry.get("createdAtMs") or 0),
                     json.dumps(entry, ensure_ascii=False),
                 ),
@@ -163,17 +187,25 @@ class SqliteTaskStore:
             conn.execute("DELETE FROM tasks WHERE id = ?", (ark_id,))
         return json.loads(row["entry"])
 
-    def list_recent(self, limit: int, offset: int = 0) -> list[dict]:
+    def list_recent(self, limit: int, offset: int = 0, owner: str | None = None) -> list[dict]:
+        sql = "SELECT entry FROM tasks"
+        args: tuple = ()
+        if owner is not None:
+            sql += " WHERE owner = ?"
+            args = (owner,)
+        sql += " ORDER BY created_ms DESC LIMIT ? OFFSET ?"
         with self._session() as conn:
-            rows = conn.execute(
-                "SELECT entry FROM tasks ORDER BY created_ms DESC LIMIT ? OFFSET ?",
-                (int(limit), int(offset)),
-            ).fetchall()
+            rows = conn.execute(sql, (*args, int(limit), int(offset))).fetchall()
         return [json.loads(r["entry"]) for r in rows]
 
-    def count(self) -> int:
+    def count(self, owner: str | None = None) -> int:
+        sql = "SELECT COUNT(*) AS n FROM tasks"
+        args: tuple = ()
+        if owner is not None:
+            sql += " WHERE owner = ?"
+            args = (owner,)
         with self._session() as conn:
-            return int(conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"])
+            return int(conn.execute(sql, args).fetchone()["n"])
 
     def prune(self, retention_days: int | None = None) -> int:
         days = self.retention_days if retention_days is None else retention_days

@@ -178,11 +178,26 @@ def _build_official(settings, *, key: str | None = None) -> OfficialUpstream:
     )
 
 
-def _build_web(settings, log: Callable[[str], None] | None = None) -> WebUpstream:
+def _build_web(
+    settings,
+    log: Callable[[str], None] | None = None,
+    *,
+    cookie: str | None = None,
+) -> WebUpstream:
+    """建一个 web 上游。`cookie=None` 用本进程自己那份（AVM_COOKIE）。
+
+    `user_id` 只在"用本进程 cookie"时继承配置；透传时必须是 `""`（明确不指定），
+    否则会把**默认账号**的 userId 配到调用方的会话上 —— 列表类接口按错误的
+    userId 查，现象是"任务明明存在却查不到"。
+    """
+    passthrough = cookie is not None
     client = WebClient(
-        settings.cookie,
+        settings.cookie if cookie is None else cookie,
         base_url=settings.base_url,
-        user_id=settings.user_id,
+        # user_id 是**账号身份**，透传时绝不能继承（见 docstring）；
+        # visitor_id 只是"访客"标记、服务端不校验（web_client.py 的注释），
+        # 两条线共用部署级取值即可。
+        user_id="" if passthrough else settings.user_id,
         visitor_id=settings.visitor_id,
         trust_env=settings.trust_env,
     )
@@ -201,11 +216,15 @@ def build_upstreams(settings, log: Callable[[str], None] | None = None) -> dict[
     `settings.upstream` 只决定**默认**用哪条；调用方还能按请求覆盖
     （`X-Avm-Upstream: web|official` 头，或 `?upstream=` 查询参数）。
     两条线各有各的长处：web 有免费窗口，official 可取消并全额退积分。
+
+    ⚠️ 只建**本进程持有凭据**的那些：透传线的客户端必须等看到调用方凭据才能建
+    （见 `build_web_for_cookie`）。所以 `AVM_PASSTHROUGH_COOKIE=1` 且没配
+    `AVM_COOKIE` 时，这里返回的字典里**没有** web —— 但那条线依然可用。
     """
     out: dict[str, Any] = {}
     if settings.official_ready:
         out["official"] = _build_official(settings)
-    if settings.web_ready:
+    if settings.cookie:
         out["web"] = _build_web(settings, log)
     return out
 
@@ -213,3 +232,17 @@ def build_upstreams(settings, log: Callable[[str], None] | None = None) -> dict[
 def build_official_for_key(settings, key: str) -> OfficialUpstream:
     """透传模式：用调用方自带的 token 现建一个官方线上游。"""
     return _build_official(settings, key=key)
+
+
+def build_web_for_cookie(settings, cookie: str, log: Callable[[str], None] | None = None) -> WebUpstream:
+    """透传模式：用调用方自带的**网页会话 cookie** 现建一个 web 上游。
+
+    这正是"走逆向线"的落地形态 —— 本进程不需要 AVM_COOKIE，每个调用方用自己的
+    会话，各自的免费窗口与上游并发额度都归各自的账号。
+
+    并发闸门是**每个上游一把**（`WebSubmitQueue._sem`），这是对的：上游那条限制
+    是按账号算的（"The premium plan can only run 2 task at a time"），不同 cookie
+    就是不同账号。已知限制仍是「同一 cookie 的 2 个槽位是进程内状态」⇒
+    多 worker 下同一账号可能同时跑 2×worker 个（见 gunicorn_conf 的说明）。
+    """
+    return _build_web(settings, log, cookie=cookie)

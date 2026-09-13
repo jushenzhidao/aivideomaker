@@ -72,6 +72,48 @@ r = client.content_generation.tasks.create(
 )
 ```
 
+## 鉴权：进程持凭据，还是调用方自带凭据（透传）
+
+每条线各有一个透传开关。**开关一开，调用方的 `Authorization: Bearer` 就是上游凭据本身**
+—— 本进程不再持有那一侧的凭据，也就没有"服务自己的账号"这回事。
+
+| 线 | 进程持凭据（默认） | 调用方自带（透传） |
+|---|---|---|
+| `official` | `AVM_KEY` | `AVM_PASSTHROUGH_KEY=1`，Bearer 放 API Key（`ak_…`） |
+| `web` | `AVM_COOKIE` | `AVM_PASSTHROUGH_COOKIE=1`，Bearer 放**网页会话 cookie** |
+
+```bash
+# web 线透传：每个调用方带自己的会话，各自享自己账号的免费窗口
+export AVM_UPSTREAM=web          # 只开透传时必须显式写 —— 默认线是 official
+export AVM_PASSTHROUGH_COOKIE=1
+python3 src/ark_server.py --port 8808
+
+curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
+  -H 'Authorization: Bearer <40 位 auth_session 值>' \
+  -H 'content-type: application/json' -H 'X-Avm-Dry-Run: 1' -d '…'
+```
+
+凭据形态很宽（裸 token / `auth_session=…` / 完整 Cookie 串 / cookie jar JSON 都认），
+规范化规则见 `cookie.py`，与 JS 侧由同一份用例锁定。
+
+三条**必须知道**的约束：
+
+1. **透传与闸门 `AVM_GATE_KEY` 互斥。** 同一个 Bearer 不可能既是闸门密钥又是上游凭据，
+   同设时启动直接失败 —— 否则每个请求都 401，而现象看起来像"调用方凭据错了"。
+2. **透传即多租户。** 任务表多了 `owner` 维度（凭据的 sha256 前 16 位，**不落凭据原文**），
+   `GET /tasks`、`GET/DELETE /tasks/{id}` 全按归属过滤，别人的任务一律 404
+   （连"存在"都不透露）。切换开关前建的旧记录没有归属，在透传模式下查不到 ——
+   保留窗口只有 7 天，很快自然淘汰。
+3. **每凭据一个上游客户端 + 一把并发闸门**，缓存上限 64 条，淘汰**只关空闲的**
+   （关掉正在被轮询的客户端＝那次查询直接失败，现象是"任务查不到"）。
+   上游"同时只跑 2 个"是**按账号**的限制 ⇒ 不同 cookie 各 2 槽是正确的；
+   同一 cookie 的槽位仍是进程内状态（多 worker 会翻倍，理由见部署章节）。
+
+`/healthz` 会把这件事说清楚：`credentials_from_caller`、`passthrough_key` /
+`passthrough_cookie`，以及 `available_upstreams` —— 透传线的客户端要等凭据才存在，
+但**能力**照样如实上报（否则会显示成"没配任何上游"）。透传模式下 `?deep=1`
+没带凭据**不会** 401，而是在 `upstream_probe` 里写明原因。
+
 ## 按请求切换上游
 
 ```bash
@@ -91,7 +133,7 @@ curl -X POST 'http://127.0.0.1:8808/api/v3/contents/generations/tasks?upstream=o
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/v3/contents/generations/tasks` | 创建任务 |
-| GET | `/api/v3/contents/generations/tasks` | 列表（**仅本进程创建过的**） |
+| GET | `/api/v3/contents/generations/tasks` | 列表（**仅本凭据创建过的**；非透传时=本进程创建过的） |
 | GET | `/api/v3/contents/generations/tasks/{id}` | 查询（实时回上游取） |
 | DELETE | `/api/v3/contents/generations/tasks/{id}` | `official` 真取消并退款；`web` 只删记录并在响应里说明 |
 | GET | `/healthz` | 存活 + 两条线的可用性与计费口径；`?deep=1` 额外查上游 |

@@ -74,7 +74,10 @@ class WebClient:
         self,
         cookie: str,
         base_url: str = "https://aivideomaker.ai",
-        user_id: str = "",
+        # None → 读 AVM_USER_ID（历史行为）；"" → 明确"不指定"，交给
+        # get_user_id() 从会话里读。**透传时必须传 ""**：把默认账号的 userId 配到
+        # 调用方自己的会话上，会让列表类接口按错误的 userId 查（"任务存在却查不到"）。
+        user_id: str | None = None,
         visitor_id: str = "",
         timeout: float = 30.0,
         trust_env: bool = True,
@@ -87,7 +90,9 @@ class WebClient:
             raise ValueError("WebClient 需要 AVM_COOKIE（至少含 auth_session=...）")
         self.cookie = cookie
         self.base_url = base_url.rstrip("/")
-        self.user_id = user_id or os.environ.get("AVM_USER_ID", "")
+        if user_id is None:
+            user_id = os.environ.get("AVM_USER_ID", "")
+        self.user_id = str(user_id).strip()
         # 服务端**不校验** visitorId —— 随便一个 32 位十六进制都行
         self.visitor_id = visitor_id or os.environ.get("AVM_VISITOR_ID") or DEFAULT_VISITOR_ID
         self._http = httpx.Client(

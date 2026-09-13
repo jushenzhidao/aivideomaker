@@ -49,7 +49,11 @@ services:
       # official 线全局支出上限；留空则每个请求必须自带 max_credits，否则 400
       AVM_OFFICIAL_MAX_CREDITS: ${AVM_OFFICIAL_MAX_CREDITS:-}
       AVM_OFFICIAL_MODEL: ${AVM_OFFICIAL_MODEL:-}
+      # 透传：调用方自带凭据（Bearer 即上游凭据）。**与上面的 AVM_GATE_KEY 互斥**
+      # —— 单一 Bearer 不可能既是闸门密钥又是上游凭据，同设时服务拒绝启动并说明原因。
+      # 只开 AVM_PASSTHROUGH_COOKIE 时记得同时写 AVM_UPSTREAM=web。
       AVM_PASSTHROUGH_KEY: ${AVM_PASSTHROUGH_KEY:-0}
+      AVM_PASSTHROUGH_COOKIE: ${AVM_PASSTHROUGH_COOKIE:-0}
 
       # ---- 服务自身 ----
       # 网关密钥。**留空 = 不校验**（仅限本机自用）。对外暴露请务必设置，
