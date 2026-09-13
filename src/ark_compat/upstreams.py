@@ -1,7 +1,7 @@
-"""两条上游的统一接口。
+"""上游的统一接口（本项目只有一条：网页端内部接口）。
 
-`app.py` 只认这一层，不关心背后是**官方 API** 还是**网页端内部接口**——
-差异（认证方式、参数形状、计费口径、能否取消、并发限制）全部被各自的实现吸收。
+`app.py` 只认这一层，不关心背后是 tRPC 还是别的 —— 认证方式、参数形状、
+能否取消、并发限制全部被 `WebUpstream` 吸收。
 
 接口刻意很小：
 
@@ -11,11 +11,10 @@
     balance() -> int | None      余额
     health() -> dict             /healthz 用
 
-两条线的计费语义不同（见 `translate.billing_view`），**不能互相套用**：
+计费语义（见 `translate.billing_view`）：
 
 ==========  ==========================================================
 `web`       `tier=base` 一律计费；`tier=turbo` 且 ≤8s **免费**；无取消端点；并发上限 2
-`official`  **一律计费**，无免费窗口；可取消并全额退积分；`X-Max-Credits` 兜底
 ==========  ==========================================================
 """
 
@@ -25,55 +24,9 @@ import base64
 import re
 from typing import Any, Callable
 
-from .client import OfficialClient
-from .errors import BudgetUnsetError
-from .translate import BUDGET_REQUIRED_MESSAGE, normalize_task, normalize_web_task
+from .translate import normalize_web_task
 from .web_client import WebClient
 from .web_queue import WebSubmitQueue
-
-
-class OfficialUpstream:
-    """官方 API（`key` 头）。提交即计费，所以必须有支出上限。"""
-
-    kind = "official"
-    supports_cancel = True
-
-    def __init__(self, client: OfficialClient, default_max_credits: int | None = None):
-        self.client = client
-        self.default_max_credits = default_max_credits
-
-    def create(self, plan: dict) -> str | None:
-        max_credits = plan.get("max_credits")
-        if max_credits is None:
-            max_credits = self.default_max_credits
-        if max_credits is None:
-            # 官方线提交即计费 —— 拿不到上限就拒绝，且**在发出请求之前**
-            raise BudgetUnsetError(BUDGET_REQUIRED_MESSAGE)
-        return self.client.create(
-            plan["official_model"],
-            plan["official_payload"],
-            max_credits,
-            plan.get("idempotency_key"),
-        )
-
-    def get_task(self, task_id: str) -> dict:
-        return normalize_task(self.client.get_task(task_id))
-
-    def cancel_task(self, task_id: str) -> dict:
-        self.client.cancel_task(task_id)
-        return {"cancelled": True, "task_id": task_id, "refund": "full"}
-
-    def balance(self) -> int | None:
-        return self.client.balance()
-
-    def health(self) -> dict:
-        info: dict[str, Any] = {"upstream": self.kind, "base_url": self.client.base_url}
-        try:
-            info["balance"] = self.balance()
-        except Exception as e:  # noqa: BLE001
-            info["upstream_error"] = str(e)
-        return info
-
 
 _DATA_URI_RE = re.compile(r"^data:([^;,]+);base64,(.*)$", re.S)
 _SITE_CDN_RE = re.compile(r"^https?://static\d*\.img2video\.ai/", re.I)
@@ -167,17 +120,6 @@ class WebUpstream:
         return info
 
 
-def _build_official(settings, *, key: str | None = None) -> OfficialUpstream:
-    return OfficialUpstream(
-        OfficialClient(
-            key or settings.upstream_key_for_client,
-            base_url=settings.base_url,
-            trust_env=settings.trust_env,
-        ),
-        default_max_credits=settings.max_credits,
-    )
-
-
 def _build_web(
     settings,
     log: Callable[[str], None] | None = None,
@@ -196,7 +138,7 @@ def _build_web(
         base_url=settings.base_url,
         # user_id 是**账号身份**，透传时绝不能继承（见 docstring）；
         # visitor_id 只是"访客"标记、服务端不校验（web_client.py 的注释），
-        # 两条线共用部署级取值即可。
+        # 部署级共用取值即可。
         user_id="" if passthrough else settings.user_id,
         visitor_id=settings.visitor_id,
         trust_env=settings.trust_env,
@@ -211,27 +153,15 @@ def _build_web(
 
 
 def build_upstreams(settings, log: Callable[[str], None] | None = None) -> dict[str, Any]:
-    """构造**所有凭据齐全**的上游 —— 两条线可以并存，不是二选一。
+    """构造**本进程持有凭据**的 web 上游。
 
-    `settings.upstream` 只决定**默认**用哪条；调用方还能按请求覆盖
-    （`X-Avm-Upstream: web|official` 头，或 `?upstream=` 查询参数）。
-    两条线各有各的长处：web 有免费窗口，official 可取消并全额退积分。
-
-    ⚠️ 只建**本进程持有凭据**的那些：透传线的客户端必须等看到调用方凭据才能建
+    ⚠️ 只建**本进程持有凭据**的那份：透传线的客户端必须等看到调用方凭据才能建
     （见 `build_web_for_cookie`）。所以 `AVM_PASSTHROUGH_COOKIE=1` 且没配
-    `AVM_COOKIE` 时，这里返回的字典里**没有** web —— 但那条线依然可用。
+    `AVM_COOKIE` 时，这里返回**空字典** —— 但服务依然可用。
     """
-    out: dict[str, Any] = {}
-    if settings.official_ready:
-        out["official"] = _build_official(settings)
-    if settings.cookie:
-        out["web"] = _build_web(settings, log)
-    return out
-
-
-def build_official_for_key(settings, key: str) -> OfficialUpstream:
-    """透传模式：用调用方自带的 token 现建一个官方线上游。"""
-    return _build_official(settings, key=key)
+    if not settings.cookie:
+        return {}
+    return {"web": _build_web(settings, log)}
 
 
 def build_web_for_cookie(settings, cookie: str, log: Callable[[str], None] | None = None) -> WebUpstream:

@@ -253,7 +253,7 @@ class WebClient:
             raise CaptchaRequiredError(
                 "account currently requires a Turnstile captcha (model.needsCaptcha=true). "
                 "This is a dynamic, velocity-based gate, not an account property. "
-                "Supply a fresh Turnstile token, wait for it to decay, or use the official API."
+                "Supply a fresh Turnstile token, wait for it to decay, or spread the submissions out."
             )
 
         body = {

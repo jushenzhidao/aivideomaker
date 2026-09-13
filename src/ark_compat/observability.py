@@ -181,9 +181,8 @@ def safe_headers(headers) -> dict:
 def describe_error(exc: BaseException) -> str:
     """统一的错误摘要，**必须带错误码**。
 
-    两个异常类型都把码放在属性上（`WebApiError.code` / `OfficialApiError.code`），
-    而 `str(exc)` 只有散文 —— 只看散文的话，trace 里没法按码过滤，也分不清
-    "上游明确拒绝"和"我们自己拦下来的"。
+    异常类型把码放在属性上（`WebApiError.code`），而 `str(exc)` 只有散文 ——
+    只看散文的话，trace 里没法按码过滤，也分不清"上游明确拒绝"和"我们自己拦下来的"。
     """
     code = getattr(exc, "code", None)
     status = getattr(exc, "http_status", None)
@@ -197,7 +196,7 @@ def describe_error(exc: BaseException) -> str:
 
 # ---- 上游请求 / 响应采集 ---------------------------------------------------
 #
-# 采集点在客户端内部（`OfficialClient._req` / `WebClient.trpc`），span 在 app 层。
+# 采集点在客户端内部（`WebClient.trpc`），span 在 app 层。
 # 用 contextvar 把两者接起来，客户端因此**不需要**多一个 `sink` 参数：
 # `asyncio.to_thread` 会复制上下文，所以"app 里开、线程里的客户端写"是通的。
 _EXCHANGES: ContextVar[list | None] = ContextVar("avm_upstream_exchanges", default=None)

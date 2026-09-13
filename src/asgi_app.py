@@ -6,7 +6,7 @@
 
     PYTHONPATH=src gunicorn -c src/gunicorn_conf.py asgi_app:app
 
-两个入口的语义刻意保持一致：配置错误（AVM_KEY 缺失、AVM_TASK_STORE 拼错…）都在
+两个入口的语义刻意保持一致：配置错误（AVM_COOKIE 缺失、AVM_TASK_STORE 拼错…）都在
 **启动期**抛错，而不是等第一个请求打进来才 500。
 
 关于 worker 数：`app` 是**模块级对象**，由每个 worker 进程各自导入 ⇒ 每个 worker 拿到

@@ -3,23 +3,20 @@
 服务名（`service_name` / `service_title`）的**唯一来源**是 `ark_compat/__init__.py`
 里的常量 —— 确定名字后只改那里一处即可，其余全部引用它。
 
-上游二选一（`AVM_UPSTREAM`）：
+本项目只对接**一条上游**：网页端内部接口（tRPC over `/api`，会话 cookie）。
+它没有取消端点，但有一个免费窗口 —— `tier=turbo` 且 `duration ≤ 8s` 不计费。
 
-    official  官方 API（`key` 头）—— 提交即计费，必须有支出上限
-    web       网页端内部接口（会话 cookie）—— 有免费窗口，但没有取消端点
-
-**凭据的两种来源**（每条线各有一个透传开关）：
+**凭据的两种来源**：
 
 ===========================================  ==========================================
 本进程持有一份凭据（默认）                     调用方按请求自带凭据（透传）
 ===========================================  ==========================================
-official：`AVM_KEY`                          official：`AVM_PASSTHROUGH_KEY=1`
 web：`AVM_COOKIE`                            web：`AVM_PASSTHROUGH_COOKIE=1`
 ===========================================  ==========================================
 
-透传模式下调用方的 `Authorization: Bearer` 就是**上游凭据本身** —— 官方线放 API Key，
-web 线放网页会话 cookie。因此它与闸门（`AVM_GATE_KEY`）**互斥**：单一 Bearer 不可能
-既当闸门密钥又当上游凭据，同设的后果是每个请求都 401（见 `validate()`）。
+透传模式下调用方的 `Authorization: Bearer` 就是**上游凭据本身**（网页会话 cookie）。
+因此它与闸门（`AVM_GATE_KEY`）**互斥**：单一 Bearer 不可能既当闸门密钥又当上游凭据，
+同设的后果是每个请求都 401（见 `validate()`）。
 """
 
 from __future__ import annotations
@@ -29,22 +26,17 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from . import SERVICE_NAME, SERVICE_TITLE
-from .client import DEFAULT_BASE_URL
 from .cookie import normalize_cookie_header
 from .store import DEFAULT_DB_PATH, DEFAULT_RETENTION_DAYS
 
-UPSTREAMS = ("official", "web")
+# 站点根地址（`AVM_BASE_URL` 可覆盖）。网页端接口都在这个域下。
+DEFAULT_BASE_URL = "https://aivideomaker.ai"
+
 TASK_STORES = ("sqlite", "memory")
 
-
-def _env_int(env: Mapping[str, str], key: str) -> int | None:
-    raw = str(env.get(key, "")).strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        raise ValueError(f"{key} must be an integer (got {raw!r})") from None
+# 已经取消的选线开关。曾经有 official / web 两条上游，现在只剩 web；
+# 保留这个名字只为在 `validate()` 里对旧配置**明确报错**（见该方法的说明）。
+LEGACY_UPSTREAM_ENV = "AVM_UPSTREAM"
 
 
 def _env_flag(env: Mapping[str, str], key: str) -> bool:
@@ -65,16 +57,7 @@ def _parse_send(raw) -> bool | str:
 class Settings:
     """服务配置。测试可直接构造，不必碰环境变量。"""
 
-    # ---- 上游选择 ----
-    upstream: str = "official"
-
-    # ---- official 线 ----
-    upstream_key: str = ""
-    passthrough_key: bool = False
-    max_credits: int | None = None
-    default_model: str = ""
-
-    # ---- web 线 ----
+    # ---- 上游：只剩 web 一条 ----
     cookie: str = ""
     # 调用方的 Bearer 里放网页会话 cookie（裸 token 或完整 Cookie 串），
     # 本进程不再需要 AVM_COOKIE。这就是"走逆向线"的对外形态。
@@ -83,6 +66,12 @@ class Settings:
     visitor_id: str = ""
     max_concurrent: int = 2
     poll_interval: float = 10.0
+
+    # ---- 历史配置的报错面 ----
+    # AVM_UPSTREAM 是已取消的选线开关，这里只用于 `validate()` 报错，不参与任何
+    # 决策。静默忽略它会让"以为在跑另一条线"变成没人发现的事实 —— 那正是本项目
+    # 最忌讳的半成品状态（配置写了、代码没读、还不报错）。
+    legacy_upstream: str = ""
 
     # ---- 通用 ----
     base_url: str = DEFAULT_BASE_URL
@@ -98,7 +87,7 @@ class Settings:
     # 字样的属性值会被 logfire 整条替换成 [Scrubbed …]）。凭证的防线改为
     # 「请求头不进 span」（capture_headers=False），见 observability.py。
     logfire_scrubbing: bool = False
-    # 抓请求头（含 key / cookie）要显式打开 —— 打开即明文进 trace。
+    # 抓请求头（含 cookie）要显式打开 —— 打开即明文进 trace。
     logfire_capture_headers: bool = False
     # 单个属性值里字符串的截断上限：防 data URI 把 trace 撑爆，不是脱敏。
     logfire_max_chars: int = 20000
@@ -120,26 +109,24 @@ class Settings:
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
         env = os.environ if env is None else env
         return cls(
-            upstream=str(env.get("AVM_UPSTREAM", "official")).strip().lower() or "official",
-            task_store=str(env.get("AVM_TASK_STORE", "sqlite")).strip().lower() or "sqlite",
-            task_db=str(env.get("AVM_TASK_DB", DEFAULT_DB_PATH)).strip() or DEFAULT_DB_PATH,
-            task_retention_days=int(env.get("AVM_TASK_RETENTION_DAYS") or DEFAULT_RETENTION_DAYS),
-            upstream_key=str(env.get("AVM_KEY", "")).strip(),
-            passthrough_key=_env_flag(env, "AVM_PASSTHROUGH_KEY"),
-            passthrough_cookie=_env_flag(env, "AVM_PASSTHROUGH_COOKIE"),
-            max_credits=_env_int(env, "AVM_OFFICIAL_MAX_CREDITS"),
-            default_model=str(env.get("AVM_OFFICIAL_MODEL", "")).strip(),
             cookie=normalize_cookie_header(env.get("AVM_COOKIE", "")),
+            passthrough_cookie=_env_flag(env, "AVM_PASSTHROUGH_COOKIE"),
             user_id=str(env.get("AVM_USER_ID", "")).strip(),
             visitor_id=str(env.get("AVM_VISITOR_ID", "")).strip(),
             max_concurrent=int(env.get("AVM_MAX_CONCURRENT") or 2),
             poll_interval=float(env.get("AVM_POLL_SECONDS") or 10),
+            legacy_upstream=str(env.get(LEGACY_UPSTREAM_ENV, "")).strip().lower(),
             base_url=str(env.get("AVM_BASE_URL", DEFAULT_BASE_URL)).rstrip("/"),
             gate_key=str(env.get("AVM_GATE_KEY", "")).strip(),
             # 服务名可用 AVM_SERVICE_NAME 临时覆盖，但默认值只有一个来源
             service_name=str(env.get("AVM_SERVICE_NAME", SERVICE_NAME)).strip(),
             environment=str(env.get("AVM_ENVIRONMENT", "")).strip(),
             log_level=str(env.get("AVM_LOG_LEVEL", "INFO")).strip().upper(),
+            # 任务持久化
+            task_store=str(env.get("AVM_TASK_STORE", "sqlite")).strip().lower() or "sqlite",
+            task_db=str(env.get("AVM_TASK_DB", DEFAULT_DB_PATH)).strip() or DEFAULT_DB_PATH,
+            task_retention_days=int(env.get("AVM_TASK_RETENTION_DAYS") or DEFAULT_RETENTION_DAYS),
+            # 可观测性
             enable_logfire=not _env_flag(env, "AVM_DISABLE_LOGFIRE"),
             logfire_send=_parse_send(env.get("AVM_LOGFIRE_SEND", "if-token-present")),
             logfire_console=_env_flag(env, "AVM_LOGFIRE_CONSOLE"),
@@ -151,80 +138,49 @@ class Settings:
         )
 
     @property
-    def official_ready(self) -> bool:
-        """官方线可用？（有 key，或开了透传让调用方自带 key）"""
-        return bool(self.upstream_key or self.passthrough_key)
-
-    @property
     def web_ready(self) -> bool:
-        """web 线可用？（有会话 cookie，或开了透传让调用方自带 cookie）"""
+        """凭据是否齐备？（本进程持有会话 cookie，或开了透传让调用方自带）"""
         return bool(self.cookie or self.passthrough_cookie)
 
     @property
-    def passthrough(self) -> bool:
-        """是否有任一条线在"调用方自带凭据"形态下运行。"""
-        return bool(self.passthrough_key or self.passthrough_cookie)
-
-    @property
     def available_upstreams(self) -> list[str]:
-        """本进程实际能用的上游 —— 凭据齐全的那些。两条都配齐就两条都能用。
+        """对外能力声明 —— 本进程实际能用的上游。
 
-        注意：这里说的是**能力**，不是"进程内已建好客户端"。透传线的客户端要等到
-        看到调用方凭据才能建（见 `upstreams.build_web_for_cookie`），所以它出现在这里
-        但不会出现在 `app.state.upstreams` 里。
+        只剩 web 一条，但这里仍返回**列表**而不是布尔：`/healthz` 已经在用这个
+        字段，且"能力"与"进程内已建好客户端"是两回事 —— 透传线的客户端要等到
+        看到调用方凭据才能建（见 `upstreams.build_web_for_cookie`）。
         """
-        out: list[str] = []
-        if self.official_ready:
-            out.append("official")
-        if self.web_ready:
-            out.append("web")
-        return out
+        return ["web"] if self.web_ready else []
 
     def validate(self) -> None:
         """配置错误在起服务之前就暴露，而不是等第一个请求打进来。"""
-        if self.upstream not in UPSTREAMS:
-            raise ValueError(f"AVM_UPSTREAM 必须是 {UPSTREAMS} 之一（收到 {self.upstream!r}）")
         if self.task_store not in TASK_STORES:
             raise ValueError(
                 f"AVM_TASK_STORE 必须是 {TASK_STORES} 之一（收到 {self.task_store!r}）"
             )
 
-        if self.passthrough and self.gate_key:
+        if self.legacy_upstream and self.legacy_upstream != "web":
+            # 旧配置写着 official（本项目已移除该上游）。这里必须**拒绝启动**：
+            # 静默按 web 线跑起来的话，调用方会以为自己还在用那条可取消、有幂等的线，
+            # 实际拿到的却是"没有取消端点"的 web 线 —— 这个误解只在任务卡住时暴露。
+            raise ValueError(
+                f"{LEGACY_UPSTREAM_ENV}={self.legacy_upstream!r}：本项目已移除 official 上游，"
+                "只剩 web 线。请删除该变量（推荐做法），或显式写成 web。"
+            )
+
+        if self.passthrough_cookie and self.gate_key:
             # 这不是"运行时才发现的偶发问题"，而是**必然失败**的组合：闸门先校验
             # `Authorization: Bearer`，而透传要求同一个 Bearer 就是上游凭据。
             # 两者同设时每个请求都会在闸门处 401，透传永远不生效 —— 且现象
             # （401 AuthenticationError）看起来像是"调用方凭据错了"，极易误诊。
             raise ValueError(
-                "AVM_GATE_KEY 与透传互斥（AVM_PASSTHROUGH_KEY / AVM_PASSTHROUGH_COOKIE）："
+                "AVM_GATE_KEY 与透传互斥（AVM_PASSTHROUGH_COOKIE）："
                 "同一个 Authorization: Bearer 不可能既是闸门密钥又是上游凭据。"
                 "要透传就清空 AVM_GATE_KEY；要闸门就关掉透传。"
             )
 
-        available = self.available_upstreams
-        if not available:
+        if not self.web_ready:
             raise ValueError(
-                "至少要配一条上游：官方线用 AVM_KEY（或 AVM_PASSTHROUGH_KEY=1 透传调用方 API Key），"
-                "web 线用 AVM_COOKIE（至少含 auth_session=...）"
-                "（或 AVM_PASSTHROUGH_COOKIE=1 透传调用方会话 cookie）"
+                "至少要配一份凭据：AVM_COOKIE（至少含 auth_session=...），"
+                "或 AVM_PASSTHROUGH_COOKIE=1 透传调用方的会话 cookie。"
             )
-        if self.upstream not in available:
-            # 不隐式回退 —— 那会悄悄改变计费语义（免费窗口 vs 一律计费）
-            raise ValueError(
-                f"AVM_UPSTREAM={self.upstream} 缺少对应凭据；当前可用的是 {available}。"
-                f"官方线需要 AVM_KEY，web 线需要 AVM_COOKIE（或对应的透传开关）。"
-                f"只开透传时请显式写 AVM_UPSTREAM={available[0]}。"
-            )
-
-    @property
-    def upstream_key_for_client(self) -> str:
-        """OfficialClient 需要一个非空 key 才能构造（透传模式下先用占位）。"""
-        return self.upstream_key or "passthrough"
-
-    def translate_env(self) -> dict[str, str]:
-        """注入翻译层的环境视图 —— 让纯函数不必读 os.environ。"""
-        env: dict[str, str] = {}
-        if self.default_model:
-            env["AVM_OFFICIAL_MODEL"] = self.default_model
-        if self.max_credits is not None:
-            env["AVM_OFFICIAL_MAX_CREDITS"] = str(self.max_credits)
-        return env
