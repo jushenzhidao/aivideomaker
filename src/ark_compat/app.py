@@ -285,16 +285,13 @@ def _fingerprint(secret: str) -> str:
 def _pool_accounts(app) -> list[tuple[str, str, str, object]]:
     """号池视图：``(upstream, 凭据指纹, 来源, 上游对象)``。
 
-    来源两种：`process` = 本进程持有凭据（AVM_KEY / AVM_COOKIE）；
+    来源两种：`process` = 本进程持有凭据（`AVM_COOKIE`）；
     `passthrough` = 调用方自带凭据（每个凭据一个上游对象）。
     """
     s = app.state.settings
     out: list[tuple[str, str, str, object]] = []
     for kind, up in sorted(app.state.upstreams.items()):
-        raw = s.upstream_key if kind == "official" else s.cookie
-        out.append((kind, _fingerprint(raw or kind), "process", up))
-    for token, up in list(app.state.passthrough_upstreams.items()):
-        out.append(("official", _fingerprint(token), "passthrough", up))
+        out.append((kind, _fingerprint(s.cookie or kind), "process", up))
     for key, up in list(app.state.passthrough_web.items()):
         # web 透传的缓存键**本身**就是 cookie 的 sha256[:16]，直接复用
         out.append(("web", key, "passthrough", up))

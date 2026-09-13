@@ -43,7 +43,6 @@ KEY = "ak_" + "d" * 64
 
 def settings(**kw) -> Settings:
     base = dict(
-        upstream="web",
         cookie=COOKIE,
         base_url=DEAD_UPSTREAM,
         log_level="WARNING",
@@ -71,21 +70,6 @@ class FakeWebUp:
     def balance(self):
         if self._boom:
             raise RuntimeError("UNAUTHORIZED: session expired")
-        return self._credits
-
-
-class FakeOfficialUp:
-    kind = "official"
-    supports_cancel = True
-
-    def __init__(self, credits=796, boom=False):
-        self._credits = credits
-        self._boom = boom
-        self.client = SimpleNamespace()
-
-    def balance(self):
-        if self._boom:
-            raise RuntimeError("AUTH_FAILED: invalid API key")
         return self._credits
 
 
@@ -160,7 +144,7 @@ class TestRecordAccount(MetricsCase):
         self.assertEqual([p[1] for p in self.named("avm.account.captcha_required")], [1])
 
     def test_missing_fields_are_simply_not_reported(self):
-        O.record_account(upstream="official", account="abc", credits=15)
+        O.record_account(upstream="web", account="abc", credits=15)
         self.assertEqual(len(self.named("avm.account.credits")), 1)
         self.assertEqual(self.named("avm.account.captcha_required"), [])
         self.assertEqual(self.named("avm.account.reachable"), [])
@@ -180,7 +164,6 @@ class TestNoCredentialInTelemetry(MetricsCase):
         app.state.upstreams = {"web": FakeWebUp(credits=796)}
         # 透传池：键是 cookie 的 sha256[:16]（与 app._passthrough_web_upstream 一致）
         app.state.passthrough_web = {fp(COOKIE): FakeWebUp(credits=700)}
-        app.state.passthrough_upstreams = {KEY: FakeOfficialUp(credits=700)}
         return app
 
     def test_account_labels_are_fingerprints(self):
@@ -188,7 +171,6 @@ class TestNoCredentialInTelemetry(MetricsCase):
         rows = {(kind, source): account for kind, account, source, _ in _pool_accounts(app)}
         self.assertEqual(rows[("web", "process")], fp(COOKIE))
         self.assertEqual(rows[("web", "passthrough")], fp(COOKIE))
-        self.assertEqual(rows[("official", "passthrough")], fp(KEY))
 
     def test_credentials_never_reach_the_metrics(self):
         app = self._app_with_pool()
@@ -236,7 +218,7 @@ class TestPoolSampling(MetricsCase):
 
     def test_one_bad_account_does_not_stop_the_others(self):
         app = self._app()
-        app.state.upstreams = {"official": FakeOfficialUp(boom=True)}
+        app.state.upstreams = {"web": FakeWebUp(boom=True)}
         app.state.passthrough_web = {fp("y" * 40): FakeWebUp(credits=99)}
         rows = asyncio_run(_report_pool_once(app))
         self.assertEqual(len(rows), 2, "一个账号挂了不能拖掉整轮采样")
