@@ -1,0 +1,43 @@
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Node 依赖（可再生成，体积达 218M）
+node_modules/
+
+# 运行时产物（下载的视频不入库，assets/ 中的对比样本除外）
+out/
+outputs/
+*.tmp.mp4
+# avm-proxy 的端到端测试产物视频：需要时可重跑生成，不入库
+avm-proxy/*.mp4
+
+# web 逆向侧：登录态凭据与运行时状态，绝不入库
+# 这两个 pattern 刻意**不带路径前缀** —— 不带斜杠的 pattern 匹配任意层级。
+# 历史教训：曾写成 `src/web-adapter/.session-state.json`，结果在 avm-proxy/ 目录
+# 跑一次 check-session.mjs 就落下一份未被忽略的副本（git check-ignore 可验证）。
+cookies.json
+.session-state.json
+
+# Ark 兼容层的任务持久化（运行时状态，不入库）
+# 不带路径前缀 ⇒ 匹配任意层级；`db*` 一并覆盖 WAL 的 -wal / -shm 旁文件
+.ark-tasks.db*
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.log
+# 例外：测试证据日志需要入库（被 docs/web-reverse/README.md 引用）
+!docs/web-reverse/*.log
+
+# 本仓库工作目录：会话记忆与内部工作日志，不入库
+.workbuddy/

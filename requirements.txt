@@ -1,0 +1,19 @@
+# aivideomaker → 火山方舟 Seedance 协议兼容层（src/ark_compat/）
+#
+#   pip install -r requirements.txt
+#   export AVM_KEY="ak_xxx"
+#   python3 src/ark_server.py --port 8808
+#
+# 注：src/avm.py（官方 API CLI）与 src/web_session.py 仍为零依赖的标准库实现，
+# 不依赖本文件中的任何包。
+
+# HTTP 服务
+fastapi>=0.115
+uvicorn>=0.30
+httpx>=0.27
+
+# 日志与可观测性
+loguru>=0.7
+logfire>=3.0
+
+# 测试（TestClient 依赖 httpx，已在上面）

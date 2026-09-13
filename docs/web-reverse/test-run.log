@@ -1,0 +1,104 @@
+# 自动化测试套件输出（node run-all-tests.mjs）
+# 生成时间: 2026-09-10T18:05:16.679Z
+# 全部用例零消耗：翻译层走 dry_run，上传为免费，队列用 mock 上游
+
+======== A. 接口契约 ========
+  ✓ 无鉴权 → 401  — got 401
+  ✓ 错误密钥 → 401  — got 401
+  ✓ 未知路由 → 404
+  ✓ 查询不存在的任务 → 404 TaskNotFound
+  ✓ 删除不存在的任务 → 404
+  ✓ 任务列表 → {items,total,...}  — total=0
+  ✓ /healthz 暴露协议与队列
+
+======== B. 请求体必填与枚举校验 ========
+  ✓ 缺 model → MissingParameter
+  ✓ 缺 content → MissingParameter
+  ✓ content 空数组 → 400
+  ✓ ratio 非法 → InvalidParameter
+  ✓ resolution 非法 → InvalidParameter
+  ✓ ratio=16:9 映射  — 16:9
+  ✓ ratio=4:3 映射  — 4:3
+  ✓ ratio=1:1 映射  — 1:1
+  ✓ ratio=3:4 映射  — 3:4
+  ✓ ratio=9:16 映射  — 9:16
+  ✓ ratio=21:9 映射  — 21:9
+  ✓ ratio=adaptive → 从原图推导  — auto(from image)
+  ✓ resolution=480p 透传
+  ✓ resolution=720p 透传
+  ✓ resolution=1080p 透传
+
+======== C. content 角色映射 ========
+  ✓ first_frame → imageUrl
+  ✓ last_frame → lastFrameUrl
+  ✓ reference_image → referenceImageUrls
+  ✓ 无 role → referenceImageUrls
+  ✓ reference_video → referenceVideoUrl
+  ✓ reference_audio → referenceAudioUrls
+  ✓ 多条 text 合并
+  ✓ 站点字段名 content（MiniMax 路径）被识别  — "a car"
+  ✓ Ark 路径拒绝字符串 content（协议一致性）  — http=400
+
+======== D. duration / frames / 计费判定 ========
+  ✓ 480p/6s → 吸附 5s  — dur=5
+  ✓ 480p/12s → 吸附 10s  — dur=10
+  ✓ 480p/20s → 20s 且计费
+  ✓ 720p/6s → 保留 6s 且免费
+  ✓ 720p/30s → 钳到 20s
+  ✓ 1080p/18s → 吸附 10s  — dur=10
+  ✓ frames=120 → 5s  — dur=5
+  ✓ duration=-1 → 5s 且免费
+  ✓ prefer_free 480p/8s → 落到免费档  — dur=5 billed=false
+  ✓ prefer_free 480p/9s → 落到免费档  — dur=5 billed=false
+  ✓ prefer_free 480p/12s → 落到免费档  — dur=5 billed=false
+  ✓ 480p/8s 提示跨进计费区
+
+======== E. 站点不支持的参数 ========
+  ✓ watermark → 列入 unsupported
+  ✓ generate_audio → 列入 unsupported
+  ✓ seed → 列入 unsupported
+  ✓ camera_fixed → 列入 unsupported
+  ✓ return_last_frame → 列入 unsupported
+  ✓ draft → 列入 unsupported
+  ✓ service_tier → 列入 unsupported
+  ✓ priority → 列入 unsupported
+  ✓ callback_url → 列入 unsupported
+  ✓ safety_identifier → 列入 unsupported
+  ✓ tools → 列入 unsupported
+  ✓ omni_reference_task_type → 列入 unsupported
+  ✓ execution_expires_after → 列入 unsupported
+  ✓ output_format → 列入 unsupported
+  ✓ 14 项一起传全部登记  — len=14
+  ✓ 未知 content type 登记为 unsupported
+
+======== F. model → tier / 计费默认值 ========
+  ✓ doubao-seedance-2-5-260628 默认 turbo（不自动计费）
+  ✓ doubao-seedance-2-0-260128 默认 turbo（不自动计费）
+  ✓ doubao-seedance-1-0-pro-250528 默认 turbo（不自动计费）
+  ✓ doubao-seedance-1-5-pro-251215 默认 turbo（不自动计费）
+  ✓ unknown-model 默认 turbo（不自动计费）
+  ✓ 显式 base → 计费并告警
+  ✓ 非法 tier → 忽略并告警
+
+======== G. base64 首帧转存 ========
+  ✓ base64 → 转存为 CDN URL  — https://static.img2video.ai/1789063506922-95a9e52c-ade6-4da5
+
+======== H. 官方文档三条示例 ========
+  ✓ 示例1（多素材参考/15s）→ 计费且告警
+  ✓ 示例2（视频编辑/adaptive/-1）→ 5s 且免费
+  ✓ 示例3（首尾帧）→ 首尾帧都填且免费
+
+======== I. 媒体上传（真实上传，免费） ========
+  ✓ video 上传并原样回读  — video/mp4 554.3KB → video/mp4
+  ✓ audio 上传并原样回读  — audio/mpeg 15.9KB → audio/mpeg
+
+======== J. 上游并发队列（mock 上游） ========
+  ✓ 5 个提交并发不超 2  — peak=2
+  ✓ 5 个全部成功
+  ✓ 打印了延迟提示
+  ✓ queue-full 后回退重试成功  — calls=3
+  ✓ 打印了 UPSTREAM FULL
+
+============================================================
+结果：通过 77 项，失败 0 项
+============================================================

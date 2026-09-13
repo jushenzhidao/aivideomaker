@@ -1,0 +1,25 @@
+{
+  "name": "avm-web-adapter",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "aivideomaker.ai 登录态内部接口 → 第三方标准协议适配层（OpenAI Responses / MiniMax / 火山方舟 Ark-Seedance）",
+  "engines": { "node": ">=18" },
+  "dependencies": {},
+  "scripts": {
+    "start": "node adapter.mjs",
+    "check": "node tools/check-session.mjs",
+    "diagnose": "node tools/session-diagnose.mjs",
+    "test": "node tests/run-all-tests.mjs",
+    "test:unit": "node tests/cookie-normalize-test.mjs",
+    "test:diagnose": "node tests/session-diagnose-test.mjs",
+    "test:offline": "node tests/cookie-normalize-test.mjs && node tests/session-diagnose-test.mjs",
+    "test:live": "node tests/run-all-tests.mjs --live",
+    "test:queue": "node tests/queue-test.mjs",
+    "test:media": "node tests/media-upload-test.mjs",
+    "test:reference": "node tests/live-reference-test.mjs",
+    "wire-trace": "node tests/ark-wire-trace.mjs",
+    "tasks": "node tools/collect-tasks.mjs",
+    "credits": "node tools/credit-report.mjs"
+  }
+}

@@ -1,0 +1,22 @@
+[
+  {
+    "name": "__client-uat",
+    "value": "REPLACE_ME",
+    "domain": ".aivideomaker.ai",
+    "path": "/",
+    "expirationDate": 1893456000,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "__Secure-authjs.session-token",
+    "value": "REPLACE_ME",
+    "domain": ".aivideomaker.ai",
+    "path": "/",
+    "expirationDate": 1893456000,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "Lax"
+  }
+]

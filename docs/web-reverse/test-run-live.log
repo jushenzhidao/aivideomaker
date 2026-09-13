@@ -1,0 +1,143 @@
+
+======== A. 接口契约 ========
+  ✓ 无鉴权 → 401  — got 401
+  ✓ 错误密钥 → 401  — got 401
+  ✓ 未知路由 → 404
+  ✓ 查询不存在的任务 → 404 TaskNotFound
+  ✓ 删除不存在的任务 → 404
+  ✓ 任务列表 → {items,total,...}  — total=0
+  ✓ /healthz 暴露协议与队列
+
+======== B. 请求体必填与枚举校验 ========
+  ✓ 缺 model → MissingParameter
+  ✓ 缺 content → MissingParameter
+  ✓ content 空数组 → 400
+  ✓ ratio 非法 → InvalidParameter
+  ✓ resolution 非法 → InvalidParameter
+  ✓ ratio=16:9 映射  — 16:9
+  ✓ ratio=4:3 映射  — 4:3
+  ✓ ratio=1:1 映射  — 1:1
+  ✓ ratio=3:4 映射  — 3:4
+  ✓ ratio=9:16 映射  — 9:16
+  ✓ ratio=21:9 映射  — 21:9
+  ✓ ratio=adaptive → 从原图推导  — auto(from image)
+  ✓ resolution=480p 透传
+  ✓ resolution=720p 透传
+  ✓ resolution=1080p 透传
+
+======== C. content 角色映射 ========
+  ✓ first_frame → imageUrl
+  ✓ last_frame → lastFrameUrl
+  ✓ reference_image → referenceImageUrls
+  ✓ 无 role → referenceImageUrls
+  ✓ reference_video → referenceVideoUrl
+  ✓ reference_audio → referenceAudioUrls
+  ✓ 多条 text 合并
+  ✓ 站点字段名 content（MiniMax 路径）被识别  — "a car"
+  ✓ Ark 路径拒绝字符串 content（协议一致性）  — http=400
+
+======== D. duration / frames / 计费判定 ========
+  ✓ 480p/6s → 吸附 5s  — dur=5
+  ✓ 480p/12s → 吸附 10s  — dur=10
+  ✓ 480p/20s → 20s 且计费
+  ✓ 720p/6s → 保留 6s 且免费
+  ✓ 720p/30s → 钳到 20s
+  ✓ 1080p/18s → 吸附 10s  — dur=10
+  ✓ frames=120 → 5s  — dur=5
+  ✓ duration=-1 → 5s 且免费
+  ✓ prefer_free 480p/8s → 落到免费档  — dur=5 billed=false
+  ✓ prefer_free 480p/9s → 落到免费档  — dur=5 billed=false
+  ✓ prefer_free 480p/12s → 落到免费档  — dur=5 billed=false
+  ✓ 480p/8s 提示跨进计费区
+
+======== E. 站点不支持的参数 ========
+  ✓ watermark → 列入 unsupported
+  ✓ generate_audio → 列入 unsupported
+  ✓ seed → 列入 unsupported
+  ✓ camera_fixed → 列入 unsupported
+  ✓ return_last_frame → 列入 unsupported
+  ✓ draft → 列入 unsupported
+  ✓ service_tier → 列入 unsupported
+  ✓ priority → 列入 unsupported
+  ✓ callback_url → 列入 unsupported
+  ✓ safety_identifier → 列入 unsupported
+  ✓ tools → 列入 unsupported
+  ✓ omni_reference_task_type → 列入 unsupported
+  ✓ execution_expires_after → 列入 unsupported
+  ✓ output_format → 列入 unsupported
+  ✓ 14 项一起传全部登记  — len=14
+  ✓ 未知 content type 登记为 unsupported
+
+======== F. model → tier / 计费默认值 ========
+  ✓ doubao-seedance-2-5-260628 默认 turbo（不自动计费）
+  ✓ doubao-seedance-2-0-260128 默认 turbo（不自动计费）
+  ✓ doubao-seedance-1-0-pro-250528 默认 turbo（不自动计费）
+  ✓ doubao-seedance-1-5-pro-251215 默认 turbo（不自动计费）
+  ✓ unknown-model 默认 turbo（不自动计费）
+  ✓ 显式 base → 计费并告警
+  ✓ 非法 tier → 忽略并告警
+
+======== G. base64 首帧转存 ========
+  ✓ base64 → 转存为 CDN URL  — https://static.img2video.ai/1789063632355-e319a52b-03b8-482f
+
+======== H. 官方文档三条示例 ========
+  ✓ 示例1（多素材参考/15s）→ 计费且告警
+  ✓ 示例2（视频编辑/adaptive/-1）→ 5s 且免费
+  ✓ 示例3（首尾帧）→ 首尾帧都填且免费
+
+======== I. 媒体上传（真实上传，免费） ========
+  ✓ video 上传并原样回读  — video/mp4 554.3KB → video/mp4
+  ✓ audio 上传并原样回读  — audio/mpeg 15.9KB → audio/mpeg
+
+======== J. 上游并发队列（mock 上游） ========
+  ✓ 5 个提交并发不超 2  — peak=2
+  ✓ 5 个全部成功
+  ✓ 打印了延迟提示
+  ✓ queue-full 后回退重试成功  — calls=3
+  ✓ 打印了 UPSTREAM FULL
+
+======== K. 真实提交（免费组合：turbo + 5s + 480p） ========
+
+  [K1 文生视频 Ark 480p/5s] 等待闸门…
+  [K1 文生视频 Ark 480p/5s] 已提交 taskId = cgt-20260910180737-c5e439ed
+  ✓ K1 文生视频 Ark 480p/5s 提交成功  — cgt-20260910180737-c5e439ed
+  [K1 文生视频 Ark 480p/5s] queued …（已等 0s）
+  [K1 文生视频 Ark 480p/5s] queued …（已等 13s）
+  [K1 文生视频 Ark 480p/5s] queued …（已等 25s）
+  [K1 文生视频 Ark 480p/5s] queued …（已等 38s）
+  [K1 文生视频 Ark 480p/5s] queued …（已等 50s）
+  [K1 文生视频 Ark 480p/5s] queued …（已等 63s）
+  [K1 文生视频 Ark 480p/5s] queued …（已等 75s）
+  [K1 文生视频 Ark 480p/5s] queued …（已等 88s）
+  [K1 文生视频 Ark 480p/5s] queued …（已等 100s）
+  [K1 文生视频 Ark 480p/5s] queued …（已等 113s）
+  ✓ K1 文生视频 Ark 480p/5s 出片  — succeeded https://static.img2video.ai/1789063767591-0cb7b67b-1d71-46…
+  [K1 文生视频 Ark 480p/5s] 成片: https://static.img2video.ai/1789063767591-0cb7b67b-1d71-4637-9daa-ba9d81633399-1620612_0_minimax_h3_1620612.mp4
+  ✓ K1 文生视频 Ark 480p/5s 未计费（paid=false）  — paid=false credits=1 res=480 dur=5
+
+  [K2 图生视频 Ark first_frame 480p/5s] 等待闸门…
+  … 闸门关闭中（needsCaptcha=true），等待 30s
+  … 闸门关闭中（needsCaptcha=true），等待 30s
+  [K2 图生视频 Ark first_frame 480p/5s] 已提交 taskId = cgt-20260910181116-5b3e6168
+  ✓ K2 图生视频 Ark first_frame 480p/5s 提交成功  — cgt-20260910181116-5b3e6168
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 0s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 13s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 26s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 38s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 50s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 63s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 75s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 88s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 100s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 113s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 125s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 138s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 150s）
+  [K2 图生视频 Ark first_frame 480p/5s] queued …（已等 163s）
+  ✓ K2 图生视频 Ark first_frame 480p/5s 出片  — succeeded https://static.img2video.ai/1789064046981-fc7e7536-d0b7-45…
+  [K2 图生视频 Ark first_frame 480p/5s] 成片: https://static.img2video.ai/1789064046981-fc7e7536-d0b7-4571-ace5-2607c4b7fec8-1620616_0_minimax_h3_1620616.mp4
+  ✓ K2 图生视频 Ark first_frame 480p/5s 未计费（paid=false）  — paid=false credits=1 res=480 dur=5
+
+============================================================
+结果：通过 83 项，失败 0 项
+============================================================
