@@ -62,6 +62,9 @@ class Settings:
     visitor_id: str = ""
     max_concurrent: int = 2
     poll_interval: float = 10.0
+    # 探测类**只读**请求的超时（秒）：出口代理的 TLS 握手实测抖到 10s+，
+    # 一发卡住的探测会占满重试循环（默认 30s），所以探测单独用短超时。
+    probe_timeout: float = 8.0
 
     # ---- 通用 ----
     base_url: str = DEFAULT_BASE_URL
@@ -105,6 +108,7 @@ class Settings:
             visitor_id=str(env.get("AVM_VISITOR_ID", "")).strip(),
             max_concurrent=int(env.get("AVM_MAX_CONCURRENT") or 2),
             poll_interval=float(env.get("AVM_POLL_SECONDS") or 10),
+            probe_timeout=float(env.get("AVM_PROBE_TIMEOUT") or 8),
             base_url=str(env.get("AVM_BASE_URL", DEFAULT_BASE_URL)).rstrip("/"),
             gate_key=str(env.get("AVM_GATE_KEY", "")).strip(),
             # 服务名可用 AVM_SERVICE_NAME 临时覆盖，但默认值只有一个来源

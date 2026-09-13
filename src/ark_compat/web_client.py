@@ -80,6 +80,10 @@ class WebClient:
         user_id: str | None = None,
         visitor_id: str = "",
         timeout: float = 30.0,
+        # 探测类**只读**请求的超时与重试（见 `trpc` 的说明）。出口代理的 TLS 握手
+        # 实测抖到 10s+，一发卡住的探测会把闸门重试循环占满一整个默认 30s。
+        probe_timeout: float = 8.0,
+        probe_retries: int = 2,
         trust_env: bool = True,
         transport: httpx.BaseTransport | None = None,
     ):
@@ -95,6 +99,8 @@ class WebClient:
         self.user_id = str(user_id).strip()
         # 服务端**不校验** visitorId —— 随便一个 32 位十六进制都行
         self.visitor_id = visitor_id or os.environ.get("AVM_VISITOR_ID") or DEFAULT_VISITOR_ID
+        self.probe_timeout = float(probe_timeout)
+        self.probe_retries = max(0, int(probe_retries))
         self._http = httpx.Client(
             base_url=self.base_url,
             timeout=timeout,
@@ -127,11 +133,22 @@ class WebClient:
         return h
 
     def trpc(self, procedure: str, inp: Any = None, *, method: str = "GET",
-             referer: str = PAGE, meta: dict | None = None) -> Any:
+             referer: str = PAGE, meta: dict | None = None,
+             timeout: float | None = None, retries: int | None = None) -> Any:
         """调一个 tRPC procedure，解开 `result.data.json`；出错抛 `WebApiError`。
 
         `json.dumps` 用紧凑分隔符：tRPC 的 input 会被百分号编码进 query，
         紧凑写法避免空格被编码成 `+`／`%20` 的歧义。
+
+        **重试策略（2026-09-14 实测后加的）**：
+
+        - `GET` 是**只读** ⇒ 传输层错误（代理 502 / `ConnectError` / 各种 Timeout）
+          按 `probe_retries`（默认 2）**立即**重试。实测这类错误多数下一发就成功；
+          而"失败后等 10s 再试"会白烧掉一整个闸门窗口（实测：一次真提交被代理吞掉
+          ⇒ 那个窗口作废 ⇒ 该条整体延后 393s）。
+        - `POST` 是**写**，而这条线**没有幂等键** ⇒ **绝不自动重试**：响应丢失时重试
+          可能重复建任务（计费线上就是重复扣费）。写失败只能由调用方决定怎么处理。
+        - `timeout=None` ⇒ 用 client 默认（长）；探测类显式传 `probe_timeout`（短）。
         """
         payload = json.dumps(meta if meta is not None else {"0": {"json": inp}}, separators=(",", ":"))
         url = f"/api/{procedure}"
@@ -143,22 +160,38 @@ class WebClient:
         req_view = {"procedure": procedure, "method": method, "input": inp, "headers": safe_headers(hdrs)}
         started = time.perf_counter()
 
-        try:
-            if method == "POST":
-                extra["origin"] = self.base_url
-                r = self._http.post(url, params=params, headers=hdrs, json={"0": {"json": inp}})
-            else:
-                r = self._http.get(url, params=params, headers=hdrs)
-        except httpx.HTTPError as e:
-            note_upstream(
-                procedure,
-                upstream="web",
-                request=req_view,
-                status="error",
-                error=f"{type(e).__name__}: {e}",
-                duration_ms=(time.perf_counter() - started) * 1000,
-            )
-            raise WebApiError(procedure, f"{type(e).__name__}: {e}") from None
+        # 只有只读请求（GET）自动重试；写入（POST）一次都不重试 —— 没有幂等键。
+        planned = self.probe_retries if retries is None else max(0, int(retries))
+        attempts = 1 if method == "POST" else planned + 1
+        # ⚠️ httpx 的 `timeout=None` 表示**关闭超时**（不是"用默认值"），所以 None 时
+        # 必须**不传**这个参数，否则一个卡住的请求会永远挂着。
+        tkw = {} if timeout is None else {"timeout": timeout}
+
+        for attempt in range(attempts):
+            try:
+                if method == "POST":
+                    extra["origin"] = self.base_url
+                    r = self._http.post(url, params=params, headers=hdrs,
+                                        json={"0": {"json": inp}}, **tkw)
+                else:
+                    r = self._http.get(url, params=params, headers=hdrs, **tkw)
+                break
+            except httpx.HTTPError as e:
+                if attempt + 1 < attempts:
+                    # 立即重试：退避只用于错开极短抖动，不做秒级等待
+                    time.sleep(0.25 * (2 ** attempt))
+                    continue
+                note_upstream(
+                    procedure,
+                    upstream="web",
+                    request=req_view,
+                    status="error",
+                    error=f"{type(e).__name__}: {e}",
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                )
+                raise WebApiError(procedure, f"{type(e).__name__}: {e}") from None
+        else:  # pragma: no cover —— 循环要么 break 要么 raise
+            raise WebApiError(procedure, "transport error (no attempt completed)")
 
         elapsed = (time.perf_counter() - started) * 1000
         try:
@@ -229,7 +262,7 @@ class WebClient:
         网页端与官方 API **共用同一份积分池**（实测与 `/api/v1/account` 的
         `currentBalance` 相等），所以这个数也等于官方侧的余额。
         """
-        r = self.trpc("credits.getCredits", None, meta=VOID_INPUT)
+        r = self.trpc("credits.getCredits", None, meta=VOID_INPUT, timeout=self.probe_timeout)
         return (r or {}).get("totalRemaining")
 
     def needs_captcha(self) -> bool:
@@ -237,7 +270,13 @@ class WebClient:
 
         **动态风控开关，不是账号属性** —— 每次提交前都要重新问，不要缓存。
         """
-        return bool(self.trpc("model.needsCaptcha", {"userId": self.get_user_id()}))
+        return bool(
+            self.trpc(
+                "model.needsCaptcha",
+                {"userId": self.get_user_id()},
+                timeout=self.probe_timeout,
+            )
+        )
 
     # ------------------------------------------------------------- create ----
 

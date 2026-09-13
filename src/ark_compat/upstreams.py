@@ -142,6 +142,7 @@ def _build_web(
         user_id="" if passthrough else settings.user_id,
         visitor_id=settings.visitor_id,
         trust_env=settings.trust_env,
+        probe_timeout=settings.probe_timeout,
     )
     queue = WebSubmitQueue(
         client,
