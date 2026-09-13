@@ -72,8 +72,8 @@ jobs:
           set -euo pipefail
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git tag -a '${{ steps.ver.outputs.version }}' -m 'Release ${{ steps.ver.outputs.version }}'
-          git push origin '${{ steps.ver.outputs.version }}'
+          git tag -a '${{ steps.ver.outputs.next }}' -m 'Release ${{ steps.ver.outputs.next }}'
+          git push origin '${{ steps.ver.outputs.next }}'
 
       - name: Create GitHub Release
         env:
@@ -81,7 +81,7 @@ jobs:
           # 经 env 传值而不是内联到 shell：提交信息里出现单引号会把
           # `--notes '...'` 撕开，导致 release 建不出来或正文被截断。
           BODY: ${{ steps.log.outputs.body }}
-          TAG: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.next }}
         run: |
           set -euo pipefail
           printf '%s\n' "$BODY" > /tmp/notes.md
