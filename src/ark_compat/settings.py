@@ -7,6 +7,19 @@
 
     official  官方 API（`key` 头）—— 提交即计费，必须有支出上限
     web       网页端内部接口（会话 cookie）—— 有免费窗口，但没有取消端点
+
+**凭据的两种来源**（每条线各有一个透传开关）：
+
+===========================================  ==========================================
+本进程持有一份凭据（默认）                     调用方按请求自带凭据（透传）
+===========================================  ==========================================
+official：`AVM_KEY`                          official：`AVM_PASSTHROUGH_KEY=1`
+web：`AVM_COOKIE`                            web：`AVM_PASSTHROUGH_COOKIE=1`
+===========================================  ==========================================
+
+透传模式下调用方的 `Authorization: Bearer` 就是**上游凭据本身** —— 官方线放 API Key，
+web 线放网页会话 cookie。因此它与闸门（`AVM_GATE_KEY`）**互斥**：单一 Bearer 不可能
+既当闸门密钥又当上游凭据，同设的后果是每个请求都 401（见 `validate()`）。
 """
 
 from __future__ import annotations
@@ -63,6 +76,9 @@ class Settings:
 
     # ---- web 线 ----
     cookie: str = ""
+    # 调用方的 Bearer 里放网页会话 cookie（裸 token 或完整 Cookie 串），
+    # 本进程不再需要 AVM_COOKIE。这就是"走逆向线"的对外形态。
+    passthrough_cookie: bool = False
     user_id: str = ""
     visitor_id: str = ""
     max_concurrent: int = 2
@@ -107,6 +123,7 @@ class Settings:
             task_retention_days=int(env.get("AVM_TASK_RETENTION_DAYS") or DEFAULT_RETENTION_DAYS),
             upstream_key=str(env.get("AVM_KEY", "")).strip(),
             passthrough_key=_env_flag(env, "AVM_PASSTHROUGH_KEY"),
+            passthrough_cookie=_env_flag(env, "AVM_PASSTHROUGH_COOKIE"),
             max_credits=_env_int(env, "AVM_OFFICIAL_MAX_CREDITS"),
             default_model=str(env.get("AVM_OFFICIAL_MODEL", "")).strip(),
             cookie=normalize_cookie_header(env.get("AVM_COOKIE", "")),
@@ -136,12 +153,22 @@ class Settings:
 
     @property
     def web_ready(self) -> bool:
-        """web 线可用？（有会话 cookie）"""
-        return bool(self.cookie)
+        """web 线可用？（有会话 cookie，或开了透传让调用方自带 cookie）"""
+        return bool(self.cookie or self.passthrough_cookie)
+
+    @property
+    def passthrough(self) -> bool:
+        """是否有任一条线在"调用方自带凭据"形态下运行。"""
+        return bool(self.passthrough_key or self.passthrough_cookie)
 
     @property
     def available_upstreams(self) -> list[str]:
-        """本进程实际能用的上游 —— 凭据齐全的那些。两条都配齐就两条都能用。"""
+        """本进程实际能用的上游 —— 凭据齐全的那些。两条都配齐就两条都能用。
+
+        注意：这里说的是**能力**，不是"进程内已建好客户端"。透传线的客户端要等到
+        看到调用方凭据才能建（见 `upstreams.build_web_for_cookie`），所以它出现在这里
+        但不会出现在 `app.state.upstreams` 里。
+        """
         out: list[str] = []
         if self.official_ready:
             out.append("official")
@@ -158,17 +185,30 @@ class Settings:
                 f"AVM_TASK_STORE 必须是 {TASK_STORES} 之一（收到 {self.task_store!r}）"
             )
 
+        if self.passthrough and self.gate_key:
+            # 这不是"运行时才发现的偶发问题"，而是**必然失败**的组合：闸门先校验
+            # `Authorization: Bearer`，而透传要求同一个 Bearer 就是上游凭据。
+            # 两者同设时每个请求都会在闸门处 401，透传永远不生效 —— 且现象
+            # （401 AuthenticationError）看起来像是"调用方凭据错了"，极易误诊。
+            raise ValueError(
+                "AVM_GATE_KEY 与透传互斥（AVM_PASSTHROUGH_KEY / AVM_PASSTHROUGH_COOKIE）："
+                "同一个 Authorization: Bearer 不可能既是闸门密钥又是上游凭据。"
+                "要透传就清空 AVM_GATE_KEY；要闸门就关掉透传。"
+            )
+
         available = self.available_upstreams
         if not available:
             raise ValueError(
-                "至少要配一条上游：官方线用 AVM_KEY（或 AVM_PASSTHROUGH_KEY=1 透传调用方 token），"
+                "至少要配一条上游：官方线用 AVM_KEY（或 AVM_PASSTHROUGH_KEY=1 透传调用方 API Key），"
                 "web 线用 AVM_COOKIE（至少含 auth_session=...）"
+                "（或 AVM_PASSTHROUGH_COOKIE=1 透传调用方会话 cookie）"
             )
         if self.upstream not in available:
             # 不隐式回退 —— 那会悄悄改变计费语义（免费窗口 vs 一律计费）
             raise ValueError(
                 f"AVM_UPSTREAM={self.upstream} 缺少对应凭据；当前可用的是 {available}。"
-                f"官方线需要 AVM_KEY，web 线需要 AVM_COOKIE。"
+                f"官方线需要 AVM_KEY，web 线需要 AVM_COOKIE（或对应的透传开关）。"
+                f"只开透传时请显式写 AVM_UPSTREAM={available[0]}。"
             )
 
     @property
