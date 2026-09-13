@@ -183,7 +183,7 @@ AVM_COOKIE="auth_session=$(python3 -c "import json;print([c['value'] for c in js
 |---|---|---|
 | 绕开 cookie → 改用官方 API `key` | ✅ **可行（已验证）** | `ApiKey` 模型**无 `expiresAt` 字段**，不会过期；无 Turnstile 闸门 |
 | 绕开 cookie → 只带 `visitorId` 匿名调用 | ⚠️ **未坐实**（见 §5） | 项目内无归档证据；`visitorId` 服务端不校验，属弱标识 |
-| 绕开 `needsCaptcha` 动态闸门 | ❌ **不可行** | 自起 Chrome 注入真 cookie 后 Turnstile 挂死；只能 BYO 真 token 或等衰减 |
+| 绕开 `needsCaptcha` 动态闸门 | ❌ **不可行**（除非带 token） | 闸门开着时 `token: null` 会被静默拒；**带上真 token 即可连投**（2026-09-14 实测：自动化 Chrome 也能产出 token，条件见 skill `browser-cdp-anti-bot-proxy` 的 09-14 更正）；或等衰减 |
 
 补充：**你自己贴的那条 curl 没有 `Cookie` 头**，只有 `visitorId` + `token: null`。
 其中 `token: null` 仅在 `needsCaptcha=false` 时有效；闸门开启后**同一个 `token: null` 会被静默拒绝
