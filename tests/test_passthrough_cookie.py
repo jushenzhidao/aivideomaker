@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """透传鉴权：调用方的 `Authorization: Bearer` 就是**上游凭据本身**。
 
-两条线各一个开关，本文件测 **web 线**（`AVM_PASSTHROUGH_COOKIE=1`）：
-调用方带自己的网页会话 cookie，本进程不再需要 `AVM_COOKIE`。
+本文件测 web 线的透传开关（`AVM_PASSTHROUGH_COOKIE=1`）：调用方带自己的网页
+会话 cookie，本进程不再需要 `AVM_COOKIE`。
 
 纪律（与 test_ark_compat.py 一致）：
   1. **零额度消耗** —— 提交一律走 dry-run，或让假上游直接返回一个 taskId；
@@ -43,7 +43,6 @@ COOKIE_A = f"auth_session={TOKEN_A}"
 
 def settings(**kw) -> Settings:
     base = dict(
-        upstream="web",
         passthrough_cookie=True,
         base_url=DEAD_UPSTREAM,
         log_level="WARNING",
@@ -136,26 +135,30 @@ class TestPassthroughCookieConfig(unittest.TestCase):
         s = settings()
         s.validate()  # 不抛
         self.assertTrue(s.web_ready)
-        self.assertIn("web", s.available_upstreams)
-        self.assertNotIn("official", s.available_upstreams)
-        self.assertTrue(s.passthrough)
+        self.assertEqual(s.available_upstreams, ["web"])
+        self.assertTrue(s.passthrough_cookie)
 
     def test_from_env_reads_the_switch(self):
-        s = Settings.from_env({"AVM_PASSTHROUGH_COOKIE": "1", "AVM_UPSTREAM": "web"})
+        s = Settings.from_env({"AVM_PASSTHROUGH_COOKIE": "1"})
         self.assertTrue(s.passthrough_cookie)
-        self.assertTrue(s.passthrough)
 
-    def test_default_upstream_still_has_to_be_explicit(self):
-        # 只开透传时不隐式改默认线 —— 那是"悄悄换了一条计费语义完全不同的线"
+    def test_removed_official_line_is_rejected_loudly(self):
+        # official 上游已移除。旧配置里写着它时必须**拒绝启动** —— 静默按 web 跑起来
+        # 会让调用方以为自己用的是一条可取消、有幂等的线，实际拿到的是"没有取消端点"
+        # 的 web 线；这个误解只在任务卡住时暴露。
         with self.assertRaises(ValueError) as ctx:
-            settings(upstream="official").validate()
-        self.assertIn("AVM_UPSTREAM=web", str(ctx.exception))
+            settings(legacy_upstream="official").validate()
+        self.assertIn("AVM_UPSTREAM='official'", str(ctx.exception))
+        self.assertIn("web", str(ctx.exception))
+
+    def test_legacy_upstream_web_is_tolerated(self):
+        # 旧配置里写着 web 的属于无意义但无害，不该拦
+        settings(legacy_upstream="web").validate()
 
     def test_gate_and_passthrough_cannot_coexist(self):
-        for flag in ({"passthrough_cookie": True}, {"passthrough_key": True}):
-            with self.assertRaises(ValueError) as ctx:
-                settings(gate_key="sk-gate", **flag).validate()
-            self.assertIn("AVM_GATE_KEY", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            settings(gate_key="sk-gate").validate()
+        self.assertIn("AVM_GATE_KEY", str(ctx.exception))
 
     def test_gate_alone_is_still_fine(self):
         settings(passthrough_cookie=False, gate_key="sk-gate", cookie=COOKIE_A).validate()
@@ -214,6 +217,24 @@ class TestBearerIsTheCookie(PassthroughHttpCase):
         self.assertTrue(r.json()["dry_run"])
         self.assertEqual(r.json()["upstream"], "web")
 
+    def test_removed_upstream_selector_is_rejected(self):
+        # 旧客户端可能还在发 X-Avm-Upstream: official。明确 400，而不是静默按 web 跑。
+        r = self.client.post(
+            TASKS_PATH,
+            json=body(extra_body={"aivideomaker_dry_run": True}),
+            headers={**auth(TOKEN_A), "X-Avm-Upstream": "official"},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("official", r.json()["error"]["message"])
+
+    def test_explicit_web_selector_is_tolerated(self):
+        r = self.client.post(
+            TASKS_PATH,
+            json=body(extra_body={"aivideomaker_dry_run": True}),
+            headers={**auth(TOKEN_A), "X-Avm-Upstream": "web"},
+        )
+        self.assertEqual(r.status_code, 200)
+
     def test_same_credential_reuses_one_upstream(self):
         before = len(self.builder.calls)
         for _ in range(3):
@@ -233,12 +254,15 @@ class TestBearerIsTheCookie(PassthroughHttpCase):
 class TestHealthzHidesNothing(PassthroughHttpCase):
     def test_capabilities_are_declared_even_without_a_client_yet(self):
         j = self.client.get("/healthz").json()
-        self.assertIn("web", j["available_upstreams"])
+        self.assertEqual(j["available_upstreams"], ["web"])
         self.assertEqual(j["upstream"], "web")
         self.assertTrue(j["passthrough_cookie"])
         self.assertTrue(j["credentials_from_caller"])
         self.assertIn("billing_notes", j)
         self.assertIn("web", j["supports_cancel"])
+        # 已移除的官方线不该在健康检查里留下任何字段
+        for gone in ("switch_via", "max_credits", "default_model", "passthrough_key"):
+            self.assertNotIn(gone, j, f"{gone} 属于已移除的 official 线，不该再出现")
 
     def test_deep_probe_without_credentials_explains_itself(self):
         # 这里绝不能 401：存活探针拿到 401 会被读成"服务坏了 / 鉴权失败"
@@ -346,7 +370,7 @@ class TestCredentialPlumbing(unittest.TestCase):
         self.addCleanup(fixed.client.close)
         self.assertEqual(passed.client.user_id, "")
         self.assertEqual(fixed.client.user_id, "u-of-default-account")
-        # visitorId 不是账号身份（服务端不校验），两条线共用部署级取值是刻意的
+        # visitorId 不是账号身份（服务端不校验），共用部署级取值是刻意的
         self.assertEqual(passed.client.visitor_id, fixed.client.visitor_id)
         self.assertEqual(passed.client.cookie, COOKIE_A)
 

@@ -474,7 +474,7 @@ class TestSubmitQueue(unittest.TestCase):
 
 
 class TestNormalizeWebTask(unittest.TestCase):
-    def test_status_vocabulary_is_the_sites_not_the_officials(self):
+    def test_status_vocabulary_is_the_sites(self):
         self.assertEqual(normalize_web_task({"taskStatus": "processing"})["status"], "running")
         self.assertEqual(
             normalize_web_task({"taskStatus": "succeed", "url": "u"})["status"], "succeeded"
@@ -517,7 +517,6 @@ class TestNormalizeWebTask(unittest.TestCase):
 
 def web_settings(**kw) -> Settings:
     base = dict(
-        upstream="web",
         cookie="auth_session=deadbeef",
         base_url="https://site.test",
         log_level="WARNING",
@@ -637,19 +636,18 @@ class TestWebAppLayer(unittest.TestCase):
         self.assertEqual(self.fake.uploaded, [], "dry-run 不该产生任何上传 / 副作用")
 
 
-class TestTwoUpstreamsCoexist(unittest.TestCase):
-    """两条线**并存**：默认线由 AVM_UPSTREAM 定，按请求还能切。"""
+class TestWebOnlyUpstream(unittest.TestCase):
+    """本项目只有 web 一条线：请求一律走它，旧选线头必须被明确拒绝。"""
 
     def setUp(self):
         self.app = create_app(
             Settings(
-                upstream="official",
-                upstream_key="ak_test",
                 cookie="auth_session=deadbeef",
                 base_url="http://127.0.0.1:9",
                 log_level="WARNING",
                 enable_logfire=False,
                 trust_env=False,
+                task_store="memory",
             )
         )
         self.fake_web = FakeWebClient()
@@ -658,73 +656,58 @@ class TestTwoUpstreamsCoexist(unittest.TestCase):
         )
         self.client = TestClient(self.app)
 
-    def test_healthz_lists_both_lines(self):
+    def test_healthz_declares_only_the_web_line(self):
         j = self.client.get("/healthz").json()
-        self.assertEqual(j["available_upstreams"], ["official", "web"])
-        self.assertTrue(j["supports_cancel"]["official"])
-        self.assertFalse(j["supports_cancel"]["web"])
+        self.assertEqual(j["available_upstreams"], ["web"])
+        self.assertFalse(j["supports_cancel"]["web"], "web 线没有取消端点，不许谎报")
         self.assertIn("free up to 8s", j["billing_notes"]["web"])
-        self.assertIn("every submit is billed", j["billing_notes"]["official"])
+        # 已移除的官方线不该在健康检查里留下任何字段
+        for gone in ("switch_via", "max_credits", "default_model", "passthrough_key"):
+            self.assertNotIn(gone, j, f"{gone} 属于已移除的 official 线")
 
-    def test_same_request_switches_billing_semantics_by_header(self):
-        """同一个 5s/turbo：web 线免费、官方线计费 —— 一趟看清两条线的差别。"""
+    def test_dry_run_is_always_tagged_web(self):
         body = ark_body(extra_body={"aivideomaker_dry_run": True})
-        web = self.client.post(TASKS_PATH, json=body, headers={"X-Avm-Upstream": "web"}).json()
-        official = self.client.post(TASKS_PATH, json=body, headers={"X-Avm-Upstream": "official"}).json()
-        self.assertEqual(web["upstream"], "web")
-        self.assertFalse(web["effective"]["billed"])
-        self.assertEqual(official["upstream"], "official")
-        self.assertTrue(official["effective"]["billed"])
-
-    def test_query_parameter_also_switches(self):
-        body = ark_body(extra_body={"aivideomaker_dry_run": True})
-        j = self.client.post(f"{TASKS_PATH}?upstream=web", json=body).json()
+        j = self.client.post(TASKS_PATH, json=body).json()
         self.assertEqual(j["upstream"], "web")
+        self.assertFalse(j["effective"]["billed"])  # 480p/5s/turbo 落在免费窗口内
 
-    def test_default_is_the_configured_line(self):
+    def test_removed_upstream_selector_is_rejected(self):
+        """旧客户端可能还在发 X-Avm-Upstream: official —— 明确 400，不许静默按 web 跑。"""
+        r = self.client.post(TASKS_PATH, json=ark_body(), headers={"X-Avm-Upstream": "official"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["error"]["code"], "InvalidParameter")
+        self.assertIn("official", r.json()["error"]["message"])
+
+    def test_explicit_web_selector_is_tolerated(self):
         body = ark_body(extra_body={"aivideomaker_dry_run": True})
-        self.assertEqual(self.client.post(TASKS_PATH, json=body).json()["upstream"], "official")
+        j = self.client.post(TASKS_PATH, json=body, headers={"X-Avm-Upstream": "web"}).json()
+        self.assertEqual(j["upstream"], "web")
 
     def test_unknown_upstream_is_rejected(self):
         r = self.client.post(TASKS_PATH, json=ark_body(), headers={"X-Avm-Upstream": "nope"})
         self.assertEqual(r.status_code, 400)
         self.assertEqual(r.json()["error"]["code"], "InvalidParameter")
 
-    def test_switching_to_an_unconfigured_line_says_what_is_missing(self):
-        c = TestClient(create_app(web_settings()))  # 只配了 web
-        r = c.post(TASKS_PATH, json=ark_body(), headers={"X-Avm-Upstream": "official"})
-        self.assertEqual(r.status_code, 503)
-        self.assertEqual(r.json()["error"]["code"], "UpstreamUnavailable")
-        self.assertIn("AVM_KEY", r.json()["error"]["message"])
 
-
-class TestUpstreamSwitch(unittest.TestCase):
-    def test_both_lines_configured_means_both_available(self):
-        s = Settings(upstream="web", upstream_key="ak_x", cookie="auth_session=y")
+class TestSettingsContract(unittest.TestCase):
+    def test_web_credentials_are_enough(self):
+        s = Settings(cookie="auth_session=y")
         s.validate()
-        self.assertEqual(s.available_upstreams, ["official", "web"])
-
-    def test_default_line_without_credentials_is_reported_clearly(self):
-        with self.assertRaises(ValueError) as ctx:
-            Settings(upstream="official", cookie="auth_session=y").validate()
-        self.assertIn("官方线需要 AVM_KEY", str(ctx.exception))
+        self.assertEqual(s.available_upstreams, ["web"])
 
     def test_web_settings_require_a_cookie(self):
         with self.assertRaises(ValueError) as ctx:
-            Settings(upstream="web", cookie="").validate()
+            Settings(cookie="").validate()
         self.assertIn("AVM_COOKIE", str(ctx.exception))
 
-    def test_official_settings_require_a_key(self):
-        with self.assertRaises(ValueError):
-            Settings(upstream="official", upstream_key="").validate()
+    def test_removed_official_line_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            Settings(cookie="auth_session=y", legacy_upstream="official").validate()
+        self.assertIn("official", str(ctx.exception))
 
-    def test_unknown_upstream_is_rejected(self):
-        with self.assertRaises(ValueError):
-            Settings(upstream="nope").validate()
-
-    def test_from_env_reads_the_switch(self):
+    def test_from_env_tolerates_the_legacy_web_value(self):
         s = Settings.from_env({"AVM_UPSTREAM": "WEB", "AVM_COOKIE": "auth_session=x"})
-        self.assertEqual(s.upstream, "web")
+        self.assertEqual(s.legacy_upstream, "web")
         s.validate()  # 不应抛
 
 

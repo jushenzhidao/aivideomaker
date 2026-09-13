@@ -44,7 +44,6 @@ from logfire.testing import (  # noqa: E402
 
 from ark_compat import observability as O  # noqa: E402
 from ark_compat.app import TASKS_PATH, create_app  # noqa: E402
-from ark_compat.client import OfficialClient  # noqa: E402
 from ark_compat.upstreams import WebUpstream  # noqa: E402
 from ark_compat.web_queue import WebSubmitQueue  # noqa: E402
 
@@ -59,7 +58,6 @@ from test_web_upstream import (  # noqa: E402
     web_settings,
 )
 
-KEY = "ak_trace_contract_secret"
 COOKIE = "auth_session=deadbeef"
 GATE = "gate-secret-123"
 
@@ -77,89 +75,8 @@ SITE_TASK = {
 }
 
 
-def official_client(handler) -> OfficialClient:
-    """官方客户端 + MockTransport 替身。构造后换掉 `_http`，零网络。"""
-    c = OfficialClient(KEY, base_url="https://up.test", trust_env=False)
-    c._http.close()
-    c._http = httpx.Client(
-        base_url="https://up.test",
-        transport=httpx.MockTransport(handler),
-        headers={"key": KEY, "accept": "application/json"},
-    )
-    return c
-
-
 class TestExchangeRecorder(unittest.TestCase):
     """采集层：有没有原文、失败路径有没有留痕、凭证有没有被摘掉。"""
-
-    def test_official_request_response_and_task_id_are_recorded(self):
-        c = official_client(lambda r: httpx.Response(200, json={"taskId": "up-1"}))
-
-        with O.upstream_exchanges() as box:
-            task_id = c.create("seedance20", {"prompt": "a cat", "duration": 5}, max_credits=7)
-
-        self.assertEqual(task_id, "up-1")
-        self.assertEqual(len(box), 1)
-        rec = box[0]
-        self.assertEqual(rec["upstream"], "official")
-        self.assertEqual(rec["status"], "ok")
-        self.assertEqual(rec["request"]["json"], {"prompt": "a cat", "duration": 5})
-        self.assertEqual(rec["response"]["http_status"], 200)
-        self.assertEqual(rec["response"]["body"], {"taskId": "up-1"})
-        self.assertEqual(rec["task_id"], "up-1")
-        self.assertGreaterEqual(rec["duration_ms"], 0)
-
-    def test_the_spend_cap_header_is_kept_but_the_key_is_not(self):
-        """`X-Max-Credits` 是排障要看的头；`key` 是凭证 —— 同一个 dict 里两种命运。"""
-        c = official_client(lambda r: httpx.Response(200, json={"taskId": "up-1"}))
-
-        with O.upstream_exchanges() as box:
-            c.create("seedance20", {"prompt": "x"}, max_credits=7, idempotency_key="idem-1")
-
-        headers = box[0]["request"]["headers"]
-        self.assertEqual(headers["X-Max-Credits"], "7")
-        self.assertEqual(headers["Idempotency-Key"], "idem-1")
-        self.assertNotIn("key", {k.lower() for k in headers})
-        self.assertNotIn(KEY, json.dumps(box))
-
-    def test_the_key_sitting_on_the_session_is_never_recorded(self):
-        """真客户端的 `key` 挂在 httpx 会话上 —— 采集器不该顺手把会话头抄进去。"""
-        c = official_client(lambda r: httpx.Response(200, json={"taskId": "up-1"}))
-        with O.upstream_exchanges() as box:
-            c.create("seedance20", {"prompt": "x"}, max_credits=7)
-        self.assertNotIn(KEY, json.dumps(box))
-
-    def test_upstream_error_body_is_recorded(self):
-        """失败路径同样要留痕：上游拒绝的理由（body）只在这里出现一次。"""
-        c = official_client(
-            lambda r: httpx.Response(400, json={"errorCode": "INVALID_PAYLOAD", "message": "bad ratio"})
-        )
-
-        with O.upstream_exchanges() as box:
-            with self.assertRaises(Exception) as ctx:
-                c.create("seedance20", {"prompt": "x"}, max_credits=7)
-
-        self.assertIn("INVALID_PAYLOAD", str(ctx.exception))
-        self.assertEqual(len(box), 1)
-        rec = box[0]
-        self.assertEqual(rec["status"], "error")
-        self.assertEqual(rec["response"]["http_status"], 400)
-        self.assertEqual(rec["response"]["body"]["errorCode"], "INVALID_PAYLOAD")
-        self.assertIn("400", rec["error"])
-
-    def test_network_failure_keeps_the_request_side(self):
-        def boom(request):
-            raise httpx.ConnectError("refused", request=request)
-
-        c = official_client(boom)
-        with O.upstream_exchanges() as box:
-            with self.assertRaises(Exception):
-                c.create("seedance20", {"prompt": "x"}, max_credits=7)
-
-        rec = box[0]
-        self.assertEqual(rec["status"], "error")
-        self.assertEqual(rec["request"]["json"], {"prompt": "x"})
-        self.assertNotIn("response", rec, "从未收到应答时不该伪造一个 response")
 
     def test_web_trpc_records_input_and_raw_envelope_without_cookie(self):
         site = FakeSite()
@@ -198,9 +115,11 @@ class TestExchangeRecorder(unittest.TestCase):
 
     def test_nothing_is_collected_when_nobody_is_watching(self):
         """没有采集箱时立即返回：不建列表、不序列化（轮询线程里每 10 秒一次的长尾）。"""
-        c = official_client(lambda r: httpx.Response(200, json={"taskId": "up-1"}))
+        site = FakeSite()
+        site.set("ai.minimaxH3", "t1")
+        client = make_client(site, user_id="u1")
         self.assertIsNone(O._EXCHANGES.get())
-        c.create("seedance20", {"prompt": "x"}, max_credits=1)
+        client.create({"content": "x"})
         self.assertIsNone(O._EXCHANGES.get())
 
 
@@ -445,7 +364,7 @@ class TestSpanContract(unittest.TestCase):
     def test_no_credential_ever_reaches_a_span(self):
         """脱敏关着 ⇒ 防线只剩 capture_headers=False。这里断言它真的在。
 
-        三个串都来自真实路径：站点 cookie、调用方 Bearer、官方 key。
+        两个串都来自真实路径：站点 cookie 与调用方 Bearer。
         """
         tid = self.post_task()["id"]
         self.client.get(f"{TASKS_PATH}/{tid}", headers={"Authorization": f"Bearer {GATE}"})
@@ -454,7 +373,6 @@ class TestSpanContract(unittest.TestCase):
         self.assertNotIn(COOKIE, blob)
         self.assertNotIn("auth_session", blob)
         self.assertNotIn(GATE, blob)
-        self.assertNotIn(KEY, blob)
 
     def test_scrubbing_is_off_so_credential_bearing_urls_stay_readable(self):
         """默认脱敏会把这个出片地址整条替换成 `[Scrubbed due to 'Credential']`，

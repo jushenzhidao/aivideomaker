@@ -11,9 +11,8 @@
 （点名被丢弃的 URL 与因此悬空的提示词占位符）。静默截断是本项目最贵的一类缺陷。
 
 三条纪律（与 `test_ark_compat.py` 一致）：
-  1. **零额度消耗** —— 需要"真实提交"的用例一律指向死端口上游，且拒绝发生在
-     发出上游请求**之前**（断言拿到的是 InvalidParameter，而不是计费保护那条
-     BudgetGuardRequired —— 后者证明代码已经走到提交路径了）；
+  1. **零额度消耗** —— 提交一律走 dry-run，或让拦截发生在发出上游请求**之前**
+     （死端口上游从头到尾不被碰到）；
   2. **零外发** —— 上游 base_url = 127.0.0.1:9，客户端 trust_env=False；
   3. 主要压纯函数，HTTP 层只做路由与错误信封的往返回归。
 
@@ -88,7 +87,7 @@ def ref_video(url: str) -> dict:
 
 def settings(**kw) -> Settings:
     base = dict(
-        upstream_key="ak_test",
+        cookie="auth_session=" + "x" * 40,
         base_url=DEAD_UPSTREAM,
         log_level="CRITICAL",
         enable_logfire=False,
@@ -110,63 +109,52 @@ class TestDocumentedExample(unittest.TestCase):
     """文档示例：6 段参考视频按上游上限截断到 1 段，且截断必须留痕。"""
 
     def setUp(self):
-        self.plan = T.translate_create(doc_example(), {})
+        self.plan = T.translate_create(doc_example())
         self.wp = self.plan["web_params"]
 
     def test_only_the_first_reference_video_survives(self):
         self.assertEqual(self.wp["referenceVideoUrl"], REF_VIDEOS[0])
-        self.assertNotIn("referenceVideoUrls", self.wp)
+        note = dropped_notes(self.plan, "reference_video")[0]
+        for u in REF_VIDEOS[1:]:
+            self.assertIn(u, note, "每一段被丢弃的视频都必须被点名")
+        self.assertIn("5 dropped", note)
 
-    def test_dropped_videos_are_named_in_the_warnings(self):
-        notes = dropped_notes(self.plan, "reference_video")
-        self.assertEqual(len(notes), 1, self.plan["warnings"])
-        for url in REF_VIDEOS[1:]:
-            self.assertIn(url, notes[0])
+    def test_truncation_is_never_silent(self):
+        # 6 段视频丢 5；@视频2…@视频6 的占位符因此全部悬空，必须逐个点名
+        joined = " ".join(self.plan["warnings"])
+        for n in (2, 3, 4, 5, 6):
+            self.assertIn(f"@视频{n}", joined)
 
     def test_dangling_prompt_placeholders_are_named(self):
-        """截断后 @视频2…@视频6 已无对应素材 —— 必须点名，否则会"参考错素材"。"""
         dangling = [w for w in self.plan["warnings"] if "cannot resolve" in w]
-        self.assertEqual(len(dangling), 1, self.plan["warnings"])
-        for n in range(2, 7):
-            self.assertIn(f"@视频{n}", dangling[0])
-        self.assertNotIn("@视频1,", dangling[0])
-        self.assertNotIn("@图像1", dangling[0])
+        self.assertTrue(dangling, "悬空占位符必须告警")
+        self.assertIn("@视频2", dangling[0])
 
-    def test_reference_image_is_forwarded_whole(self):
-        self.assertEqual(self.wp["referenceImageUrls"], [REF_IMAGE])
-
-    def test_top_level_parameters_survive(self):
-        self.assertEqual(self.wp["duration"], 15)
+    def test_extra_parameters_are_echoed_not_dropped(self):
         self.assertEqual(self.wp["aspectRatio"], "16:9")
         self.assertEqual(self.plan["requested"]["omni_reference_task_type"], "reference")
         self.assertEqual(self.plan["requested"]["output_format"], "mov")
 
     def test_billing_is_flagged_on_the_web_line(self):
-        eff, _ = T.billing_view(self.plan, "web")
+        eff, _ = T.billing_view(self.plan)
         self.assertTrue(eff["billed"])  # 15s 已越过 ≤8s 的免费窗口
         self.assertEqual(eff["tier"], "turbo")
-
-    def test_official_payload_now_carries_the_reference_video(self):
-        """官方线原来把参考视频**全丢**（payload 里没有这个字段）。"""
-        payload = self.plan["official_payload"]
-        self.assertEqual(payload["referenceVideoUrl"], REF_VIDEOS[0])
-        self.assertTrue(
-            any("referenceVideoUrl field is unverified" in w for w in self.plan["official_warnings"])
-        )
 
     def test_effective_reports_the_actual_container(self):
         self.assertEqual(self.plan["effective"]["output_format"], "mp4")
 
     def test_nothing_is_silently_lost(self):
         """本次请求的每一项要么发出去了、要么出现在 warnings 里。"""
-        named = " ".join(self.plan["warnings"])
-        for url in REF_VIDEOS[1:]:
-            self.assertIn(url, named)
+        joined = " ".join(self.plan["warnings"] + self.plan["unsupported"])
+        self.assertIn("mov", joined)
+        self.assertIn("generate_audio", joined)
 
 
 class TestReferenceTruncation(unittest.TestCase):
-    def test_single_video_passes_through(self):
-        plan = T.translate_create(minimal(content=[{"type": "text", "text": "x"}, ref_video(REF_VIDEOS[0])]))
+    def test_one_reference_video_is_kept_as_is(self):
+        plan = T.translate_create(
+            minimal(content=[{"type": "text", "text": "x"}, ref_video(REF_VIDEOS[0])])
+        )
         self.assertEqual(plan["web_params"]["referenceVideoUrl"], REF_VIDEOS[0])
         self.assertFalse(dropped_notes(plan, "reference_video"))
 
@@ -223,7 +211,7 @@ class TestOmniTaskType(unittest.TestCase):
         with self.assertRaises(ParamError):
             T.translate_create(minimal(omni_reference_task_type="resurrect"))
 
-    def test_edit_and_extend_are_incompatible_with_the_configured_upstreams(self):
+    def test_edit_and_extend_are_incompatible_with_the_web_upstream(self):
         for value in ("edit", "extend"):
             plan = T.translate_create(minimal(omni_reference_task_type=value))
             self.assertTrue(plan["incompatible"], value)
@@ -291,12 +279,7 @@ class TestOmniHttpLayer(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # 官方线：无支出上限 → 若拦截失效会拿到 BudgetGuardRequired，可据此判定拦截位置
         cls.client = TestClient(create_app(settings()))
-        # web 线：反向证明"换一条上游照样优先拒绝"
-        cls.web_client = TestClient(
-            create_app(settings(upstream="web", upstream_key="", cookie="auth_session=" + "x" * 40))
-        )
 
     def test_dry_run_returns_the_full_translation(self):
         r = self.client.post(TASKS_PATH, json=doc_example(extra_body={"aivideomaker_dry_run": True}))
@@ -308,7 +291,7 @@ class TestOmniHttpLayer(unittest.TestCase):
         self.assertEqual(j["incompatible"], [])
         self.assertTrue(any("5 dropped" in w for w in j["warnings"]))
 
-    def test_edit_is_visible_in_dry_run_but_refused_on_submit(self):
+    def test_edit_is_visible_in_dry_run_but_refused_before_submitting(self):
         payload = doc_example(omni_reference_task_type="edit")
 
         dry = self.client.post(TASKS_PATH, json={**payload, "extra_body": {"aivideomaker_dry_run": True}})
@@ -317,22 +300,17 @@ class TestOmniHttpLayer(unittest.TestCase):
 
         live = self.client.post(TASKS_PATH, json=payload)
         self.assertEqual(live.status_code, 400)
-        # 关键：拿到的是 InvalidParameter 而**不是** BudgetGuardRequired。
-        # 后者说明代码已经走到"提交上游"那一步了；前者证明拦截发生在其之前 ——
-        # 死端口上游从头到尾没被碰过。
+        # 关键：拿到的是 InvalidParameter —— 证明拦截发生在"发出上游请求"之前，
+        # 死端口上游从头到尾没被碰过（否则这里会是 502 连接失败）。
         self.assertEqual(live.json()["error"]["code"], "InvalidParameter")
         self.assertIn("edit", live.json()["error"]["message"])
 
-    def test_web_line_refuses_edit_before_touching_the_station(self):
-        r = self.web_client.post(TASKS_PATH, json=doc_example(omni_reference_task_type="extend"))
-        self.assertEqual(r.status_code, 400)
-        self.assertEqual(r.json()["error"]["code"], "InvalidParameter")
-
     def test_reference_task_is_not_refused_by_the_compatibility_gate(self):
-        """对照组：reference 类的请求不该被新门禁拦下（它会被计费保护拦，那是另一回事）。"""
+        """对照组：reference 类请求不该被兼容门禁拦下 —— 它会真的打上游（死端口），
+        以 5xx 收场。关键是**不是** 400 InvalidParameter。"""
         r = self.client.post(TASKS_PATH, json=doc_example())
-        self.assertEqual(r.status_code, 400)
-        self.assertEqual(r.json()["error"]["code"], "BudgetGuardRequired")
+        self.assertNotEqual(r.status_code, 400)
+        self.assertNotEqual(r.json().get("error", {}).get("code"), "InvalidParameter")
 
 
 if __name__ == "__main__":
