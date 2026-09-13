@@ -42,7 +42,10 @@ DURATION_ALLOWED: dict[str, list[int]] = {
     "720p": list(range(5, 21)),
     "1080p": list(range(5, 21)),
 }
-FREE_MAX_DURATION = 8  # 免费窗口的上界：turbo 且不超过它就不计费
+FREE_MAX_DURATION = 10  # 免费窗口的上界：turbo 且不超过它就不计费
+# ⚠️ 2026-09-14 更正：原写 8s。终态实测证据 —— 你自己在站点提交的 `480p/10s/turbo`
+#   任务记录为 `taskStatus=succeed` + **`paid=False`**（余额未动）⇒ 10s 仍在免费区。
+#   480p 的合法时长只有 5/10/15/20 ⇒ 免费档为 5s 与 10s；720p 连续 5~20 ⇒ 免费档 5~10s。
 
 # Seedance 2.5 的「全能参考」任务类型。
 #   auto / reference  普通全模态生成与参考驱动 —— 站点侧有对应能力
@@ -89,7 +92,7 @@ def snap_duration(duration: Any, resolution: str, prefer_free: bool = False) -> 
     只有越界值才会被就近钳制。
 
     `prefer_free=True` 是**省钱开关**，语义为"别越过免费线"：凡是超过
-    `FREE_MAX_DURATION` 的合法时长（例如 12s）都会被主动拉回 8s —— 而不只是
+    `FREE_MAX_DURATION` 的合法时长（例如 15s）都会被主动拉回免费上界 —— 而不只是
     在越界时才生效。
     """
     allowed = DURATION_ALLOWED.get(resolution) or [5]
@@ -443,7 +446,7 @@ def billing_note() -> str:
 def billing_view(plan: Mapping[str, Any]) -> tuple[dict, list[str]]:
     """渲染计费口径。
 
-    `tier=base` 一律计费；`tier=turbo` 且 ≤8s **免费**。
+    `tier=base` 一律计费；`tier=turbo` 且 ≤10s（`FREE_MAX_DURATION`）**免费**。
 
     返回 `(effective, warnings)`。判据只有一个：`effective.billed`
     —— 站点任务记录里的 `paid` 才是最终事实（`credits` 与它反相，别用它判断）。
