@@ -355,3 +355,26 @@ node tools/session-diagnose.mjs --submit
 - **无头 0/4 超时、有头 3/4 秒** ⇒ 部署用 `xvfb-run -a`，别用 `--headless=new`。
 - 并发天花板由套餐决定：`ai.queryUserPermission.maxQueueLength`（premium 2 / pro 4），
   超限原文：`"The queue is full. The <plan> plan can only run N task at a time."`
+
+
+### 怎么起这套（2026-09-14 实测跑通的命令）
+
+```bash
+# 1) 铸造服务（常驻；Linux 用 xvfb-run 有头，macOS 直接有头）
+MINTER_KEY=<自定> POOL_TARGET=4 TOKEN_TTL_S=120 PORT=8899 \
+  CHROME_PROFILE=/tmp/avm-chrome python3 tools/turnstile_service.py
+#   自检：curl -s http://127.0.0.1:8899/healthz   # 12ms 内返回；ready=true 且 pool 涨到 target
+
+# 2) 适配层挂上铸造服务（闸门开着且调用方没带 token 时自动取）
+AVM_MINTER_URL=http://127.0.0.1:8899 AVM_MINTER_KEY=<同上> \
+AVM_COOKIE='auth_session=...' AVM_MAX_CONCURRENT=6 python3 src/ark_server.py
+```
+
+实测结果（pro 账号）：连投 6 条 → **#1~#4 接受、#5 起报
+`The queue is full. The pro plan can only run 4 task at a time.`**；
+铸造服务 `minted=8 failed=0 served=6` ⇒ 闸门不再是瓶颈，天花板回到账号额度。
+
+⚠️ 三个已踩过的坑（都会表现成"莫名其妙起不来"）：
+1. `--user-data-dir` 给了别的平台的路径 ⇒ Chrome 静默回落默认 profile ⇒"在现有会话中打开"、CDP 不开；
+2. `HTTP_PROXY` 劫持回环 ⇒ CDP 的 127.0.0.1 请求被拐走（已用 ProxyHandler({}) 与 http_no_proxy 绕开）；
+3. 探活与铸造共用锁 ⇒ 冷启动 46 秒期间 `/healthz` 超时（已拆两把锁）。
