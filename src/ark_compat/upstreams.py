@@ -24,6 +24,7 @@ import base64
 import re
 from typing import Any, Callable
 
+from .minter import TokenMinter
 from .translate import normalize_web_task
 from .web_client import WebClient
 from .web_queue import WebSubmitQueue
@@ -143,6 +144,8 @@ def _build_web(
         visitor_id=settings.visitor_id,
         trust_env=settings.trust_env,
         probe_timeout=settings.probe_timeout,
+        # 闸门开着时会自动去铸造服务取 token（未配置则为 None ⇒ 行为不变）
+        minter=TokenMinter(settings.minter_url, settings.minter_key, settings.minter_timeout),
     )
     queue = WebSubmitQueue(
         client,

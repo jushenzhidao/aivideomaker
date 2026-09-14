@@ -67,6 +67,12 @@ class Settings:
     probe_timeout: float = 8.0
     # 号池上报是否带**账号身份（邮箱）**。默认关：遥测里放 PII 要显式点头。
     account_report_identity: bool = False
+    # ---- Turnstile token 铸造服务（见 tools/turnstile_service.py）----
+    # 闸门开着且调用方没带 token 时，自动去这里取一个；取不到则如实失败（退回慢路径）。
+    # 留空 = 不启用（行为与以前完全一致）。
+    minter_url: str = ""
+    minter_key: str = ""
+    minter_timeout: float = 25.0
 
     # ---- 通用 ----
     base_url: str = DEFAULT_BASE_URL
@@ -111,6 +117,9 @@ class Settings:
             max_concurrent=int(env.get("AVM_MAX_CONCURRENT") or 2),
             poll_interval=float(env.get("AVM_POLL_SECONDS") or 10),
             probe_timeout=float(env.get("AVM_PROBE_TIMEOUT") or 8),
+            minter_url=(env.get("AVM_MINTER_URL") or "").strip(),
+            minter_key=(env.get("AVM_MINTER_KEY") or "").strip(),
+            minter_timeout=float(env.get("AVM_MINTER_TIMEOUT") or 25),
             account_report_identity=_env_flag(env, "AVM_ACCOUNT_REPORT_IDENTITY"),
             base_url=str(env.get("AVM_BASE_URL", DEFAULT_BASE_URL)).rstrip("/"),
             gate_key=str(env.get("AVM_GATE_KEY", "")).strip(),

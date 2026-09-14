@@ -35,6 +35,7 @@
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -42,7 +43,10 @@ import urllib.request
 
 import websocket
 
-PORT = 9222
+PORT = int(os.environ.get("CDP_PORT", "9222"))
+# profile 目录必须**按平台**给：macOS 上给 Linux 路径（/root/...）Chrome 会静默回落到默认
+# profile，于是"看到已有实例 ⇒ 在现有会话中打开"，--remote-debugging-port 被忽略、CDP 起不来。
+PROFILE_DIR = os.environ.get("CHROME_PROFILE") or ("/root/avm-chrome" if sys.platform.startswith("linux") else "/tmp/avm-chrome")   # CDP 端口；被占用时用 CDP_PORT 换一个
 SITEKEY = os.environ.get("SITEKEY", "0x4AAAAAABrddy3Hsje8mwB_")
 ORIGIN = os.environ.get("ORIGIN", "https://aivideomaker.ai/zh/ai-video-generator")
 # 同 origin 的轻量页（sitekey 按域名生效，任何同源页面都行）—— 比加载整个应用页快一倍
@@ -68,19 +72,38 @@ def cdp_ok():
         return False
 
 
+def chrome_bin() -> str:
+    """Chrome 可执行文件：优先 CHROME_BIN；其次按平台猜（Linux 用 google-chrome，macOS 用 app 内二进制）。"""
+    env = os.environ.get("CHROME_BIN")
+    if env:
+        return env
+    mac = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    if sys.platform == "darwin" and os.path.exists(mac):
+        return mac
+    return "/usr/bin/google-chrome"
+
+
 def start_chrome():
     if cdp_ok() and KEEP:
         return
     subprocess.run(["pkill", "-f", f"remote-debugging-port={PORT}"], capture_output=True)
     time.sleep(2)
-    args = ["/usr/bin/google-chrome", f"--remote-debugging-port={PORT}",
-            "--remote-debugging-address=127.0.0.1", "--user-data-dir=/root/avm-chrome",
+    args = [chrome_bin(), f"--remote-debugging-port={PORT}",
+            "--remote-debugging-address=127.0.0.1", f"--user-data-dir={PROFILE_DIR}",
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled",
             "--no-first-run", "--no-default-browser-check", "--window-size=1280,900",
             "--remote-allow-origins=*"]
     if HEADLESS:
         args.append("--headless=new")
-    cmd = ["setsid", "nohup", "xvfb-run", "-a", "--server-args=-screen 0 1280x900x24"] + args + ["about:blank"]
+    # setsid / xvfb-run 都是 Linux 专有：macOS 上要按 which 判断（少了 setsid 会直接报
+    # FileNotFoundError，而服务只会在 /healthz 的 last_error 里露出，很难查）
+    head = ["nohup"]
+    if shutil.which("setsid"):
+        head = ["setsid"] + head
+    # Xvfb 只在"没有显示器"时必要；macOS 直接有头跑
+    if shutil.which("xvfb-run"):
+        head += ["xvfb-run", "-a", "--server-args=-screen 0 1280x900x24"]
+    cmd = head + args + ["about:blank"]
     subprocess.Popen(cmd, stdout=open("/tmp/chrome-run.log", "ab"),
                      stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
     for _ in range(90):
@@ -96,7 +119,14 @@ def val_of(resp):
 
 class CDP:
     def __init__(self, ws_url):
-        self.ws = websocket.create_connection(ws_url, timeout=150, suppress_origin=True)
+        self.ws = websocket.create_connection(
+            ws_url,
+            timeout=150,
+            suppress_origin=True,
+            # ⚠️ 与 http_json 同理：websocket-client 默认也读 proxy 环境，
+            # 不排除回环就会被代理接管（表现为连不上刚起的 Chrome）。
+            http_no_proxy=("127.0.0.1", "localhost"),
+        )
         self.i = 0
 
     def call(self, method, session=None, **params):

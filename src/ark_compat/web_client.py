@@ -25,6 +25,7 @@ from typing import Any, Iterable
 from urllib.parse import unquote
 
 import httpx
+from loguru import logger
 
 from .cookie import normalize_cookie_header
 from .errors import CaptchaRequiredError, ParamError, WebApiError
@@ -84,6 +85,9 @@ class WebClient:
         # 实测抖到 10s+，一发卡住的探测会把闸门重试循环占满一整个默认 30s。
         probe_timeout: float = 8.0,
         probe_retries: int = 2,
+        # 铸造服务客户端（可选）。闸门开着且调用方没带 token 时用它取一个；
+        # 没配 / 取不到 ⇒ 如实抛 CaptchaRequiredError（绝不静默提交）。
+        minter: object | None = None,
         trust_env: bool = True,
         transport: httpx.BaseTransport | None = None,
     ):
@@ -101,6 +105,7 @@ class WebClient:
         self.visitor_id = visitor_id or os.environ.get("AVM_VISITOR_ID") or DEFAULT_VISITOR_ID
         self.probe_timeout = float(probe_timeout)
         self.probe_retries = max(0, int(probe_retries))
+        self.minter = minter
         self._http = httpx.Client(
             base_url=self.base_url,
             timeout=timeout,
@@ -293,6 +298,15 @@ class WebClient:
 
     # ------------------------------------------------------------- create ----
 
+    def _mint_token_from_service(self) -> str | None:
+        """向铸造服务取一个 token；未配置或失败都返回 None（调用方降级）。"""
+        if self.minter is None or not getattr(self.minter, "configured", False):
+            return None
+        tok = self.minter.mint()
+        if tok:
+            logger.info("已从铸造服务取得 Turnstile token（len={}）", len(tok))
+        return tok
+
     def create(self, params: dict, token: str | None = None) -> str:
         """创建视频任务，返回站点 taskId。
 
@@ -302,11 +316,18 @@ class WebClient:
         所以我们必须自己把它变成显式失败。
         """
         if self.needs_captcha() and not token:
-            raise CaptchaRequiredError(
-                "account currently requires a Turnstile captcha (model.needsCaptcha=true). "
-                "This is a dynamic, velocity-based gate, not an account property. "
-                "Supply a fresh Turnstile token, wait for it to decay, or spread the submissions out."
-            )
+            # 闸门开着：若接了铸造服务就先要一个（这是把吞吐从 ~20 条/小时抬到
+            # ~120 条/小时的那把钥匙）。**取不到就如实失败** —— 没 token 也提交会被
+            # 上游静默拒（返回空串），那看起来像成功，是最难查的一类故障。
+            token = self._mint_token_from_service()
+            if not token:
+                tried = bool(self.minter is not None and getattr(self.minter, "configured", False))
+                raise CaptchaRequiredError(
+                    "account currently requires a Turnstile captcha (model.needsCaptcha=true). "
+                    "This is a dynamic, velocity-based gate, not an account property. "
+                    + ("token minter configured but unavailable/failed — " if tried else "")
+                    + "Supply a fresh Turnstile token, wait for it to decay, or spread the submissions out."
+                )
 
         body = {
             "content": params.get("content"),
