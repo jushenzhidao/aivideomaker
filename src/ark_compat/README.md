@@ -388,6 +388,7 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 ├── test_passthrough_cookie.py 透传（多租户隔离、缓存淘汰、闸门互斥）
 ├── test_task_store.py       任务持久化（跨实例可读 = 重启不丢）
 ├── test_env_template.py     .env 模板门禁（**双向**：声明 ↔ 生产代码读取）
+├── test_compose_env_injection.py 模板声明的键必须真的**注入容器**（声明 ↔ 编排注入）
 ├── test_auto_concurrency.py 并发槽位按账号额度自动定（含多 worker 分摊）
 ├── test_probe_retry.py      只读探测的超时与重试（写入绝不重试）
 ├── test_pool_metrics.py     号池指标（凭据原文绝不进遥测，含变异测试）
