@@ -111,8 +111,19 @@ bind = f"{os.environ.get('ARK_HOST', '127.0.0.1')}:{_int('ARK_PORT', 8808)}"
 
 workers = max(1, _int("AVM_WORKERS", 1))
 
-_GLOBAL_CAP = max(1, _int("AVM_MAX_CONCURRENT", 2))
-if workers > 1:
+_RAW_CAP = _int("AVM_MAX_CONCURRENT", 2)      # 0 = 按账号额度自动（worker 内探测）
+_GLOBAL_CAP = max(1, _RAW_CAP) if _RAW_CAP else 0
+if workers > 1 and _RAW_CAP == 0:
+    # auto 额度要等 worker 内探测才知道，master 无法在 fork 前分摊未知额度
+    # ⇒ 下发除数，worker 内 resolve_max_concurrent 把探测到的额度 // workers
+    #   （每 worker 至少 1）。每个账号的**全局**并发仍恰好等于它的 maxQueueLength。
+    # 旧行为把 0 当 1：每 worker 显式 1 槽、连探测都不做 ⇒ pro 的 4 额度用不满。
+    os.environ["AVM_CONCURRENCY_DIVISOR"] = str(workers)
+    _log(
+        f"auto(0) + {workers} workers：账号额度由 worker 内探测后按 ÷{workers} 分摊"
+        "（每账号全局并发仍等于其 maxQueueLength）"
+    )
+elif workers > 1:
     per_worker = max(1, _GLOBAL_CAP // workers)
     effective = per_worker * workers
     # 用 env 下发给子进程：worker fork 自 master，会继承到设置。

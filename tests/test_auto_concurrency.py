@@ -92,5 +92,53 @@ class TestSettings(unittest.TestCase):
         self.assertEqual(Settings.from_env({"AVM_MAX_CONCURRENT": "4"}).max_concurrent, 4)
 
 
+
+def _cfg(max_concurrent: int, fallback: int = 2, divisor=None) -> Settings:
+    kw = dict(cookie=COOKIE, base_url="http://127.0.0.1:9", trust_env=False,
+              task_store="memory", max_concurrent=max_concurrent,
+              max_concurrent_fallback=fallback)
+    if divisor is not None:
+        kw["concurrency_divisor"] = divisor
+    return Settings(**kw)
+
+
+class TestMultiWorkerDivisor(unittest.TestCase):
+    """auto 模式 + 多 worker：账号额度必须按 ÷workers 分摊到每个 worker。
+
+    背景：闸门是进程内的，N 个 worker 各持一把全额闸门会把每账号全局并发
+    放大成 N×额度（撞上游 'queue is full'）。gunicorn master 在 auto=0 时把
+    worker 数经 AVM_CONCURRENCY_DIVISOR 下发，worker 内探测到额度后自除。
+    """
+
+    def test_divisor_splits_pro_quota(self):
+        c = FakeClient(perm={"maxQueueLength": 4, "planName": "pro"})
+        self.assertEqual(resolve_max_concurrent(_cfg(0, 2, divisor=2), c), 2)
+
+    def test_divisor_rounds_down_min_one(self):
+        c = FakeClient(perm={"maxQueueLength": 3})
+        self.assertEqual(resolve_max_concurrent(_cfg(0, 2, divisor=2), c), 1)
+
+    def test_fallback_is_divided_too(self):
+        # 读不到额度时回落值同样分摊：premium(2)÷2 worker ⇒ 每 worker 1、全局 2，不放大
+        c = FakeClient(perm=None)
+        self.assertEqual(resolve_max_concurrent(_cfg(0, 2, divisor=2), c), 1)
+
+    def test_bad_divisor_treated_as_one(self):
+        c = FakeClient(perm={"maxQueueLength": 4})
+        self.assertEqual(resolve_max_concurrent(_cfg(0, 2, divisor=0), c), 4)
+        self.assertEqual(resolve_max_concurrent(_cfg(0, 2, divisor=None), c), 4)
+
+    def test_explicit_value_ignores_divisor_and_does_not_probe(self):
+        c = FakeClient(perm={"maxQueueLength": 4})
+        self.assertEqual(resolve_max_concurrent(_cfg(3, 2, divisor=2), c), 3)
+        self.assertEqual(c.calls, 0)
+
+    def test_from_env_reads_divisor(self):
+        from ark_compat.settings import Settings as S
+        self.assertEqual(S.from_env({"AVM_CONCURRENCY_DIVISOR": "2"}).concurrency_divisor, 2)
+        self.assertEqual(S.from_env({}).concurrency_divisor, 1)
+        self.assertEqual(S.from_env({"AVM_CONCURRENCY_DIVISOR": "0"}).concurrency_divisor, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

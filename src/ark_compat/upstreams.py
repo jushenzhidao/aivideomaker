@@ -134,19 +134,30 @@ def resolve_max_concurrent(settings, client) -> int:
     """
     if settings.max_concurrent > 0:
         return settings.max_concurrent
+    divisor = max(1, int(getattr(settings, "concurrency_divisor", 1) or 1))
     try:
         perm = client.get_permission() or {}
         n = int(perm.get("maxQueueLength") or 0)
         if n > 0:
-            logger.info(
-                "提交闸门槽位按账号额度自动定为 {}（planName={}）", n, perm.get("planName") or "?"
-            )
-            return n
-        logger.warning("账号额度读不到 maxQueueLength ⇒ 回落 {} 槽", settings.max_concurrent_fallback)
+            slots = max(1, n // divisor)   # 多 worker：把账号额度向下分摊到每个 worker
+            if divisor > 1:
+                logger.info(
+                    "提交闸门槽位按账号额度自动定为 {}（额度 {} ÷ {} worker，planName={}）",
+                    slots, n, divisor, perm.get("planName") or "?",
+                )
+            else:
+                logger.info(
+                    "提交闸门槽位按账号额度自动定为 {}（planName={}）", n, perm.get("planName") or "?"
+                )
+            return slots
+        fallback = max(1, settings.max_concurrent_fallback // divisor)
+        logger.warning("账号额度读不到 maxQueueLength ⇒ 回落 {} 槽（已按 {} worker 分摊）",
+                       fallback, divisor)
     except Exception as e:  # noqa: BLE001 探测失败不该让建上游失败
-        logger.warning("账号额度探测失败（{}: {}）⇒ 回落 {} 槽",
-                       type(e).__name__, e, settings.max_concurrent_fallback)
-    return settings.max_concurrent_fallback
+        logger.warning("账号额度探测失败（{}: {}）⇒ 回落 {} 槽（已按 {} worker 分摊）",
+                       type(e).__name__, e,
+                       max(1, settings.max_concurrent_fallback // divisor), divisor)
+    return max(1, settings.max_concurrent_fallback // divisor)
 
 
 def _build_web(

@@ -66,6 +66,10 @@ class Settings:
     max_concurrent: int = 2
     # 自动探测失败时的回落值
     max_concurrent_fallback: int = 2
+    # 多 worker 分摊除数（gunicorn master 在 auto=0 模式下经 AVM_CONCURRENCY_DIVISOR
+    # 下发）：worker 内探测到的账号额度会 // divisor，使「每账号全局并发」仍恰好
+    # 等于该账号的 maxQueueLength —— 不放大（撞上游）也不缩水（额度浪费）。
+    concurrency_divisor: int = 1
     poll_interval: float = 10.0
     # 探测类**只读**请求的超时（秒）：出口代理的 TLS 握手实测抖到 10s+，
     # 一发卡住的探测会占满重试循环（默认 30s），所以探测单独用短超时。
@@ -120,6 +124,7 @@ class Settings:
             user_id=str(env.get("AVM_USER_ID", "")).strip(),
             visitor_id=str(env.get("AVM_VISITOR_ID", "")).strip(),
             max_concurrent=int(env.get("AVM_MAX_CONCURRENT") or 2),
+            concurrency_divisor=max(1, int(env.get("AVM_CONCURRENCY_DIVISOR") or 1)),
             poll_interval=float(env.get("AVM_POLL_SECONDS") or 10),
             probe_timeout=float(env.get("AVM_PROBE_TIMEOUT") or 8),
             minter_url=(env.get("AVM_MINTER_URL") or "").strip(),
