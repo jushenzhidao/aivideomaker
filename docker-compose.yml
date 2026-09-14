@@ -33,7 +33,7 @@
 # env_file：env_file 会把 .env 里所有变量（含无关项）一股脑灌进容器，而显式列举
 # 写错名字会立刻暴露成空值，符合本项目"宁可报错不要静默"的口径。
 #
-# **六个** compose 专属变量（**故意不写进 .env.example** —— 那里只放代码实际读取的变量，
+# **八个** compose 专属变量（**故意不写进 .env.example** —— 那里只放代码实际读取的变量，
 # 有 tests/test_env_template.py 的**双向**门禁把关；需要时直接写进你的 .env 即可）：
 #   AVM_IMAGE_TAG              拉取/构建用的镜像 tag，默认 latest（也可填版本如 0.0.1）
 #   AVM_HOST_PORT              宿主侧映射端口，默认 8808（容器内固定 8808）
@@ -41,6 +41,13 @@
 #   AVM_MINTER_BIND_HOST       铸造服务的绑定地址，默认 0.0.0.0；收到回环/内网即"开放但不挂公网"
 #   AVM_MINTER_POOL            单个铸造器实例的池子水位，默认 4（≈ 账号额度 × TTL/一轮时长）
 #   AVM_MINTER_TTL             铸出的 token 存活上限（秒），默认 120（CF 侧约 300s，按更短算）
+#   AVM_MINTER_RENDER_TIMEOUT_MS       render 常规预算（毫秒），默认 45000
+#   AVM_MINTER_COLD_RENDER_TIMEOUT_MS  render **冷启动首轮**预算（毫秒），默认 120000
+#                               —— 全新 profile 首次 render 实测 ≈46s，卡在常规 45s 之上；
+#                                  没有这一条时"新部署的第一次铸造"必然失败一次
+# ⚠️ 另有一个**由本文件派生**的注入项（不是用户变量）：`MINTER_ALLOW_INSECURE_RAW`
+#    = `${AVM_MINTER_ALLOW_INSECURE:-}`，只喂给 minter-preflight —— 有了它，前置校验才能
+#    区分「用户显式设了 ALLOW_INSECURE」与「取 compose 默认值」，归因才如实（报告 AVM12-PF-07）。
 
 services:
   ark-compat:
@@ -195,8 +202,13 @@ services:
   #      （实测踩到：本机 avm-minter:arm64 就是这种老镜像，不加这支会 ImportError 退 1。）
   #   ② 校验自身**导入不了**镜像里的铸造服务代码 ⇒ 那个镜像里的 minter 同样起不来
   #      ⇒ **判失败**：把"校验跑不起来"当成通过，是这类前置检查最典型的自我欺骗。
-  # 为什么还要比一次两侧的值：compose 里两侧同源于 AVM_MINTER_KEY（天然相等），
-  #   但**手工接线**最容易只改一边 ⇒ minter 有 key、ark-compat 没有，取 token 全 401。
+  # 🔴 **它守不住"服务侧被改"**（2026-09-14 报告 AVM12-PF-08 实测）：这里的 MINTER_KEY 与
+  #   ARK_MINTER_KEY 都写成 `${AVM_MINTER_KEY:-}` ⇒ **同源、永远相等**，比的是**自己那份
+  #   env**。把 **minter 服务**那一行写死成字面量（`docker compose config` 已确认生效），
+  #   本容器照样报 [ok] —— 因为容器里既没有 docker CLI、也看不见别的服务的 env。
+  #   ⇒ 真正的接线校验在**宿主机侧**：`python3 tools/compose_wiring_check.py`
+  #     （读 compose 解析后的两个服务 env 再比对，`up -d` 之前跑）。这里那条比较保留，
+  #     但语义如实降级为「仅防 preflight 自身被改」（P-05 那种改法它确实拦得住）。
   minter-preflight:
     image: ghcr.io/jushenzhidao/aivideomaker-minter:${AVM_IMAGE_TAG:-latest}
     build:
@@ -212,10 +224,15 @@ services:
     # 纯本地判断，不需要（也不该有）网络
     network_mode: none
     environment:
-      MINTER_KEY: ${AVM_MINTER_KEY:-}          # = minter 服务读到的值
-      ARK_MINTER_KEY: ${AVM_MINTER_KEY:-}      # = ark-compat 读到的值
+      MINTER_KEY: ${AVM_MINTER_KEY:-}          # = minter 服务读到的值（同源自检，见上）
+      ARK_MINTER_KEY: ${AVM_MINTER_KEY:-}      # = ark-compat 读到的值（同源自检，见上）
       # 与 minter 用**同一个表达式**（默认 1 = 开放）⇒ 校验按真实开关判定
       MINTER_ALLOW_INSECURE: ${AVM_MINTER_ALLOW_INSECURE:-1}
+      # ★ 上面那个值**分辨不出**"用户显式设了 1"与"compose 默认给的 1"。归因要如实，
+      #   就必须知道原始值：留空 = 用户没设过（`${VAR:-}` 的语义，与 template 一致）。
+      #   报告 AVM12-PF-07 的根因正是分不清这两者 —— 于是"回环绑定放行"被报成
+      #   "显式放行 MINTER_ALLOW_INSECURE"，把人引去查一个根本没设的开关。
+      MINTER_ALLOW_INSECURE_RAW: ${AVM_MINTER_ALLOW_INSECURE:-}
       # 也与 minter 同源 ⇒ 按真实绑定地址判定，不再硬套镜像里的 0.0.0.0
       BIND_HOST: ${AVM_MINTER_BIND_HOST:-0.0.0.0}
       # 与 ark-compat 用**完全相同的插值表达式**（注意那个 `:-`）⇒ 校验看到的就是适配层真实
@@ -231,10 +248,16 @@ services:
 
         minter_side = os.environ.get("MINTER_KEY", "")
         ark_side = os.environ.get("ARK_MINTER_KEY", "")
+        # ⚠️ 这条比较**只能**看见 preflight 自己这份 env：两侧都写成 `${AVM_MINTER_KEY:-}`
+        #    ⇒ **同源、永远相等**。所以它是「preflight 自检」而**不是**「接线校验」——
+        #    它拦得住"改 preflight 自己的 env"（P-05 那种），拦不住"把 **minter 服务**那一行
+        #    写死成字面量"（P-08：最常见的那种手工接线改法，实测确认被漏过）。
+        #    真正的接线校验在**宿主机侧**：`python3 tools/compose_wiring_check.py`。
         if minter_side != ark_side:
-            print("[fatal] 接线错误：minter 的 MINTER_KEY 与 ark-compat 的 AVM_MINTER_KEY "
-                  "不是同一个值 —— 取 token 会全部 401。compose 里两者同源于 "
-                  "AVM_MINTER_KEY，别单独改一边。", file=sys.stderr)
+            print("[fatal] 接线错误：preflight 自己读到的 MINTER_KEY 与 ARK_MINTER_KEY 不同 "
+                  "⇒ 该容器都被改成了不一致的值（取 token 会全部 401）。注意这只能证明"
+                  "**本容器**的 env 不一致；服务侧被改的情况要用 "
+                  "tools/compose_wiring_check.py 才能发现。", file=sys.stderr)
             sys.exit(2)
 
         # 判据取自**镜像自己的** /app/tools/turnstile_service.py ⇒ 与 minter 启动时真正
@@ -257,21 +280,32 @@ services:
                   "它未暴露在公网；建议把 AVM_IMAGE_TAG 升到 0.0.7+。", file=sys.stderr)
             sys.exit(0)
 
+        bind_host = os.environ.get("BIND_HOST", "127.0.0.1")
         allow_insecure = S.env_flag(os.environ.get("MINTER_ALLOW_INSECURE", ""))
-        err = S.bind_guard_error(os.environ.get("BIND_HOST", "127.0.0.1"), minter_side,
-                                 allow_insecure)
+        err = S.bind_guard_error(bind_host, minter_side, allow_insecure)
         if err is None:
-            # 归因必须**逐条对得上真实放行原因** —— 7 号分支实测暴露过：回环绑定
-            # 放行时若一律写成"显式放行 MINTER_ALLOW_INSECURE"，人会被引去查一个
-            # 根本没设的开关。compose 里走不到这支（镜像内 BIND_HOST 恒为 0.0.0.0），
-            # 但信息不实就是缺陷。
+            # 归因必须**逐条对得上真实放行原因**（第二版，2026-09-14 报告 AVM12-PF-07）。
+            # 第一版按 `if MINTER_KEY … elif allow_insecure … else 回环` **只挑一条**，
+            # 而 `MINTER_ALLOW_INSECURE` 在 compose 默认值下恒为 True ⇒ **回环那条分支永远
+            # 轮不到**：回环绑定放行被报成"显式放行 MINTER_ALLOW_INSECURE"，运维于是被引去
+            # 查一个根本没设的开关。两处修正：
+            #   ① 列出**所有**成立的充分理由，而不是挑一条；
+            #   ② 借 MINTER_ALLOW_INSECURE_RAW 区分"显式设置"与"取默认值" —— compose 默认
+            #      给的 1 与别人显式打开的 1，在运维眼里是两件完全不同的事。
+            reasons = []
             if minter_side.strip():
-                why = "MINTER_KEY 已设"
-            elif allow_insecure:
-                why = "显式放行 MINTER_ALLOW_INSECURE"
-            else:
-                why = "BIND_HOST=%r 是回环绑定（无 key 也放行）" % os.environ.get(
-                    "BIND_HOST", "127.0.0.1")
+                reasons.append("MINTER_KEY 已设")
+            if bind_host.strip() in getattr(S, "LOOPBACK_HOSTS", frozenset()):
+                reasons.append("BIND_HOST=%r 是回环绑定（无 key 也放行）" % bind_host)
+            raw_insecure = os.environ.get("MINTER_ALLOW_INSECURE_RAW")
+            if allow_insecure and raw_insecure is None:
+                reasons.append("MINTER_ALLOW_INSECURE=1（**分不清**是显式设置还是默认值 —— "
+                               "compose 里缺 MINTER_ALLOW_INSECURE_RAW 插值）")
+            elif allow_insecure and str(raw_insecure).strip():
+                reasons.append("显式设了 MINTER_ALLOW_INSECURE=1")
+            if not reasons:
+                reasons.append("MINTER_ALLOW_INSECURE 取 compose 默认值 1（这是开放模式的**默认**，"
+                               "不是谁显式打开的）")
             ark_url = os.environ.get("ARK_MINTER_URL", "")
             if not ark_url.strip():
                 # 契约护栏：**铸造能力默认开启**靠的是文件头那条带冒号的默认值写法（.env 留空
@@ -286,15 +320,13 @@ services:
                 # 免得"服务在跑"被当成"服务是安全的"。
                 # 只在**非回环**绑定下喊：回环绑定时外部根本连不上，跟着喊只会让人对告警脱敏。
                 # 判据复用 minter 自己那份回环名单（`LOOPBACK_HOSTS`），不另写一套。
-                _bh = os.environ.get("BIND_HOST", "127.0.0.1")
-                _loopback = _bh.strip() in getattr(S, "LOOPBACK_HOSTS", frozenset())
-                if not _loopback:
+                if bind_host.strip() not in getattr(S, "LOOPBACK_HOSTS", frozenset()):
                     print("[warn] 铸造服务以**开放模式**运行（未设 MINTER_KEY，绑定 %s）—— 任何能连上"
                           "该地址的人都能领 Turnstile token（等于分发过闸能力，也会让账号更快撞"
                           "风控）。收口二选一：① AVM_MINTER_BIND_HOST 收到回环/内网；"
-                          "② 设 MINTER_KEY 且把 AVM_MINTER_ALLOW_INSECURE 置 0。" % _bh,
+                          "② 设 MINTER_KEY 且把 AVM_MINTER_ALLOW_INSECURE 置 0。" % bind_host,
                           file=sys.stderr)
-            print("[ok] minter 前置校验通过（%s）" % why)
+            print("[ok] minter 前置校验通过（%s）" % "；".join(reasons))
             sys.exit(0)
 
         print("[fatal] 前置校验未通过：minter 启动时会被自己的失败关闭守卫拒绝（退出码 2），"
@@ -351,6 +383,13 @@ services:
       # **开大没好处** —— 没被用掉的 token 会自然老死。
       POOL_TARGET: ${AVM_MINTER_POOL:-4}
       TOKEN_TTL_S: ${AVM_MINTER_TTL:-120}
+      # render 预算（毫秒）。**为什么要有两条**：全新 profile 的**首次** render 实测 ≈46s，
+      # 而常规预算是 45s ⇒ 不放宽的话「新部署的第一次铸造」**必然失败一次**，现象是
+      # `POST /v1/turnstile/mint` 返回 503 + `{'why': 'TIMEOUT'}（耗时 46.01s）`，而
+      # `/healthz` 早在 10 秒时就报了 `ready=true` —— 看起来像"镜像坏了"，其实只是冷启动
+      # （报告 AVM12-MINT 的根因）。首轮走 COLD，铸出过 token 之后回落到常规值。
+      MINT_TIMEOUT_MS: ${AVM_MINTER_RENDER_TIMEOUT_MS:-45000}
+      COLD_MINT_TIMEOUT_MS: ${AVM_MINTER_COLD_RENDER_TIMEOUT_MS:-120000}
     volumes:
       - minter-chrome:/data
     # Chrome 吃 /dev/shm；给大一点比依赖 --disable-dev-shm-usage 更稳

@@ -21,7 +21,10 @@ API（默认 127.0.0.1:8899）：
       **绝不能让上游把"铸造失败"当成"闸门放行"**。
 
 环境变量：PORT / BIND_HOST / MINTER_KEY / MINTER_ALLOW_INSECURE /
-          POOL_TARGET / TOKEN_TTL_S / SITEKEY / LIGHT_URL / HEADLESS
+          POOL_TARGET / TOKEN_TTL_S / SITEKEY / LIGHT_URL / HEADLESS /
+          CDP_PORT / CHROME_PROFILE / MINT_TIMEOUT_MS / COLD_MINT_TIMEOUT_MS
+          （后两条是 render 预算，见 tools/turnstile_minter.py 的「render 超时预算」段：
+            首轮用 `COLD_*`，之后回落常规值 —— 全新 profile 首次 render 实测 ≈46s）
 """
 import json
 import os
@@ -114,6 +117,11 @@ class MintCore:
     def __init__(self):
         self.bc = None
         self.page = None
+        # ★ 本进程**第一次**铸造用**冷启动预算**：全新 profile 的首次 render 实测 ≈46 秒，
+        #   越过常规 45 秒线 ⇒「新部署的第一次铸造必然失败一次」，而 `/healthz` 早就报了
+        #   `ready=true`，看起来像"镜像坏了"（报告 AVM12-MINT，两次 46.01s TIMEOUT）。
+        #   只给首轮放宽：常态用常规预算，免得把一次**真卡死**的铸造从 45s 拉长到 120s。
+        self.warmed = False
 
     def ensure(self):
         if self.bc is not None and self.page is not None:
@@ -135,13 +143,15 @@ class MintCore:
     def mint(self) -> str:
         with _MINT_LOCK:
             self.ensure()
-            tok, dt = M.mint_on(self.bc, self.page[1], 0)
+            budget = M.MINT_TIMEOUT_MS if self.warmed else M.COLD_MINT_TIMEOUT_MS
+            tok, dt = M.mint_on(self.bc, self.page[1], 0, timeout_ms=budget)
             if not tok:
                 self.reset()
                 with _STATE_LOCK:
                     _STATE["stats"]["failed"] += 1
                     _STATE["last_error"] = "mint failed (page/browser reset)"
                 raise RuntimeError("mint failed")
+            self.warmed = True      # 说明这个页面**真的**铸出过 token（heat ≠ ready）
             with _STATE_LOCK:
                 _STATE["stats"]["minted"] += 1
             return tok
@@ -206,6 +216,12 @@ def health() -> dict:
             "minting": _MINT_LOCK.locked(),
             "browser": _STATE["browser"],
             "ready": _STATE["ready"],
+            # ⚠️ `ready`（Chrome/页面就绪）与 `warmed`（**真的铸出过** token）是两件事：
+            #    冷启动期 `ready=true` 而铸造仍会超时 —— 只看 `ready` 会误判成"服务是好的"
+            #    （报告 AVM12-MINT 就是这个形状：healthz 10 秒即 ready，铸造就 46s TIMEOUT）。
+            #    再挂上两条实际生效的预算，排障时不必去翻环境变量。
+            "warmed": CORE.warmed,
+            "render_timeout_ms": {"cold": M.COLD_MINT_TIMEOUT_MS, "normal": M.MINT_TIMEOUT_MS},
             "pool": {"size": pool, "target": POOL_TARGET, "ttl_s": TTL_S},
             "stats": st,
             "last_error": _STATE["last_error"],

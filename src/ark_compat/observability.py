@@ -28,6 +28,9 @@ from loguru import logger
 
 _LOGFIRE_READY = False
 _CAPTURE_HEADERS = False
+# 「SDK 装配成功」与「数据真的在往外发」是两个不同的信号，必须分开报（见 logfire_exporting）。
+# 默认 False：没配 token / 关了 logfire 时，它就是 False —— 不猜"大概会发吧"。
+_LOGFIRE_EXPORTING = False
 
 LOG_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
@@ -110,12 +113,15 @@ def setup_observability(settings) -> bool:
         except Exception as e:
             logger.debug(f"instrument_httpx 不可用：{e}")
 
+        global _LOGFIRE_EXPORTING
+        _LOGFIRE_EXPORTING = will_export(settings)
         _LOGFIRE_READY = True
         logger.info(
-            "logfire 已装配 | service={} send_to_logfire={} token={} scrubbing={} capture_headers={}",
+            "logfire 已装配 | service={} send_to_logfire={} token={} 实际外发={} scrubbing={} capture_headers={}",
             settings.service_name,
             settings.logfire_send,
             "present" if _has_token() else "absent",
+            "是" if _LOGFIRE_EXPORTING else "否（仅本地收集）",
             bool(getattr(settings, "logfire_scrubbing", False)),
             capture_headers,
         )
@@ -289,6 +295,28 @@ def span(name: str, **attrs: Any):
 
 def logfire_ready() -> bool:
     return _LOGFIRE_READY
+
+
+def will_export(settings) -> bool:
+    """按**配置**判断数据是否真的会外发 —— 与"SDK 装上了"是两件事。
+
+    `send_to_logfire="if-token-present"`（默认）在没有 `LOGFIRE_TOKEN` 时**不会**外发，
+    但 `logfire.configure()` 照样成功、span 照样生成。只报"装配成功"会让
+    `/healthz` 给出 `logfire: true` 而实际上一条 trace 都没出去（2026-09-14 实测踩到）。
+    """
+    if not getattr(settings, "enable_logfire", True):
+        return False
+    send = getattr(settings, "logfire_send", "if-token-present")
+    if send is True:
+        return True
+    if send is False:
+        return False
+    return _has_token()      # "if-token-present"：没有 token 就只在本地收集
+
+
+def logfire_exporting() -> bool:
+    """数据**真的**在往外发吗？（`logfire_ready()` 只说明 SDK 装配成功）"""
+    return _LOGFIRE_EXPORTING
 
 
 # ------------------------------------------------------- 号池指标（余额 / 闸门）----

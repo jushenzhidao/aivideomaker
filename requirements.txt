@@ -20,6 +20,11 @@ uvicorn-worker>=0.3
 
 # 日志与可观测性
 loguru>=0.7
-logfire>=3.0
+# ⚠️ 必须带 `[fastapi]` extra —— 少了它，`logfire.instrument_fastapi(app)` 会抛
+#    "requires the opentelemetry-instrumentation-fastapi package"，`app.py` 把异常吞成一条
+#    警告后继续起服务 ⇒ **每个请求的自动 span 静默消失**（容器日志里每人 2 行，看不出后果）。
+#    2026-09-14 报告 AVM12-OPEN-LOGFIRE 实测发现：`logfire>=3.0` 不带 extra 时，
+#    `requirements.txt` 里搜 `logfire[fastapi]` 是 0 命中，而追踪链路上少了一层。
+logfire[fastapi]>=3.0
 
 # 测试（TestClient 依赖 httpx，已在上面）

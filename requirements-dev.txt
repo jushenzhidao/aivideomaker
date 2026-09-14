@@ -1,0 +1,39 @@
+# 测试期依赖（**刻意不放 requirements.txt** —— 那是生产镜像的依赖，多带一个测试框架
+# 既是浪费也是多余的攻击面）。
+#
+# 本地复刻 CI 的 hygiene 作业，就用这一条命令：
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# 三个包都是 2026-09-14 逐轮审计时才现形的 —— **本地一直是绿的**，
+# 因为开发环境里恰好都装着。只有在干净 venv / CI runner 上才会暴露：
+#
+# 1) websocket-client
+#    测试会 import 铸造器模块（`tools/turnstile_minter.py` 顶层 `import websocket`，
+#    见 tests/test_minter_chrome_guard.py 与 tests/test_minter_bind_guard.py）。
+#    该包原本只装在**铸造器镜像**里（Dockerfile.minter），测试环境没有
+#    ⇒ `ModuleNotFoundError: No module named 'websocket'`，作业一上来就红。
+#
+# 2) pytest
+#    **不是**本项目在用 pytest（单测一律 unittest）。而是 `logfire.testing`
+#    （测试里用来捞 span 的内存 exporter）自己 import 它。
+#    缺它的表现很误导：报错发生在**收集阶段**，`test_trace_contract` 与
+#    `test_pool_metrics` 整个模块不被收集 ⇒ 输出是
+#    `Ran 269 tests / 2 ERROR`（看着像"测试变少了"，而不是"少了依赖"）。
+#    本项目共 313 项，少 44 项就是这两个模块。
+#
+# 3) pyyaml
+#    `tests/test_compose_env_injection.py` 与 `tests/test_compose_wiring_check.py` 都用了
+#    **两条独立解析路径**（pyyaml 与零依赖行内解析），并让二者**互相校验** ——
+#    但没装 pyyaml 时，那条对照用例会 `skipTest`。
+#    实测（2026-09-14 报告 AVM12-OPEN-PYYAML）：原文 `requirements.txt`、
+#    `requirements-dev.txt`、CI 三处都不装 pyyaml ⇒ 第二条路在流水线里**从不执行**，
+#    "互相校验"实际只剩一条，而输出只是 `OK (skipped=1)`，**没有任何提示**。
+#    ⚠️ 已确认这不是"藏着缺陷"（装上后对照路 6/6 通过）⇒ 属**覆盖率**问题而非正确性问题。
+#    配套：`tools/egress_audit.py` 现在会断言 `skipped == 0`，防止以后新增的 skip 静默累积。
+#
+#    为什么不挪进 requirements.txt：只有**编排/门禁类**检查用它，而 python:3.12-slim
+#    的镜像本来不带 —— 放进生产依赖等于给每个服务进程白加一个解析器。
+
+websocket-client>=1.7
+pytest>=8
+pyyaml>=6

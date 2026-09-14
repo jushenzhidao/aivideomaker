@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""零外发审计：跑全量单测，拦下所有**非回环** TCP 连接并打印调用栈。
+"""零外发审计 + **门禁不得被跳过**：跑全量单测，拦下所有**非回环** TCP 连接并打印调用栈。
 
 为什么需要它：单测的纪律之一是"零外发"（不碰真上游、不产生额度消耗、
 不依赖外部服务可用性），但这条纪律**靠人自觉**。2026-09-14 复跑时抓到反例：
@@ -17,8 +17,16 @@
 教训：**"指向死端口"只覆盖 base_url 那条路径**；凡是不经 base_url 的绝对 URL
 （媒体下载、回调、探测）都必须单独确认。
 
+## 第二职责：`skipped == 0`（2026-09-14 新增）
+
+**跳过 ≠ 通过**，而且输出几乎一样（只多一句 `OK (skipped=1)`）—— 这是最隐蔽的假绿。
+实测（报告 AVM12-OPEN-PYYAML）：`requirements.txt`、`requirements-dev.txt`、CI 三处都不装
+pyyaml ⇒ `test_compose_env_injection` 的对照路**在流水线里从不执行**，而全程是绿的。
+所以这里把"有用例被跳过"直接判失败，并在报告里点名是哪一条、为什么。真正的修法是补齐
+测试期依赖（见 `requirements-dev.txt`），不是把这条断言删掉。
+
 用法：
-    python3 tools/egress_audit.py            # 退出码非 0 即有非回环出站
+    python3 tools/egress_audit.py            # 退出码非 0 即有非回环出站 / 有用例被跳过
 """
 import socket
 import sys
@@ -68,7 +76,8 @@ def main() -> int:
     import os
     os.chdir(ROOT)
     suite = unittest.TestLoader().discover("tests")
-    ok = unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful()
+    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    ok = result.wasSuccessful()
 
     sys.stderr.write(f"\n=== 非回环出站合计：{len(HITS)} 次 ===\n")
     for kind, addr in HITS:
@@ -82,7 +91,23 @@ def main() -> int:
             "   base_url 指向死端口**挡不住**这类请求。请把 URL 换成死端口地址。\n"
         )
         return 1
-    sys.stderr.write("⇒ 零外发 ✔\n")
+    if result.skipped:
+        # 跳过 ≠ 通过。这是最隐蔽的一类假绿：输出只多了一句 `OK (skipped=1)`，
+        # 而"被跳过的门禁"与"跑过且通过的门禁"在报告里长得一模一样。
+        # 实测（2026-09-14 报告 AVM12-OPEN-PYYAML）：没装 pyyaml ⇒
+        # `test_compose_env_injection` 的对照路整条不执行，而流水线全程绿。
+        sys.stderr.write(
+            f"⇒ 有 {len(result.skipped)} 条用例被**跳过**（跳过不等于通过）：\n"
+        )
+        for case, why in result.skipped:
+            sys.stderr.write(f"    {case.id()}\n      理由：{why}\n")
+        sys.stderr.write(
+            "  常见根因：测试期依赖没装 —— 见 requirements-dev.txt"
+            "（pyyaml / websocket-client / pytest）。\n"
+            "  确实需要跳过时，请把这条断言与理由一起改掉，别让它静默累积。\n"
+        )
+        return 1
+    sys.stderr.write("⇒ 零外发 ✔（且没有用例被跳过）\n")
     return 0
 
 

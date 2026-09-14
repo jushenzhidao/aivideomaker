@@ -165,7 +165,7 @@ class TestDocumentedExample(unittest.TestCase):
 
     def test_billing_is_flagged_on_the_web_line(self):
         eff, _ = T.billing_view(self.plan)
-        self.assertTrue(eff["billed"])  # 15s 已越过 ≤8s 的免费窗口
+        self.assertTrue(eff["billed"])  # 15s 已越过 ≤10s 的免费窗口
         self.assertEqual(eff["tier"], "turbo")
 
     def test_effective_reports_the_actual_container(self):

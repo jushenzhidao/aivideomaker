@@ -50,6 +50,14 @@ SCAN_SUFFIXES = frozenset({
 
 # 会被当作"口径声明"来逐处比对的载体。清单里每一项都在机械发现里出现过，
 # 不是凭印象写的；漏登记会被 `test_no_unlisted_carrier` 拦下。
+#
+# ⚠️ 为什么 `src/ark_compat/translate.py` **不在**这里（2026-09-14 试过又撤回）：
+#    它那条越线提醒用的是 f-string —— `… is outside the free window ({FREE_MAX_DURATION}s) …`
+#    —— **没有字面数字可漂移**（改常量即自动跟随），因此它命中不了任何锚点，
+#    进 DOCS 只会让 `test_every_carrier_mentions_the_window_somewhere` 报"找不到声明"。
+#    代码侧"提醒里的数字必须来自常量"改由**行为断言**钉住：见
+#    `tests/test_billing_advisory.py::test_crossing_the_line_is_announced`。
+#    两者互补：本文件守**文档里被引用的字面数字**，那条守**渲染出来的数字**。
 DOCS = (
     "README.md",
     "src/ark_compat/README.md",
@@ -87,6 +95,11 @@ ANCHORS = (
     # 实测漏过一处（session-runbook.md，8 秒时代残留）—— 原锚点强求 `duration` 前缀，
     # 于是它一直没被扫出来。放宽后对现有载体**零误报**（逐条人工读过才采纳）。
     (r"(?:duration\s*)?≥\s*(\d+)s", lambda free: free + 1, "计费起始秒数（上界 + 1）"),
+    # 2026-09-14 新增：**越线提醒**在 `src/ark_compat/README.md` 里被原文引了一句
+    # （"… outside the free window (…s) — this request WILL BE BILLED …"）。
+    # ⚠️ 本行刻意不写具体秒数：写了它，**本文件自己**就会变成"声明了免费窗口"的载体，
+    #    被 `test_no_unlisted_carrier` 逮住（本次已踩）。
+    (r"free window \((\d+)s\)", lambda free: free, "越线提醒（文档原文引用）"),
 )
 
 

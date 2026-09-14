@@ -597,6 +597,20 @@ class TestWebAppLayer(unittest.TestCase):
         self.assertEqual(j["resolution"], "480p")
         self.assertEqual(j["requested"]["model"], "doubao-seedance-2-5-260628")
 
+    def test_task_view_exposes_the_upstream_model_next_to_the_requested_one(self):
+        """★ 报告 AVM12-OPEN-UPSTREAM：请求值与**上游实际执行**的模型都要能读到。
+
+        实测背景：三次真实提交请求的都是 `doubao-seedance-2-5-260628`，成片 URL 里却是
+        `minimax_h3`（web 线只有 `ai.minimaxH3` 一条 tRPC 程序）。此前 `model` 被覆盖成
+        请求值、嵌套的原始记录又被 `upstream`（上游种类）覆盖 ⇒ 事实在最后一跳消失。
+        """
+        tid = self.client.post(TASKS_PATH, json=ark_body()).json()["id"]
+        j = self.client.get(f"{TASKS_PATH}/{tid}").json()
+        self.assertEqual(j["model"], "doubao-seedance-2-5-260628", "model 是**请求值**")
+        self.assertEqual(j["upstream_model"], "minimax-h3", "upstream_model 是**实际值**")
+        self.assertNotEqual(j["model"], j["upstream_model"], "两者不同才是这件事的意义所在")
+        self.assertEqual(j["upstream"], "web", "`upstream` 仍然是上游**种类**，不是原始记录")
+
     # ---- 媒体转存（站点只收自己 CDN 的地址）----
 
     def first_frame(self, url: str) -> dict:

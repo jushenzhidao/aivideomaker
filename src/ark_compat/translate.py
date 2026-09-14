@@ -276,13 +276,16 @@ def translate_create(body: Mapping[str, Any]) -> dict:
     requested_duration = duration
     duration = snap_duration(duration if duration is not None else 5, resolution, prefer_free)
     if requested_duration is not None and requested_duration != duration:
-        msg = f"duration {requested_duration:g}s snapped to {duration}s (site limit for {resolution})"
-        if duration > FREE_MAX_DURATION >= requested_duration:
-            msg += (
-                "; this crosses into the billed range — set "
-                "extra_body.aivideomaker_prefer_free=true to snap down instead"
-            )
-        warnings.append(msg)
+        # ⚠️ 这里**曾经**还有一支 "吸附把请求带进了计费区" 的提醒，已删除 —— 它**不可达**：
+        #    合法区间是连续的 `[5, 20]`（见 `DURATION_ALLOWED`），吸附只在越界时发生，
+        #    因此 `duration > FREE_MAX_DURATION >= requested_duration` 永不可能成立
+        #    （2026-09-14 报告 AVM12-OPEN-DEAD 实测确认：`grep` 查得到代码、但跑不到）。
+        #    留着死分支比删掉更坏：读代码的人会以为"跨入计费区"这件事已经有人管了。
+        #    "会花钱"的提醒改由 `billing_view()` 统一渲染 —— 那里才拿得到最终 tier 与时长，
+        #    而且对**未被吸附**的越线请求同样生效（原分支只覆盖吸附路径 ⇒ 等于没有提醒）。
+        warnings.append(
+            f"duration {requested_duration:g}s snapped to {duration}s (site limit for {resolution})"
+        )
 
     if aspect and first and ratio != "adaptive":
         warnings.append('Ark requires ratio="adaptive" when role=first_frame; ratio is derived from the image anyway')
@@ -467,7 +470,26 @@ def billing_view(plan: Mapping[str, Any]) -> tuple[dict, list[str]]:
     if web_params.get("aspectRatio"):
         eff["aspectRatio"] = web_params["aspectRatio"]
     eff["billing_note"] = billing_note()
-    return eff, list(plan.get("warnings") or [])
+
+    warnings = list(plan.get("warnings") or [])
+    # ★ 越线**必须**有声音。2026-09-14 报告 AVM12-OPEN-ADVISORY 实测：`duration=15` 会
+    #   静默进计费区 —— `effective.billed=true` 而 `warnings` 为空，调用方除非自己去读
+    #   `billed` 字段，否则不知道这条请求要真花钱（`tier` 默认为 `turbo`，看起来就像免费档）。
+    #   计费口径是本项目最贵的一类缺陷（花了就回不来），所以这里补一条显式告警。
+    #
+    #   为什么放在 `billing_view` 而不是 `translate_create`：只有这里同时拿到
+    #   **最终 tier** 与**最终时长**。`translate_create` 里同义的那支分支已删（不可达，
+    #   见该函数内注释）—— 计费措辞只在这一处渲染，也就不会两处漂移。
+    #
+    #   只在**因时长**越线时喊：`tier=base` 是调用方显式点名的选择（`extra_body.
+    #   aivideomaker_tier=base`），不是"悄悄变贵"，再喊一遍只会让人对告警脱敏。
+    if tier != "base" and duration > FREE_MAX_DURATION:
+        warnings.append(
+            f"duration {duration}s is outside the free window ({FREE_MAX_DURATION}s) — this "
+            f"request WILL BE BILLED (tier={tier}); pass "
+            f"extra_body.aivideomaker_prefer_free=true to snap it down to {FREE_MAX_DURATION}s instead"
+        )
+    return eff, warnings
 
 
 def _epoch(v: Any) -> int | None:
@@ -521,7 +543,17 @@ def normalize_web_task(raw: Mapping[str, Any] | None) -> dict:
 
     return {
         "id": raw.get("id"),
+        # ⚠️ `model` 是**上游记录里的**模型名；对外的任务视图会把它覆盖成**调用方请求的**
+        #    模型（`app._task_view` 的 `view["model"] = entry["model"]`）⇒ 只看 `model`
+        #    永远发现不了"上游换了模型"。要看实际值请用下面那个平行的 `upstream_model`。
         "model": raw.get("aiModel"),
+        # ★ 上游**实际执行**的模型，与 `model`（请求值）并列暴露。
+        #   依据：web 线只有 `ai.minimaxH3` 一条 tRPC 程序（见 docs/web-reverse/），站点对
+        #   调用方请求的模型名只是**回显** —— 2026-09-14 三次真实提交请求的都是
+        #   `doubao-seedance-2-5-260628`，而成片 URL 里一律是 `minimax_h3`。
+        #   报告 AVM12-OPEN-UPSTREAM 的诉求就是这个事实要在契约里读得到。
+        #   刻意**不**用它去改写 `model`：请求值与实际值都必须保留，否则又是一处"静默改写"。
+        "upstream_model": raw.get("aiModel"),
         "status": ark_status,
         "error": (
             {"code": "GenerationFailed", "message": raw.get("taskStatusMsg") or "video generation failed"}
@@ -556,5 +588,9 @@ def normalize_web_task(raw: Mapping[str, Any] | None) -> dict:
         "draft": False,
         "draft_task_id": None,
         "cover": raw.get("cover"),
-        "upstream": dict(raw),
+        # ⚠️ 键名是 `upstream_record`，**不是** `upstream`：`app._task_view` 用 `upstream`
+        #    表示上游**种类**（`"web"`）并会覆盖同名键 ⇒ 原始站点记录若放 `upstream`，
+        #    会在视图最后一跳被丢掉，而它正是"上游到底跑了什么"的唯一原始证据
+        #    （报告 AVM12-OPEN-UPSTREAM 的根因之一：证据在最后一跳消失）。
+        "upstream_record": dict(raw),
     }

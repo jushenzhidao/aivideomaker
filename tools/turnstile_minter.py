@@ -26,6 +26,12 @@
     N=3 HEADLESS=1 /usr/bin/python3 /tmp/minter.py     # --headless=new
     KEEP=1 ...                                          # 复用已运行的 Chrome
 
+环境变量：`CDP_PORT` / `CHROME_PROFILE` / `CHROME_BIN` / `SITEKEY` / `ORIGIN` / `LIGHT_URL`
+          / `N` / `HEADLESS` / `KEEP`
+          / `MINT_TIMEOUT_MS`（常规 render 预算，默认 45000）/ `COLD_MINT_TIMEOUT_MS`
+            （**冷启动**首轮预算，默认 120000 —— 全新 profile 首次 render 实测 ≈46s，
+             45s 的常规预算会让"新部署的第一次铸造"必然失败一次）
+
 产出 /tmp/tokens.txt（一行一个 token），并打印每个 token 的铸造耗时。
 
 要点:
@@ -201,11 +207,22 @@ class CDP:
                 return m
 
 
-MINT_JS = """
+# ---- render 超时预算 --------------------------------------------------------
+# 🔴 45s 这条线是被**冷启动**踩中的，不是随便定的：全新 profile 的**首次** render 实测
+#    ≈46 秒（Dockerfile.minter 第 86 行自己就写着这个数），恰好越过 45s ⇒ **新部署的第一次
+#    铸造必然失败一次**。2026-09-14 报告 AVM12-MINT 实测：冷 profile 起一次性实例，
+#    `/healthz` 10 秒即 `ready=true`，而两次 `POST /v1/turnstile/mint` 都是
+#    **46.01s TIMEOUT / 503** —— 现象看起来像"这个镜像坏了"，实际只是冷启动。
+# 两条预算分开：常规 `MINT_TIMEOUT_MS`；**首次**（页面/画像还是冷的）用
+# `COLD_MINT_TIMEOUT_MS`，并在超时后**用冷预算重试一次**（那一轮之后挑战已明显变快）。
+MINT_TIMEOUT_MS = int(os.environ.get("MINT_TIMEOUT_MS", "45000"))
+COLD_MINT_TIMEOUT_MS = int(os.environ.get("COLD_MINT_TIMEOUT_MS", "120000"))
+
+MINT_JS_TMPL = """
 (async () => {
   if (typeof window.turnstile === 'undefined') return {ok:false, why:'no turnstile api'};
   return await new Promise((resolve) => {
-    const t = setTimeout(() => resolve({ok:false, why:'TIMEOUT'}), 45000);
+    const t = setTimeout(() => resolve({ok:false, why:'TIMEOUT'}), %d);
     try {
       const host = document.createElement('div');
       host.style.cssText = 'position:fixed;left:10px;top:10px;width:300px;height:65px;z-index:99999;background:#fff';
@@ -218,7 +235,16 @@ MINT_JS = """
     } catch (e) { clearTimeout(t); resolve({ok:false, why:'EX '+String(e)}); }
   });
 })()
-""" % json.dumps(SITEKEY)
+"""
+
+
+def mint_js(timeout_ms: int) -> str:
+    """按给定预算生成 render 脚本（页面内的 `setTimeout` 是**唯一**的超时闸门）。"""
+    return MINT_JS_TMPL % (int(timeout_ms), json.dumps(SITEKEY))
+
+
+# 兼容旧用法（也供不方便传预算的调用点使用）
+MINT_JS = mint_js(MINT_TIMEOUT_MS)
 
 PROBE = "typeof window.turnstile + '|' + document.readyState + '|' + location.href"
 
@@ -235,8 +261,14 @@ def open_warm_page(bc):
     return tid, sess
 
 
-def mint_on(bc, sess, i):
-    """在**已预热**的页面上 render 一次（轻量页 ≈1.7s）。"""
+def mint_on(bc, sess, i, timeout_ms: int | None = None):
+    """在**已预热**的页面上 render 一次（热页面 ≈1.7s）。
+
+    `timeout_ms` 显式给预算；不给则用常规预算。**超时不算终局**：冷启动/挑战变慢时
+    用 `COLD_MINT_TIMEOUT_MS` 再试一次 —— 一次 45s 超时之后页面本身已经热了，
+    第二次通常几秒就出 token（这也是为什么"新部署第一次必失败"是**可修**的）。
+    """
+    budget = MINT_TIMEOUT_MS if timeout_ms is None else int(timeout_ms)
     t0 = time.time()
     ready = False
     for _ in range(45):
@@ -249,14 +281,27 @@ def mint_on(bc, sess, i):
         v = val_of(bc.call("Runtime.evaluate", session=sess, returnByValue=True, expression=PROBE)) or ""
         print(f"  #{i} 页面未就绪：{str(v)[:120]}")
         return None, time.time() - t0
-    val = val_of(bc.call("Runtime.evaluate", session=sess, expression=MINT_JS,
-                         awaitPromise=True, returnByValue=True))
+
+    val = _render_once(bc, sess, budget)
+    if isinstance(val, dict) and not val.get("ok") and val.get("why") == "TIMEOUT" \
+            and budget < COLD_MINT_TIMEOUT_MS:
+        # ★ 冷启动那条路：第一次超时不代表铸造能力坏了。用冷预算重试一次 ——
+        #   首次 render 的 ~46s 冷启动恰好越过 45s 线，正是报告 AVM12-MINT 的根因。
+        print(f"  #{i} 首次 {budget}ms 超时 ⇒ 用冷启动预算 {COLD_MINT_TIMEOUT_MS}ms 重试一次")
+        val = _render_once(bc, sess, COLD_MINT_TIMEOUT_MS)
+
     dt = time.time() - t0
     if isinstance(val, dict) and val.get("ok"):
         print(f"  #{i} token len={len(val['token'])} 铸造耗时={dt:.2f}s head={val['token'][:24]}...")
         return val["token"], dt
     print(f"  #{i} 失败：{val}（耗时 {dt:.2f}s）")
     return None, dt
+
+
+def _render_once(bc, sess, timeout_ms: int):
+    """单次 render（不重试）。返回 JS 的求值结果。"""
+    return val_of(bc.call("Runtime.evaluate", session=sess, expression=mint_js(timeout_ms),
+                          awaitPromise=True, returnByValue=True))
 
 
 def mint(bc, i):
@@ -292,7 +337,8 @@ def mint_legacy_app_page(bc, i):
             v = val_of(bc.call("Runtime.evaluate", session=sess, returnByValue=True, expression=PROBE)) or ""
             print(f"  #{i} 页面未就绪：{str(v)[:150]}")
             return None, time.time() - t0
-        val = val_of(bc.call("Runtime.evaluate", session=sess, expression=MINT_JS,
+        val = val_of(bc.call("Runtime.evaluate", session=sess,
+                             expression=mint_js(COLD_MINT_TIMEOUT_MS),
                              awaitPromise=True, returnByValue=True))
         dt = time.time() - t0
         if isinstance(val, dict) and val.get("ok"):

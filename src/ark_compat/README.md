@@ -215,6 +215,19 @@ first/last frame`），混用时适配层直接 400，不再让上游拒绝。
 `extra_body.aivideomaker_prefer_free=true` 是省钱开关：把超过 10s 的**合法**时长
 主动拉回 10s（不只是越界时才生效）。
 
+**越线一定会有声音**（2026-09-14 起）：只要 `billed` 是**因为时长**而为 true，`warnings`
+里就会多一条显式提醒。此前的行为是 `duration:15` **静默**进计费区 —— `billed: true`
+而 `warnings` 为空，调用方除非自己去读 `billed` 字段，根本不知道这条请求要花钱
+（而 `tier` 默认是 `turbo`，看起来就像免费档）：
+
+```
+duration 15s is outside the free window (10s) — this request WILL BE BILLED (tier=turbo);
+pass extra_body.aivideomaker_prefer_free=true to snap it down to 10s instead
+```
+
+⚠️ `tier=base` **不会**触发这条：它是调用方显式点名的选择（`extra_body.aivideomaker_tier`），
+不属于"悄悄变贵"，重复喊只会让人对告警脱敏。
+
 > 多素材请求要留意累加效应：参考素材本身可能带时长，
 > `duration:15` 这类请求**必然越过免费窗口**。
 

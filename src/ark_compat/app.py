@@ -60,6 +60,7 @@ from .observability import (
     clip,
     describe_error,
     instrument_fastapi,
+    logfire_exporting,
     logfire_ready,
     record_account,
     set_upstream_calls,
@@ -563,7 +564,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "tasks_tracked": request.app.state.tasks.count(),
             # 一眼看出任务表是否真的在持久化（kind=sqlite 才跨重启可读）
             "task_store": request.app.state.tasks.describe(),
+            # ⚠️ 两个信号必须**分开**报（2026-09-14 报告 AVM12-OPEN-LOGFIRE 实测发现）：
+            #   `logfire`          = SDK 装配成功（span 会生成，但可能一条都不外发）
+            #   `logfire_exporting`= 数据**真的**在往外发（需要 token，或显式强制发送）
+            # 只报前者时，`send_to_logfire=if-token-present` + 没有 LOGFIRE_TOKEN 会给出
+            # `logfire: true` —— 运维据此以为 trace 在云端，实际只有本地收集。
             "logfire": logfire_ok,
+            "logfire_exporting": logfire_exporting(),
+            "logfire_send": s.logfire_send,
             # 上报口径一眼可见：脱敏关着时请求/响应是原文，抓头开着则有凭证
             "logfire_scrubbing": bool(s.logfire_scrubbing),
             "logfire_capture_headers": bool(s.logfire_capture_headers),
@@ -777,7 +785,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 view = {}
         view = dict(view or {})
         view["id"] = entry["id"]
+        # `model` = **调用方请求的**模型（覆盖掉上游记录里的同名值）
         view["model"] = entry["model"]
+        # ★ `upstream_model` = **上游实际执行**的模型（站点任务记录里的 `aiModel`）。
+        #   2026-09-14 报告 AVM12-OPEN-UPSTREAM：只有 `model` 时，调用方无从知道上游换了
+        #   模型（请求 `doubao-seedance-2-5-260628`，成片的却是 `minimax_h3`）。
+        #   查不到（上游查询失败、或记录里没有该字段）时**如实给 None**，
+        #   绝不用请求值顶上 —— 那等于把"看不到"变成"看到一个假的"。
+        view["upstream_model"] = view.get("upstream_model")
         view["upstream"] = entry["upstream"]
         view["requested"] = entry["requested"]
         view["effective"] = entry["effective"]

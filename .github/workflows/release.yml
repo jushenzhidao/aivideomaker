@@ -18,12 +18,68 @@ concurrency:
   cancel-in-progress: false   # 并发会争抢版本号与 tag，必须串行
 
 jobs:
+  # ---------------------------------------------------------------- hygiene --
+  # 全量单测 + 零外发审计 + 零跳过。`tools/egress_audit.py` 一次跑完三件事：
+  #   跑完 discover 全部用例，拦下所有**非回环** TCP 连接并打印调用栈，再断言**没有用例被跳过**
+  #   —— 任一条不满足都以非 0 退出。这里是 CI 里**唯一**的测试门禁（此前流水线根本不跑单测）。
+  #   第三条是 2026-09-14 补的：`skipped` 与"通过"在报告里长得一模一样（只多一句
+  #   `OK (skipped=1)`），实测就有一条编排门禁因此**在流水线里从不执行**。
+  #
+  # 三条设计取舍，都是被真实故障逼出来的：
+  #  1. 放在 release **之前**、并让 release `needs` 它 ⇒ 门禁红时**连 tag 都不创建**，
+  #     不会"先烧掉一个版本号，再发现树是坏的"（tag 一旦打出就很难收回）。
+  #  2. **刻意不跟随跳过标记**：那条标记的语义是"这次不发版"，而"测试每推必跑"才是它的价值。
+  #     实测教训（2026-09-14）：提交信息里只是**提到**该标记，整条流水线就被 skip 成 1 秒
+  #     —— 若测试也绑在同一条件下，就等于"写文档的那次提交可以完全不验证"；
+  #     而**恰恰是文档提交最容易弄坏口径类门禁**（例如把 README 的免费窗口写回 8s）。
+  #  3. 必须钉 **Python 3.12**：`translate.py` 用了 PEP 701（f-string 嵌套引号），
+  #     3.11 及以下直接 SyntaxError —— 本地已踩过，别误判为代码回归。
+  #
+  # 为什么要 setup-python 而不是用 runner 自带的 python：runner 的默认版本随镜像漂移，
+  # 而本项目对版本有硬要求（见上）。显式钉死才能让"本地绿 / CI 红"的差异收敛到代码本身。
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 🔴 `requirements-dev.txt` 不能省 —— 三个测试期依赖（见该文件的成因说明）。
+      #    丢掉真实代价的实测（2026-09-14，在干净 venv 里复刻本作业时才发现）：
+      #      · 缺 websocket-client ⇒ `import websocket` 直接 ModuleNotFoundError；
+      #      · 缺 pytest ⇒ `Ran 269 tests / 2 ERROR`：`logfire.testing` 自己 import 它，
+      #        报错发生在**收集阶段**，`test_trace_contract` / `test_pool_metrics`
+      #        整个模块不被收集（本项目共 313 项，少 44 项正对应这两个模块）；
+      #      · 缺 pyyaml ⇒ 编排门禁的**第二条解析路**整条 skip（报告 AVM12-OPEN-PYYAML）：
+      #        "两条路互相校验"实际只剩一条，而输出只是 `OK (skipped=1)`，毫无提示。
+      #    三个坑**本地都复现不出来**（开发环境恰好装着），只有干净环境才现形。
+      #    ⇒ 现在 `tools/egress_audit.py` 会断言 `skipped == 0`，让这类缺失**当场变红**。
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check -q \
+            -r requirements.txt -r requirements-dev.txt
+
+      - name: 全量单测 + 零外发审计 + 零跳过
+        run: python3 tools/egress_audit.py
+
+      # 编排接线校验（纯静态，**不需要 docker**）。
+      # 为什么必须在 CI 里跑：容器里的 `minter-preflight` 只能看见**自己那份 env**
+      # （两侧同源于 AVM_MINTER_KEY ⇒ 永远相等），于是"把某个服务那行写死成字面量"
+      # 这种最常见的手工接线改法它看不见（报告 AVM12-PF-08）。
+      - name: compose 接线校验
+        run: python3 tools/compose_wiring_check.py
+
   release:
     # 逃生阀：提交信息里带跳过标记就不发版。
     # ⚠️ 这个字面量不得出现在任何"需要发版"的提交信息里 —— 它匹配整条 message，
     #    连"给逃生阀写说明"的那次提交自己也会命中，job 直接 skipped。
     #    中招时用 workflow_dispatch 补跑（该路径 head_commit 为 null，已用 || '' 兜底）。
     if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message || '', '[skip release]') }}
+    # 测试门禁（hygiene）没绿就不发版 —— 连 tag 都不会创建
+    needs: [hygiene]
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.next }}

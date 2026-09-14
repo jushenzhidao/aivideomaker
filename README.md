@@ -59,7 +59,12 @@ aivideomaker/
 │       ├── submit-queue.mjs           提交队列（并发闸门 + 延迟执行 + 退避重试）
 │       ├── tests/                     端到端测试（fixtures/ 内素材、archive/ 一次性探针）
 │       └── tools/                     check-session / session-diagnose / credit-report / collect-tasks / upload
-├── tests/                             Python 单测（300+ 项，零消耗、零外发）
+├── tests/                             Python 单测（380+ 项，零消耗、零外发）
+├── tools/                             运维与验证工具（零第三方依赖）
+│   ├── egress_audit.py                全量单测 + 零外发审计 + **零跳过**（CI 的测试门禁）
+│   ├── compose_wiring_check.py        编排接线校验（两侧 key 必须同源；`--resolve` 比对真实值）
+│   ├── turnstile_service.py           Turnstile 铸造**服务**（常驻，镜像是 Dockerfile.minter）
+│   └── turnstile_minter.py            铸造核心（Xvfb 有头 Chrome + 原生 CDP）
 ├── docs/
 │   ├── web-reverse/
 │   │   ├── README.md                  调研笔记（接口形态、数据模型、待办）
@@ -144,8 +149,11 @@ r = client.content_generation.tasks.create(
 Seedance 2.5「全能参考」上限为**图 4 / 视频 1 / 音频 2**，超限条目会被截断并在响应的
 `unsupported` 中留痕。
 
-测试：`python3 -m unittest discover -s tests`（300+ 项，零消耗、零外发）。
-零外发可复验：`python3 tools/egress_audit.py`（有非回环出站即以非 0 退出）。
+测试：`python3 -m unittest discover -s tests`（380+ 项，零消耗、零外发）。
+零外发可复验：`python3 tools/egress_audit.py`（有非回环出站、**或有用例被跳过**，都以非 0 退出
+—— 进 CI 的门禁**被跳过 ≠ 通过**，实测有一条编排门禁因此长期没跑过）。
+编排接线可复验：`python3 tools/compose_wiring_check.py`（部署前加 `--resolve` 用**解析后的真实值**
+再核一遍，见下方「部署」）。
 完整说明见 [`src/ark_compat/README.md`](src/ark_compat/README.md)。
 
 ## 部署
@@ -192,6 +200,27 @@ docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_P
 > 默认（开放）模式下它只告警不拦；一旦按上面的方式恢复 fail-closed，缺 key 会让
 > `docker compose up` **直接失败并打印两条出路** —— 不会再出现"命令退出 0、minter 却在
 > restart 循环里"的静默失败（那正是 0.0.7 上线时的部署陷阱）。
+>
+> ⚠️ **但那个容器有盲区，必须知道**（2026-09-14 实测）：它比的是**自己那份 env**
+> （`MINTER_KEY` 与 `ARK_MINTER_KEY` 都插值自 `AVM_MINTER_KEY` ⇒ 同源、永远相等），
+> 因此它拦得住"改 preflight 自己的 env"，**拦不住最常见的那种改法** —— 把 **minter 服务**
+> 那一行写死成字面量（容器里既没有 docker CLI，也看不见别的服务的 env）。
+> **真正的接线校验在宿主机侧**，部署前跑一次：
+>
+> ```bash
+> python3 tools/compose_wiring_check.py             # 静态：两侧 key 必须同源（CI 里也跑这条）
+> python3 tools/compose_wiring_check.py --resolve   # 更强：比对 docker compose config 解析后的**真实值**
+> ```
+>
+> 顺手还会拦下 `ARK_HOST` 被绑回环（端口映射会失效）与 `AVM_MINTER_URL` 丢掉 `:-` 默认值
+> （铸造能力被**静默**关掉）这两类"配了不生效"。
+>
+> 🔧 **冷启动那一次铸造**：全新 profile 的**首次** render 实测 ≈46s，而常规预算是 45s
+> ⇒ 不加宽就会"新部署的第一次铸造必然失败一次"（现象：`mint` 返回 503 + TIMEOUT，
+> 而 `/healthz` 早已报 ready）。现在首轮走冷启动预算并在超时后用冷预算重试一次；
+> 两条预算可调：`AVM_MINTER_RENDER_TIMEOUT_MS`（默认 45000）与
+> `AVM_MINTER_COLD_RENDER_TIMEOUT_MS`（默认 120000）。`/healthz` 会把
+> `warmed`（**真的铸出过** token）与 `ready`（Chrome 就绪）分开报 —— 只看 `ready` 会误判。
 
 **多 worker 是这里唯一的坑。** 上游闸门是进程内 `threading.Semaphore`，「全局只跑 2 个」依赖
 单进程：开 N 个 worker 会让实际并发变成 N×2，第 3 个起上游直接返回 `The queue is full`
@@ -208,6 +237,12 @@ docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_P
 
 任务表默认持久化到 SQLite（WAL，已 gitignore）；`AVM_TASK_STORE=memory` 是**显式**测试开关，
 写错会直接抛错而非静默退化。`/healthz` 的 `task_store` 字段是判断当前后端的唯一依据。
+
+`/healthz` 把 **`logfire`（SDK 装上了）与 `logfire_exporting`（数据真的会外发）分开报** ——
+`send_to_logfire="if-token-present"` 且没有 `LOGFIRE_TOKEN` 时，前者是 `true`、后者是 `false`；
+只看前者会以为 trace 在云端，**实际一条都没出去**。另外镜像依赖必须写成
+`logfire[fastapi]`：少了这个 extra，`instrument_fastapi` 每次启动都会静默失败（只留一条
+警告），每个请求的自动 span 随之消失。
 
 ## 关键结论
 

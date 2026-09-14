@@ -189,7 +189,7 @@ curl -X DELETE -H 'Authorization: Bearer sk-avm-demo' \
 | 键 | 作用 |
 | --- | --- |
 | `aivideomaker_dry_run: true` | **只校验不提交**。走完完整翻译 + 图片转存后直接返回 `{effective, warnings, unsupported, upstream_payload}`，零额度消耗。用于调试请求体。 |
-| `aivideomaker_prefer_free: true` | 时长吸附时优先落在**免费区**（≤8s）而不是数值最近的档位 |
+| `aivideomaker_prefer_free: true` | 时长吸附时优先落在**免费区**（`tier=turbo` 且 `duration ≤ 10s`）而不是数值最近的档位 |
 | `aivideomaker_tier: "turbo"\|"base"` | 显式指定档位，覆盖 model 名默认值 |
 
 ```bash
