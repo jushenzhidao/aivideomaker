@@ -320,5 +320,71 @@ class TestMultiMinter(unittest.TestCase):
         self.assertEqual(len(tm._hits), 2)
 
 
+class TestMinterFailureAttribution(unittest.TestCase):
+    """★ 失败归因（E2E-AVM-008）：node064 上 3 条 429 全部源于"配置全对、但宿主防火墙把
+    桥接容器 → 宿主端口的包丢了"—— 笼统的 "minter unavailable" 让人无从下手。
+
+    钉住两条契约：
+    1. `TokenMinter.last_error` 必须区分「unreachable（网络层）」与「HTTP/empty（可达但失败）」，
+       成功后清空（别拿旧错误误导下一条）；
+    2. 429 报文按归因给修法：unreachable ⇒ 防火墙放行命令 + --probe；其余 ⇒ 指向 minter。
+    """
+
+    def test_last_error_marks_unreachable_with_url(self):
+        def boom(_r):
+            raise httpx.ConnectError("connection refused")
+
+        m = TokenMinter("http://minter.test:8899")
+        m._http = httpx.Client(transport=httpx.MockTransport(boom))
+        self.assertIsNone(m.mint())
+        self.assertIsNotNone(m.last_error)
+        self.assertIn("unreachable", m.last_error)
+        self.assertIn("minter.test:8899", m.last_error)
+
+    def test_last_error_for_http_failure(self):
+        m = TokenMinter("http://minter.test")
+        m._http = httpx.Client(transport=httpx.MockTransport(
+            lambda r: httpx.Response(503, json={"error": "boom"})))
+        self.assertIsNone(m.mint())
+        self.assertIn("HTTP 503", m.last_error)
+        self.assertNotIn("unreachable", m.last_error)
+
+    def test_last_error_cleared_after_success(self):
+        responses = iter([httpx.Response(503, json={}),
+                          httpx.Response(200, json={"token": "TK"})])
+        m = TokenMinter("http://minter.test")
+        m._http = httpx.Client(transport=httpx.MockTransport(lambda r: next(responses)))
+        self.assertIsNone(m.mint())
+        self.assertIsNotNone(m.last_error)
+        self.assertEqual(m.mint(), "TK")
+        self.assertIsNone(m.last_error, "成功后归因必须清空")
+
+    def test_unreachable_hint_points_at_host_firewall(self):
+        class DeadMinter(FakeMinter):
+            last_error = "unreachable: http://host.docker.internal:8899 (ConnectTimeout)"
+
+        site = FakeSite(gate=True)
+        c = make_client(site, DeadMinter(token=None))
+        with self.assertRaises(CaptchaRequiredError) as ctx:
+            c.create(body_params())
+        msg = str(ctx.exception)
+        self.assertIn("FIREWALL", msg, "unreachable 归因必须给出防火墙修法")
+        self.assertIn("ufw allow", msg)
+        self.assertIn("unreachable", msg)
+        self.assertEqual(site.creates(), [])
+
+    def test_mint_failed_hint_does_not_mention_firewall(self):
+        class SickMinter(FakeMinter):
+            last_error = "http://minter.test: HTTP 503"
+
+        site = FakeSite(gate=True)
+        c = make_client(site, SickMinter(token=None))
+        with self.assertRaises(CaptchaRequiredError) as ctx:
+            c.create(body_params())
+        msg = str(ctx.exception)
+        self.assertIn("last_error=", msg)
+        self.assertNotIn("FIREWALL", msg, "可达但铸造失败时不该把人引去查防火墙")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

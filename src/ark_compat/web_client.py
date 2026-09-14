@@ -320,6 +320,29 @@ class WebClient:
             logger.info("已从铸造服务取得 Turnstile token（len={}）", len(tok))
         return tok
 
+    def _minter_failure_hint(self) -> str:
+        """铸造失败后的**归因提示**（E2E-AVM-008）。
+
+        "minter configured but unavailable" 有两种完全不同的成因，修法南辕北辙：
+        ① **网络层不可达**（`last_error` 带 `unreachable`）—— 配置全对也取不到，
+           minter 侧 `served` 纹丝不动。host 网络的 minter 下这几乎总是**宿主防火墙**
+           丢了「桥接容器 → 宿主端口」的包（E2E-AVM-008：3 条 429 全部源于此），
+           直接给放行命令与验证方法；
+        ② **可达但铸造失败** —— 指向 minter 自己（看它的 /healthz.last_failure）。
+        归因取自 `TokenMinter.last_error`（替身没有该属性时如实说 unknown）。
+        """
+        last = getattr(self.minter, "last_error", None) or "unknown"
+        if "unreachable" in str(last):
+            return (
+                "token minter configured but UNREACHABLE from this container "
+                f"(last_error={last}). With a host-network minter this is usually the "
+                "HOST FIREWALL dropping bridge-to-host traffic (E2E-AVM-008): allow the "
+                "container subnet to the minter port, e.g. `ufw allow proto tcp from "
+                "172.16.0.0/12 to any port 8899`, and verify with "
+                "`python3 tools/compose_wiring_check.py --probe`. "
+            )
+        return f"token minter configured but mint failed (last_error={last}) — "
+
     def create(self, params: dict, token: str | None = None) -> str:
         """创建视频任务，返回站点 taskId。
 
@@ -338,7 +361,7 @@ class WebClient:
                 raise CaptchaRequiredError(
                     "account currently requires a Turnstile captcha (model.needsCaptcha=true). "
                     "This is a dynamic, velocity-based gate, not an account property. "
-                    + ("token minter configured but unavailable/failed — " if tried else "")
+                    + (self._minter_failure_hint() if tried else "")
                     + "Supply a fresh Turnstile token, wait for it to decay, or spread the submissions out."
                 )
 

@@ -220,8 +220,26 @@ docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_P
 > python3 tools/compose_wiring_check.py --resolve   # 更强：比对 docker compose config 解析后的**真实值**
 > ```
 >
-> 顺手还会拦下 `ARK_HOST` 被绑回环（端口映射会失效）与 `AVM_MINTER_URL` 丢掉 `:-` 默认值
-> （铸造能力被**静默**关掉）这两类"配了不生效"。
+> 顺手还会拦下 `ARK_HOST` 被绑回环（端口映射会失效）、`AVM_MINTER_URL` 丢掉 `:-` 默认值
+> （铸造能力被**静默**关掉）与 minter 离开 host 网络（NAT 改写 TCP 指纹 ⇒ 铸造整体失效）
+> 这三类"配了不生效"。
+>
+> 🔴 **宿主防火墙：bridge 容器 → host 网络的 minter 是「出网到宿主」**（E2E-AVM-008 定案）：
+> minter 走 host 网络后"compose 内部访问"并不存在 —— ark-compat（桥接）访问 8899 受宿主
+> INPUT 链管辖。node064 的 `iptables -P INPUT DROP` 丢掉这条路 ⇒ 闸门一翻、3 条提交全部
+> 429（minter `served` 恒 1 —— 配置全对，包就是过不去）。放行**仅容器私网**：
+>
+> ```bash
+> ufw allow proto tcp from 172.16.0.0/12 to any port 8899          # docker 默认网段都在 172.16/12
+> ufw delete allow proto tcp from 172.16.0.0/12 to any port 8899   # 回滚
+> ```
+>
+> **宿主能连 ≠ 容器能连** —— 历轮接线验证都只验到"名字能解析"，没验到"包能到"。
+> 部署前加 `--probe` 在**容器内**实测一次：
+>
+> ```bash
+> python3 tools/compose_wiring_check.py --probe   # = --resolve + 与 ark-compat 同网络的容器内真实打 /healthz
+> ```
 >
 > 🔧 **冷启动那一次铸造**：常规 45s 预算下，冷 profile 的首次铸造曾在新部署上从未成功过
 > （现象：`mint` 返回 503 + TIMEOUT，而 `/healthz` 早已报 ready）。三轮复盘的定性演变

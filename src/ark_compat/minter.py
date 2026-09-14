@@ -7,6 +7,12 @@
 2. **短超时 + 只走回环/内网**：这是能产出"绕过风控凭证"的服务，不对外暴露；
    `trust_env=False` 是必须的 —— 代理会把 `127.0.0.1` 也拐走（本站踩过）。
 3. **只做一件事**：取回 token 字符串；不缓存（token 单次有效，缓存就是 bug 源）。
+
+★ 失败归因（E2E-AVM-008）：node064 上 3 条 429 的根因是"配置全对、但宿主防火墙把
+  桥接容器 → 宿主端口的包丢了"——minter 侧 `served` 纹丝不动，适配层却只有一句笼统的
+  "minter configured but unavailable"。所以这里把**最近一次失败的归因**留在
+  `last_error` 上（`unreachable: …` = 网络层到不了；`HTTP xxx` / `empty token` =
+  到得了但铸造失败），调用方据此在 429 报文里直接给出修法，别让人猜。
 """
 
 from __future__ import annotations
@@ -25,6 +31,11 @@ class TokenMinter:
     - 多地址：**从上次成功的下一个开始轮询**（长期均匀分摊负载，20 账号场景
       单实例产能 ~0.35 token/s 不够 10 个满负荷 pro ⇒ 双实例分摊），某实例失败
       立即转移到下一个，**全失败才返回 None**（调用方据此退回慢路径）。
+
+    `last_error`：最近一次 `mint()` 失败的**归因**（成功后清空为 None）——
+    `unreachable: <url> (<异常类>)` = 网络层不可达（E2E-AVM-008：多为宿主防火墙
+    丢包）；`<url>: HTTP xxx` / `<url>: empty token` = 可达但铸造失败。
+    仅供调用方拼 429 报文用，不参与任何控制流。
     """
 
     def __init__(self, url: str = "", key: str = "", timeout: float = DEFAULT_TIMEOUT):
@@ -34,6 +45,7 @@ class TokenMinter:
         self.timeout = float(timeout)
         self._http: httpx.Client | None = None
         self._next = 0          # 轮询指针：从上次成功的下一个开始
+        self.last_error: str | None = None
 
     # ------------------------------------------------------------------ api --
 
@@ -48,6 +60,7 @@ class TokenMinter:
 
     def mint(self) -> str | None:
         """取一个 token；任何失败都返回 `None`（调用方负责降级）。"""
+        self.last_error = None      # 本次尝试的归因：成功清空、失败覆盖
         if not self.configured:
             return None
         try:
@@ -63,23 +76,27 @@ class TokenMinter:
                 try:
                     r = self._http.post(f"{u}/v1/turnstile/mint", headers=headers)
                     if r.status_code != 200:
+                        self.last_error = f"{u}: HTTP {r.status_code}"
                         logger.warning(f"铸造服务 {u} 返回 {r.status_code}：{r.text[:160]}")
                         last_err = f"{u}: HTTP {r.status_code}"
                         continue
                     token = str((r.json() or {}).get("token") or "")
                     if not token:
+                        self.last_error = f"{u}: empty token"
                         logger.warning(f"铸造服务 {u} 返回空 token")
                         last_err = f"{u}: empty token"
                         continue
                     self._next = (i + 1) % n     # 成功 ⇒ 下次从下一个开始（均匀分摊）
                     return token
                 except Exception as e:  # noqa: BLE001 单实例故障 ⇒ 转移下一个
+                    self.last_error = f"unreachable: {u} ({type(e).__name__})"
                     logger.warning(f"铸造服务 {u} 不可用（{type(e).__name__}: {e}）⇒ 转移下一个")
                     last_err = f"{u}: {type(e).__name__}"
             if last_err:
                 logger.warning(f"所有铸造服务都失败（{last_err}）⇒ 本条退回慢路径")
             return None
         except Exception as e:  # noqa: BLE001 网络/客户端故障都算"取不到"
+            self.last_error = f"unreachable: minter client ({type(e).__name__})"
             logger.warning(f"铸造客户端异常（{type(e).__name__}: {e}）")
             return None
 

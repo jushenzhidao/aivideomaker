@@ -171,5 +171,68 @@ class TestComposeWiringCheck(unittest.TestCase):
         self.assertEqual(self._problems(mut), [])
 
 
+    # ---- host 网络契约与「包能到」（E2E-AVM-008）----
+    def test_parser_captures_network_mode(self):
+        """解析器必须能看见 `network_mode`（host 网络契约与路径提示都建立在它上面）。"""
+        services = self.tool.parse_services(self.compose)
+        self.assertEqual(services["minter"].get("network_mode"), "host")
+        self.assertNotIn("network_mode", services["ark-compat"],
+                         "ark-compat 没有 network_mode ⇒ 键必须缺席（别把别的键误捕进来）")
+
+    def test_catches_minter_off_host_network(self):
+        """★ 变异：删掉 `network_mode: host` ⇒ bridge 的 NAT 改写 TCP 指纹 ⇒ 铸造整体失效，
+        而 /healthz 照样 ready —— 必须被静态检查拦下。"""
+        mut = _mutate(self.compose, "minter", "    network_mode: host\n", "")
+        problems = self._problems(mut)
+        self.assertTrue(any("host 网络" in p for p in problems), problems)
+
+    def test_host_path_note_present_for_real_compose(self):
+        """真实 compose（minter=host、ark-compat=桥接）必须给出防火墙路径提示。"""
+        notes = self.tool.host_path_notes(self.tool.parse_services(self.compose))
+        self.assertTrue(any("ufw allow" in n and "8899" in n for n in notes), notes)
+
+    def test_host_path_note_mutation_proof(self):
+        """提示的触发条件必须可证伪：两侧条件各变异一次，提示都要消失。"""
+        # ① ark-compat 也上 host 网络 ⇒ 同在宿主网络栈，无跨界流量 ⇒ 不再提示
+        mut = _mutate(self.compose, "ark-compat",
+                      "    container_name: ark-compat\n",
+                      "    container_name: ark-compat\n    network_mode: host\n")
+        self.assertEqual(self.tool.host_path_notes(self.tool.parse_services(mut)), [])
+        # ② minter 离开 host 网络（该情形另由 check_static 判失败）⇒ 提示也不适用
+        mut2 = _mutate(self.compose, "minter", "    network_mode: host\n", "")
+        self.assertEqual(self.tool.host_path_notes(self.tool.parse_services(mut2)), [])
+
+    def test_probe_snippet_is_valid_python_and_blocks_proxies(self):
+        """探针源码会被塞进 `docker run … python -c`：语法必须合法；代理必须被显式清空
+        （本站踩过 HTTP_PROXY 把内网地址拐走）；必须打 /healthz 且带超时。"""
+        snippet = self.tool.probe_snippet()
+        compile(snippet, "probe", "exec")
+        self.assertIn("ProxyHandler({})", snippet)
+        self.assertIn("/healthz", snippet)
+        self.assertIn("timeout=", snippet)
+        self.assertIn("PROBE_JSON=", snippet)
+
+    def test_interpret_probe_flags_unreachable_with_ufw_hint(self):
+        import json as _json
+
+        rec = [{"url": "http://host.docker.internal:8899", "ok": False,
+                "error": "URLError: timed out"}]
+        problems = self.tool.interpret_probe(1, "PROBE_JSON=" + _json.dumps(rec), "")
+        self.assertTrue(problems)
+        self.assertTrue(any("ufw allow" in p and "8899" in p for p in problems), problems)
+
+    def test_interpret_probe_passes_on_ok(self):
+        import json as _json
+
+        rec = [{"url": "http://host.docker.internal:8899", "ok": True,
+                "status": 200, "ready": True}]
+        self.assertEqual(self.tool.interpret_probe(0, "PROBE_JSON=" + _json.dumps(rec), ""), [])
+
+    def test_interpret_probe_without_output_is_a_problem(self):
+        """★ 探针没给出结果（容器起不来/镜像缺失）⇒ 连通性**未证实**，绝不能当成通过。"""
+        problems = self.tool.interpret_probe(1, "", "docker: error …")
+        self.assertTrue(any("未证实" in p for p in problems))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

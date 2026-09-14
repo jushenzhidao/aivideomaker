@@ -373,6 +373,15 @@ services:
     #   --network host）0/2、46s 超时，与 bridge 同症状 ⇒ **Mac 上 minter 请宿主直跑**
     #   （macOS 有头直跑已验证 2.4~3.5s/个），AVM_MINTER_URL 指宿主地址并停用本服务。
     network_mode: host
+    # 🔴 **宿主防火墙是这条路径的最后一关**（E2E-AVM-008 定案）：host 网络 ⇒ 「compose 内部
+    #    访问」并不存在 —— ark-compat（桥接）访问本服务是**出网到宿主**，受宿主 INPUT 链管辖。
+    #    node064 的 `iptables -P INPUT DROP` 丢了这条路 ⇒ 闸门一翻、3 条提交全部 429
+    #    （minter served 恒 1 —— "配置全对"，包就是过不去；宿主侧 curl 全通是假象）。
+    #    修法（仅容器私网，docker 默认网段都在 172.16/12 内）：
+    #      ufw allow proto tcp from 172.16.0.0/12 to any port 8899
+    #    （回滚：ufw delete allow proto tcp from 172.16.0.0/12 to any port 8899）
+    #    部署前实测「包能到」：python3 tools/compose_wiring_check.py --probe
+    #    —— 在与 ark-compat 同网络的一次性容器里真实打一次 /healthz；宿主能连 ≠ 容器能连。
     # （host 网络下没有端口映射，`expose` 是死配置，已删——服务直接监听宿主 8899）
     environment:
       PORT: "8899"

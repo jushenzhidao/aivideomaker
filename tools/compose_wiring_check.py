@@ -13,7 +13,7 @@
 preflight 照样报 `[ok]`。容器里既没有 docker CLI，也看不见别的服务的 env —— 这个盲区
 **在容器内无法修**，只能搬到宿主机侧。
 
-两类检查，粒度不同、互相补位：
+三类检查 + 一个实测探针，粒度不同、互相补位：
 
 1. **静态**（默认，零依赖、不需要 docker）：解析 `docker-compose.yml`，检查两个服务给
    同一个键写的**插值表达式是否同源**。P-08 那种"只改一边（改成字面量）"必然被拦下。
@@ -21,19 +21,30 @@ preflight 照样报 `[ok]`。容器里既没有 docker CLI，也看不见别的�
 2. **解析后**（`--resolve`，需要 `docker compose`）：跑 `docker compose config`，拿**两个
    服务实际会拿到的 env** 逐项比对 —— 这是"事实"层面的检查，也是 P-08 的正解。
    顺带把 minter 的 fail-closed 守卫、`ARK_HOST`、闸门与透传互斥一起按真实值复核一遍。
+3. **路径提示**（默认就会打 `[note]`）：minter 走 host 网络后，"compose 内部访问"并不
+   存在 —— ark-compat（桥接）访问它是**出网到宿主**，受宿主防火墙 INPUT 链管辖。这件事
+   从 YAML 里**验不出来**（宿主防火墙不在 compose 里），所以只提示不判失败，并指向 `--probe`。
+4. **包能到**（`--probe`，需要 docker 且镜像已在本地）：起一个一次性容器（`docker compose
+   run --rm`，与 ark-compat 同网络同 env），在**容器内**真实打一次 minter 的 `/healthz`。
+   E2E-AVM-008 的教训：历轮接线验证都只验到「名字能解析」，没验到「包能到」—— node064
+   的 `iptables -P INPUT DROP` 丢掉这条路，闸门一翻 3 条提交全部 429（minter `served`
+   恒 1），而宿主侧 `curl` 全通。**宿主能连 ≠ 容器能连。**
 
 ## 用法
 
     python3 tools/compose_wiring_check.py                # 静态校验（CI 用这条）
-    python3 tools/compose_wiring_check.py --resolve       # 部署前用这条（最强）
+    python3 tools/compose_wiring_check.py --resolve       # 部署前用这条（更强）
+    python3 tools/compose_wiring_check.py --probe         # 最强：resolve + 容器内真实探测
 
-退出码：`0` 通过 ｜ `2` 未通过（含无法解析）。
+退出码：`0` 通过 ｜ `2` 未通过（含无法解析、探测不到）。
 ⚠️ 它**不**替代容器内的 `minter-preflight` —— 那条守的是"镜像里的守卫本身能不能跑起来"，
 两条都要留。
 
-本轮（E2E-AVM-006）新增的第三类检查：**minter 的 `TZ` 必须在场**。它和 `AVM_MINTER_URL`
+本轮（E2E-AVM-006）新增的检查：**minter 的 `TZ` 必须在场**。它和 `AVM_MINTER_URL`
 同属"配了才可能对、不配也照样起"的项 —— 缺它时容器按 UTC 跑，CF 判定「时区/会话不一致」
 ⇒ 下发交互式挑战 ⇒ **铸造恒失败**，而服务照常 ready、`/healthz` 一片正常。
+E2E-AVM-008 新增：minter 必须 `network_mode: host`（bridge 的 NAT 改写 TCP 指纹 ⇒
+CF 判机器人 ⇒ 铸造整体失效，实测同机同 Chrome 宿主 3.7s ✅ / bridge ❌）+ 路径提示与探针。
 """
 
 from __future__ import annotations
@@ -43,6 +54,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,11 +78,13 @@ def _strip_inline_comment(value: str) -> str:
 
 
 def parse_services(text: str) -> dict:
-    """零依赖解析出 `services.*.environment` 的**原始值字符串**（不做插值）。
+    """零依赖解析出 `services.*` 的 environment **原始值**与 `network_mode`（不做插值）。
 
     刻意不依赖 pyyaml：这个工具要在**任何**宿主机上能跑，包括没装 pyyaml 的运维机。
-    只认本项目 compose 的写法（`services:` → 缩进 2 的服务名 → 缩进 4 的 `environment:` →
-    缩进 ≥6 的 `KEY: value`），写法一变就会被"抽到 0 个服务"当场暴露，而不是静默放行。
+    只认本项目 compose 的写法（`services:` → 缩进 2 的服务名 → 缩进 4 的键），写法一变
+    就会被"抽到 0 个服务"当场暴露，而不是静默放行。
+    `network_mode`（E2E-AVM-008 起需要）：environment 之外的顶层标量键只认这一个，
+    存放在服务字典的 `"network_mode"` 键下 —— environment 的键全是大写，不会撞名。
     """
     services: dict = {}
     in_services = False
@@ -93,7 +107,15 @@ def parse_services(text: str) -> dict:
             in_env = False
             continue
         if cur is not None and indent == 4 and not in_env:
-            in_env = line == "environment:"
+            if line == "environment:":
+                in_env = True
+                continue
+            m2 = re.match(r"([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$", line)
+            if m2 and m2.group(1) == "network_mode":
+                val = _strip_inline_comment(m2.group(2))
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                    val = val[1:-1]
+                services[cur]["network_mode"] = val
             continue
         if in_env and cur is not None:
             if indent <= 4:            # 块结束（volumes / healthcheck / 下一个键…）
@@ -226,7 +248,124 @@ def check_static(services: dict) -> list[str]:
         )
         if p:
             problems.append("[接线] " + p)
+
+    # ⑥ host 网络契约（E2E-AVM-008 起钉死）：minter 必须 `network_mode: host` ——
+    #    bridge + NAT 会改写 TCP MSS/指纹 ⇒ CF 判机器人 ⇒ `render()` 全部吃满预算超时、
+    #    0 成功（同机同 Chrome：宿主 3.7s ✅ / bridge 容器 ❌，实测）。删掉或改掉这一行，
+    #    铸造就整体失效，而 /healthz 照样 ready —— 又是"配了不生效"的形态。
+    minter_nm = minter.get("network_mode", "")
+    if minter_nm != "host":
+        problems.append(
+            f"[接线] {MINTER}.network_mode={minter_nm!r} ⇒ 不走 host 网络时 NAT 会改写 "
+            "TCP 指纹，CF 判机器人 ⇒ 铸造整体失效（实测同机同 Chrome：宿主 3.7s ✅ / "
+            "bridge ❌）。必须保留 `network_mode: host`。"
+        )
     return problems
+
+
+# ---------------------------------------------------------------- 路径提示 ----
+
+
+def host_path_notes(services: dict) -> list[str]:
+    """**不判失败**、只在部署输出里喊出来的路径类提示（E2E-AVM-008）。
+
+    minter 走 host 网络后，"compose 内部访问"并不存在 —— ark-compat（桥接）访问它是
+    **出网到宿主**，受宿主防火墙 INPUT 链管辖。这件事从 YAML 里**验不出来**（宿主防火墙
+    不在 compose 里），所以只提示 + 提供 `--probe` 实测。E2E-AVM-008 的 3 条 429 全部
+    源于它（`iptables -P INPUT DROP` 丢包，而 minter `served` 恒 1 —— 配置全对）。
+    """
+    notes: list[str] = []
+    if not services:
+        return notes
+    minter_nm = (services.get(MINTER) or {}).get("network_mode", "")
+    app_nm = (services.get(APP) or {}).get("network_mode", "")
+    if minter_nm == "host" and app_nm != "host":
+        notes.append(
+            "[路径] minter 走 host 网络 ⇒ ark-compat（桥接）访问它是**出网到宿主**，受宿主"
+            "防火墙 INPUT 链管辖。宿主若 DROP（如 `iptables -P INPUT DROP` / ufw 默认拒），"
+            "闸门翻起时适配层只能如实 429（E2E-AVM-008：3 条 429 全部源于此，而 minter "
+            "served 恒为 1）。放行容器网段 → minter 端口（仅容器私网，不放公网）："
+            "`ufw allow proto tcp from 172.16.0.0/12 to any port 8899`"
+            "（回滚 `ufw delete allow proto tcp from 172.16.0.0/12 to any port 8899`），"
+            "并用 --probe 验证「包能到」—— 宿主能连 ≠ 容器能连。"
+        )
+    return notes
+
+
+# ---------------------------------------------------------------- 连通性探针 ----
+
+
+def probe_snippet() -> str:
+    """容器内执行的连通性探针源码（stdlib-only）。
+
+    为什么用 stdlib 而不是 httpx：探针要能在**任何**镜像里跑，stdlib 最稳。
+    `ProxyHandler({})` 显式清空代理 —— 环境里的 `HTTP_PROXY` 会把内网/回环地址也拐走
+    （本站踩过：返回的是代理网关的错误体，不是 connection refused，极误导）。
+    """
+    return textwrap.dedent("""\
+        import json, sys, urllib.request
+        urls = [u.strip() for u in (sys.argv[1] or "").split(",") if u.strip()]
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        out, ok_all = [], True
+        for u in urls:
+            rec = {"url": u}
+            try:
+                with opener.open(u.rstrip("/") + "/healthz", timeout=6) as r:
+                    body = json.loads((r.read() or b"{}").decode("utf-8", "replace"))
+                    rec.update(ok=True, status=r.status, ready=body.get("ready"))
+            except Exception as e:
+                rec.update(ok=False, error=type(e).__name__ + ": " + str(e)[:120])
+                ok_all = False
+            out.append(rec)
+        print("PROBE_JSON=" + json.dumps(out, ensure_ascii=False))
+        sys.exit(0 if ok_all else 1)
+        """)
+
+
+def interpret_probe(returncode: int, stdout: str, stderr: str) -> list[str]:
+    """把探针输出翻成问题清单。**没有结果本身就是问题** —— 连通性未证实 ≠ 通过。"""
+    problems: list[str] = []
+    line = next((l for l in stdout.splitlines() if l.startswith("PROBE_JSON=")), None)
+    if line is None:
+        problems.append(
+            f"[probe] 容器内探针没有给出结果（退出码 {returncode}）⇒ 连通性**未证实**，"
+            "不能当成通过。stderr: " + ((stderr or "").strip()[-200:] or "(空)")
+        )
+        return problems
+    try:
+        records = json.loads(line[len("PROBE_JSON="):])
+    except json.JSONDecodeError as e:
+        problems.append(f"[probe] 探针输出不可解析（{e}）⇒ 连通性未证实。")
+        return problems
+    for rec in records:
+        if rec.get("ok"):
+            continue
+        m = re.search(r":(\d+)", str(rec.get("url", "")))
+        port = m.group(1) if m else "8899"
+        problems.append(
+            f"[probe] 容器内连不上 minter：{rec.get('url')} —— {rec.get('error')}。"
+            "这正是 E2E-AVM-008 那 3 条 429 的成因形态：宿主能连 ≠ 容器能连，桥接容器 → "
+            "宿主端口的包被宿主防火墙 INPUT 链丢弃。放行容器网段（docker 默认网段都在 "
+            "172.16/12 内）：`ufw allow proto tcp from 172.16.0.0/12 to any port "
+            f"{port}`（回滚 `ufw delete allow …`）；放通后重跑本探针确认。"
+        )
+    return problems
+
+
+def probe_minter(compose: Path, url: str) -> list[str]:
+    """在**与 ark-compat 同网络同 env** 的一次性容器里真实探测 minter。
+
+    用 `docker compose run --rm --no-deps`：不依赖 ark-compat 正在运行（只要镜像在本地），
+    也不会牵起 minter；`-T` 禁掉 TTY 分配。命令以 argv 传递，snippet 不经 shell，无转义问题。
+    """
+    cmd = ["docker", "compose", "-f", str(compose), "run", "--rm", "--no-deps", "-T",
+           APP, "python", "-c", probe_snippet(), url]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, cwd=str(compose.parent),
+                             timeout=180)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return [f"[probe] 无法在容器内执行探针（{type(e).__name__}: {e}）⇒ 连通性未证实。"]
+    return interpret_probe(out.returncode, out.stdout, out.stderr)
 
 
 # -------------------------------------------------------------- 解析后检查 ----
@@ -315,6 +454,7 @@ def check_resolved(services: dict) -> list[str]:
 
 def main(argv: list[str]) -> int:
     do_resolve = "--resolve" in argv
+    do_probe = "--probe" in argv
     compose = DEFAULT_COMPOSE
     if "-f" in argv:
         compose = Path(argv[argv.index("-f") + 1]).resolve()
@@ -350,13 +490,29 @@ def main(argv: list[str]) -> int:
                 f"仅 pyyaml={sorted(y_keys - line_keys)}，仅行内={sorted(line_keys - y_keys)}"
             )
 
-    if do_resolve:
+    # 路径提示只喊不拦（宿主防火墙不在 compose 里，YAML 验不出来）—— E2E-AVM-008。
+    for note in host_path_notes(services):
+        print(note, file=sys.stderr)
+
+    resolved = None
+    if do_resolve or do_probe:
         try:
             resolved = resolved_services(compose)
         except (OSError, RuntimeError, json.JSONDecodeError) as e:
-            print(f"[fatal] --resolve 要求 `docker compose config` 能跑通：{e}", file=sys.stderr)
+            print(f"[fatal] --resolve/--probe 要求 `docker compose config` 能跑通：{e}",
+                  file=sys.stderr)
             return 2
         problems += check_resolved(resolved)
+
+    if do_probe:
+        url = ((resolved or {}).get(APP, {}) or {}).get("AVM_MINTER_URL", "").strip()
+        if not url:
+            problems.append(
+                f"[probe] {APP} 的 AVM_MINTER_URL 解析后为空 ⇒ 无处可探（先把铸造能力恢复，"
+                "见前面的 [接线] 项）。"
+            )
+        else:
+            problems += probe_minter(compose, url)
 
     if problems:
         print(f"[fatal] compose 接线校验未通过（{len(problems)} 项）：", file=sys.stderr)
@@ -369,10 +525,16 @@ def main(argv: list[str]) -> int:
         )
         return 2
 
-    mode = "静态 + docker compose config 解析后" if do_resolve else "静态"
-    print(f"[ok] compose 接线校验通过（{mode}；服务 {sorted(services)}）")
-    if not do_resolve:
-        print("     提示：部署前可加 --resolve 用**实际解析出的值**再复核一遍（更强）。")
+    modes = ["静态"]
+    if do_resolve:
+        modes.append("docker compose config 解析后")
+    if do_probe:
+        modes.append("容器内真实探测（包能到）")
+    print(f"[ok] compose 接线校验通过（{' + '.join(modes)}；服务 {sorted(services)}）")
+    if not do_resolve and not do_probe:
+        print("     提示：部署前可加 --resolve 用**实际解析出的值**再复核一遍；"
+              "minter 走 host 网络的部署再加 --probe 验证「容器 → 宿主」的包真的能到"
+              "（E2E-AVM-008：宿主能连 ≠ 容器能连）。")
     return 0
 
 

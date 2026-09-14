@@ -343,7 +343,9 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
 | 站点各分辨率的**时长上限** | 站点约束是「连续秒数 + 不得超过 N 秒」（UI 文案 `videoDurationMaxWarnTip`），当前统一按 `[5, 20]` 处理；**上限未逐分辨率实测** |
 | `480p` / `1080p` 接受连续秒数 | 由站点 UI 文案 + `720p` 实测推断（720p 的 5/6/7/8/9/11/14s 实测通过）；**480p/1080p 未单独实测** |
 | `web` 线的 SSE 帧结构 | 已实现（`model-status`），但生产路径默认走 `model.getModel`，SSE 只作回落 |
-| minter 的 `TZ` 修复（E2E-AVM-006） | 根因与结论由 **node064 上的单变量实验**定案（缺 TZ ⇒ 交互式挑战 ⇒ 铸造恒失败）；本仓库这一版改动（compose `AVM_MINTER_TZ` + 镜像 `ENV TZ` + tzdata + `/healthz.tz`）**尚未在该机重新验证**，下一轮 E2E 复测即为验收 |
+| minter 的 `TZ` 修复（E2E-AVM-006） | ✅ **已验收**：E2E-AVM-008（node064，0.0.15 实机）—— minter 持续 mint（池 4/4）、`served` 1→2、放通防火墙后两条真实提交成功；历史结论由单变量矩阵定案 |
+| 429 的归因提示与 `TokenMinter.last_error`（E2E-AVM-008 后新增） | 仅单测覆盖（unreachable ⇒ 防火墙修法提示；HTTP 失败 ⇒ 指向 minter），**未在 node064 实机复验报文形态** |
+| `compose_wiring_check --probe`（容器内连通性探测）与 host 网络静态契约 | 仅本地单测；探针在 node064 的下一次部署前实测（E2E-AVM-008 的矩阵用的是手工一次性容器） |
 | `tzdata` 是否必须 | 决定性实验跑在**没有** tzdata 的镜像上（浏览器走自带 ICU 时区库）⇒ 它是"消除半生效"的加固，不是铸造成功的前提；这一判断**未做过对照实测** |
 
 ## 测试
