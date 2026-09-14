@@ -343,6 +343,8 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
 | 站点各分辨率的**时长上限** | 站点约束是「连续秒数 + 不得超过 N 秒」（UI 文案 `videoDurationMaxWarnTip`），当前统一按 `[5, 20]` 处理；**上限未逐分辨率实测** |
 | `480p` / `1080p` 接受连续秒数 | 由站点 UI 文案 + `720p` 实测推断（720p 的 5/6/7/8/9/11/14s 实测通过）；**480p/1080p 未单独实测** |
 | `web` 线的 SSE 帧结构 | 已实现（`model-status`），但生产路径默认走 `model.getModel`，SSE 只作回落 |
+| minter 的 `TZ` 修复（E2E-AVM-006） | 根因与结论由 **node064 上的单变量实验**定案（缺 TZ ⇒ 交互式挑战 ⇒ 铸造恒失败）；本仓库这一版改动（compose `AVM_MINTER_TZ` + 镜像 `ENV TZ` + tzdata + `/healthz.tz`）**尚未在该机重新验证**，下一轮 E2E 复测即为验收 |
+| `tzdata` 是否必须 | 决定性实验跑在**没有** tzdata 的镜像上（浏览器走自带 ICU 时区库）⇒ 它是"消除半生效"的加固，不是铸造成功的前提；这一判断**未做过对照实测** |
 
 ## 测试
 
@@ -408,6 +410,7 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 ├── test_token_minter.py     铸造服务接线（取不到 token 就如实失败）
 ├── test_minter_chrome_guard.py 铸造器 Chrome 生命周期守卫（绝不叠实例）
 ├── test_minter_bind_guard.py 铸造服务绑定安全（非回环 + 无 key ⇒ 拒绝启动）
+├── test_minter_timezone.py  铸造时区门禁（缺 TZ ⇒ 铸造恒 interactive；含变异自证）
 └── test_ua_consistency.py   UA / 服务名一致性
 ```
 

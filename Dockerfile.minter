@@ -28,7 +28,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CDP_PORT=9222 \
     CHROME_PROFILE=/data/chrome \
     POOL_TARGET=4 \
-    TOKEN_TTL_S=120
+    TOKEN_TTL_S=120 \
+    TZ=Asia/Shanghai
+
+# ★ `TZ` 是**铸造能否成功的前提，不是可选的美化项**（E2E-AVM-006 定案）：
+#   容器默认 UTC 时 CF 会判定"时区/会话不一致"并下发**交互式挑战** ⇒ 铸造恒失败
+#   （现象是 `interactive` 分类、每次约 12s 快速失败、0 token；冷/热 profile 都一样）。
+#   同一台机器上补上 TZ=Asia/Shanghai 后：热卷首铸 2.96s、全新冷卷首铸 5.20s，各铸 4/4。
+#   ⚠️ 与部署机 compose 的 `AVM_MINTER_TZ` **同一个语义、同一个默认值**（两边都设是为了让
+#      "手工 docker run 本镜像"与"compose 起服务"拿到一致的环境，不设 compose 也正确）。
+#   ⚠️ 2026-09-14 曾有一版 TZ 改动被还原，理由是在 macOS Docker Desktop 上四格实验证伪 ——
+#      那台机器的结论没错（host 网络在 Mac 上仍经 VPNkit NAT，Mac 本就该宿主机直跑）；
+#      本条的结论来自 Linux 原生 Docker + host 网络上的干净单变量实验。别再把两者混为一谈。
 
 # 额外装的几组（都有理由，不是"顺手多加"）：
 #   * xauth      —— 没有它 `xvfb-run` 直接起不来（容器里实测踩到，且补货线程会被
@@ -36,6 +47,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #   * 多字体      —— 只装 liberation 时字体家族只有 4 个，而真人浏览器有几十个，
 #                   这是容器里最容易被 CF 当机器人的信号之一；
 #   * libgl1/mesa —— CF 会查 WebGL 渲染器，缺库时报"无 WebGL" ⇒ 强负信号。
+#   * tzdata     —— 让 `TZ=Asia/Shanghai` 在 **libc 层**也真的生效（`/usr/share/zoneinfo`
+#                   缺失时 `TZ` 会被 libc 静默当成 UTC：变量看起来设了，`date` 却是 UTC）。
+#                   ⚠️ 它不是"铸造能不能成"的决定因素 —— Chrome 走自带的 ICU 时区库，
+#                   E2E-AVM-006 那组决定性实验就是在**没有**本包的镜像上跑通的。装它是为了
+#                   不让 `TZ` 变成"只对浏览器生效、对系统半生效"的半吊子配置
+#                   （本项目最忌讳的那类"配了像没配"）。
 # ⚠️ 这些注释**不能写在 RUN 的续行里面**：Dockerfile 只在行首识别注释，续行里的 `#`
 #    会被 shell 当注释，把后半行命令（含 `&& curl ... install chrome`）整段吃掉，
 #    而该层还会"成功"—— 典型的静默破坏。
@@ -61,7 +78,7 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
         > /etc/apt/apt.conf.d/80avm-retries \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl xvfb xauth dbus dbus-x11 \
+        ca-certificates curl xvfb xauth dbus dbus-x11 tzdata \
         fonts-liberation fonts-dejavu-core fonts-noto-core fonts-noto-color-emoji \
         libgl1 libglx-mesa0 libegl1 \
         libnss3 libxss1 libatk-bridge2.0-0 libatk1.0-0 libgtk-3-0 libgbm1 libasound2 \
@@ -84,10 +101,14 @@ WORKDIR /app
 COPY tools/turnstile_minter.py tools/turnstile_service.py /app/tools/
 
 # Chrome 的 profile 落在卷里：① 重启后不用重新冷启动 ② 画像有点"年龄"总比每次全新好
-# ⚠️ 实测复盘（E2E-AVM-004）：全新 profile 的**首铸**在新部署上可能**卡死**而非"慢"——
-#    120s 冷预算也不出 token（挑战不回调成功也不回调失败，疑似交互式挑战等人操作）。
-#    旧注释里的「首次 render ~46 秒」是 45s 超时签名的误读，已证伪，别再改回去。
-#    新部署建议：用长期实例的热 profile 播种 /data 卷，或保持实例常驻不重建。
+# ⚠️ 实测复盘（E2E-AVM-004 → E2E-AVM-006）：
+#    * 全新 profile 的**首铸**曾在新部署上**卡死**而非"慢"—— 120s 冷预算也不出 token；
+#      旧注释里的「首次 render ~46 秒」是 45s 超时签名的误读，已证伪，别再改回去。
+#    * **根因（E2E-AVM-006 定案）= 环境缺 `TZ`**，不是 profile 冷热、也不是核心版本：
+#      补上 TZ 后全新冷卷首铸 5.20s（4/4 成功），而缺 TZ 时热卷也照样 interactive ×3。
+#    * ❌ 因此旧注释里「用长期实例的热 profile 播种 /data 卷」这条建议**已被实验否掉**
+#      （AVM16-SEED-HOT：整卷播种后 3 连败全 interactive，CF 的信任不落在 profile 里）。
+#      —— 别再据此把 /data 卷当成解药；要的是 `TZ` 在场。播种的唯一价值是省掉预热时间。
 VOLUME ["/data"]
 EXPOSE 8899
 

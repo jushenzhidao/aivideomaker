@@ -33,7 +33,7 @@
 # env_file：env_file 会把 .env 里所有变量（含无关项）一股脑灌进容器，而显式列举
 # 写错名字会立刻暴露成空值，符合本项目"宁可报错不要静默"的口径。
 #
-# **八个** compose 专属变量（**故意不写进 .env.example** —— 那里只放代码实际读取的变量，
+# **九个** compose 专属变量（**故意不写进 .env.example** —— 那里只放代码实际读取的变量，
 # 有 tests/test_env_template.py 的**双向**门禁把关；需要时直接写进你的 .env 即可）：
 #   AVM_IMAGE_TAG              拉取/构建用的镜像 tag，默认 latest（也可填版本如 0.0.1）
 #   AVM_HOST_PORT              宿主侧映射端口，默认 8808（容器内固定 8808）
@@ -41,12 +41,21 @@
 #   AVM_MINTER_BIND_HOST       铸造服务的绑定地址，默认 0.0.0.0；收到回环/内网即"开放但不挂公网"
 #   AVM_MINTER_POOL            单个铸造器实例的池子水位，默认 4（≈ 账号额度 × TTL/一轮时长）
 #   AVM_MINTER_TTL             铸出的 token 存活上限（秒），默认 120（CF 侧约 300s，按更短算）
+#   AVM_MINTER_TZ              铸造容器的时区，**默认 Asia/Shanghai**。E2E-AVM-006 单变量实验
+#                              定案的**必要且充分**变量：缺它 ⇒ CF 判定"时区/会话不一致" ⇒
+#                              下发交互式挑战（interactive），冷 profile 与热 profile 都铸不出
+#                              token。⚠️ **不要删、不要留空** —— 这不是"日志时间好不好看"的项，
+#                              而是铸造能否成功的前提（写法的门禁见 tools/compose_wiring_check.py）。
 #   AVM_MINTER_RENDER_TIMEOUT_MS       render 常规预算（毫秒），默认 45000
 #   AVM_MINTER_COLD_RENDER_TIMEOUT_MS  render **冷启动首轮**预算（毫秒），默认 120000
-#                               —— E2E-AVM-004 复盘：冷 profile 首铸可能是**卡死**（120s 也不出），
-#                                  而非旧的「≈46s 慢成功」（那是 45s 超时签名的误读，已证伪）；
-#                                  COLD 预算只是给慢路径留余量，真正治卡死的是代码侧的
-#                                  before-interactive-callback 快速失败 + 页面内状态采样
+#                               —— 只是给慢路径留的余量。三轮实测的定性演变（别再倒回去）：
+#                                  E2E-AVM-004：冷 profile 首铸**卡死**（120s 也不出），
+#                                    旧说法「≈46s 慢成功」是 45s 超时签名的误读，已证伪；
+#                                  E2E-AVM-005：加码到 600s 仍不出（确认不是"差一点"，是卡住）；
+#                                  E2E-AVM-006：**根因 = 环境缺 TZ**（矩阵见 minter 段注释），
+#                                    补上 TZ 后全新冷卷首铸 5.2s、热卷 2.0~3.0s。
+#                                  代码侧的 before-interactive-callback 快速失败 + 页面内状态采样
+#                                  仍然有用：它把"缺 TZ"这类环境错误从 121s 卡死降到 12s 并给出分类。
 # ⚠️ 另有一个**由本文件派生**的注入项（不是用户变量）：`MINTER_ALLOW_INSECURE_RAW`
 #    = `${AVM_MINTER_ALLOW_INSECURE:-}`，只喂给 minter-preflight —— 有了它，前置校验才能
 #    区分「用户显式设了 ALLOW_INSECURE」与「取 compose 默认值」，归因才如实（报告 AVM12-PF-07）。
@@ -367,6 +376,21 @@ services:
     # （host 网络下没有端口映射，`expose` 是死配置，已删——服务直接监听宿主 8899）
     environment:
       PORT: "8899"
+      # ★ TZ —— **铸造能否成功的前提，不是可选项**（E2E-AVM-006 单变量实验定案）：
+      #   同一台机器、同账号、同 sitekey、同 Chrome，一次只动一个变量：
+      #     0.0.14 无 TZ + 冷卷   ⇒ interactive ×5（每次 12s 快速失败，0 token）
+      #     0.0.14 无 TZ + 热卷   ⇒ interactive ×3（播种热 profile **不是**解药，AVM16-SEED-HOT）
+      #     0.0.14 有 TZ + 热卷   ⇒ minted=4，首铸 2.96s
+      #     0.0.14 有 TZ + 全新冷卷 ⇒ minted=4，首铸 5.20s
+      #   ⇒ TZ 是必要且充分变量；核心版本 / Chrome 版本 / profile 冷热都不是决定因素。
+      #   机制：容器默认 UTC，而 CF 会比对时区与会话的一致性 —— 不一致即升级为交互式挑战。
+      # ⚠️ 历史别误读（2026-09-14 那次 TZ 改动被还原，与本条**不矛盾**）：那次的四格实验是在
+      #   **macOS 的 Docker Desktop** 上做的，Mac 的 host 网络仍经 VPNkit NAT，四格全挂 ⇒
+      #   当时判"TZ 不是因子"是对的（Mac 上本来就是宿主机直跑 minter）。本条的结论来自
+      #   **node064（Linux 原生 Docker + host 网络）**的干净单变量实验，两者不在同一前提上。
+      # 留空 = 回落 Asia/Shanghai（`:-` 插值）：缺这个默认值会让时区静默变成 UTC，
+      # 而服务照常启动、/healthz 照常 ready —— 正是本项目最不想要的失败形态。
+      TZ: ${AVM_MINTER_TZ:-Asia/Shanghai}
       # 🔓 **默认开放**（2026-09-14 用户口径：默认参数就能跑，不新增必填项）：不配 key
       #    直接跑，故 MINTER_ALLOW_INSECURE 默认 1 —— 这是本文件**唯一**的 fail-open 处
       #    （服务启动时那句 fail-closed 守卫就被这一位放行）。
@@ -389,8 +413,10 @@ services:
       # 在新部署上从未成功过（现象 `POST /v1/turnstile/mint` 503 + TIMEOUT，而
       # `/healthz` 早在 10 秒时就报了 `ready=true` —— 看起来像"镜像坏了"）。
       # ⚠️ E2E-AVM-004 复盘：这**不是**「冷启动 ≈46s 慢成功」（旧说法已证伪 —— 120s 冷
-      # 预算同样两次精确压线失败，是卡死不是慢）；COLD 预算只是给慢路径留余量，真正治
-      # 卡死的是代码侧的 INTERACTIVE 快速失败 + 状态采样（进 /healthz 的 last_failure）。
+      # 预算同样两次精确压线失败，是卡死不是慢）；E2E-AVM-006 之后已定案：**根因是环境缺
+      # TZ**（见上面的 `TZ` 项），超时预算怎么加都治不了（600s 也测过）。COLD 预算与
+      # INTERACTIVE 快速失败（进 /healthz 的 last_failure）现在的价值是**归因**：
+      # 12s 就给出分类与页面状态，而不是让人对着 121s 猜。
       # 首轮走 COLD，铸出过 token 之后回落到常规值。
       MINT_TIMEOUT_MS: ${AVM_MINTER_RENDER_TIMEOUT_MS:-45000}
       COLD_MINT_TIMEOUT_MS: ${AVM_MINTER_COLD_RENDER_TIMEOUT_MS:-120000}

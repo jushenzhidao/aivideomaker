@@ -193,6 +193,14 @@ docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_P
 >
 > **只要适配层、不要铸造**时：`docker compose up -d ark-compat`（少一份常驻 Chrome）。
 >
+> 🔴 **minter 的 `TZ` 必须在场**（E2E-AVM-006 单变量实验定案）：容器默认 UTC 时 CF 判定
+> 「时区/会话不一致」⇒ 下发**交互式挑战** ⇒ **铸造恒失败**（现象：`interactive` 分类、
+> 约 12s 快速失败、`minted=0`；冷 profile 与热 profile 都一样，加超时预算也没用）。
+> compose 与镜像都已默认 `Asia/Shanghai`（compose 专属变量 `AVM_MINTER_TZ`），**别删那一行**。
+> 它属于"配了才可能对、不配也照样起"的项：服务照常 `ready`、`/healthz` 一片正常，
+> 失败只体现在"铸造不出 token"这一个远端行为上 —— 本轮为此白跑了三轮实验。
+> 部署前用 `python3 tools/compose_wiring_check.py --resolve` 会拦住它丢失或留空。
+>
 > **两侧必须成对相等**：minter 的 `MINTER_KEY` 与 ark-compat 的 `AVM_MINTER_KEY` 是同一个
 > 值（compose 里两者同源于 `AVM_MINTER_KEY`；**手工接线**时最容易只改一边 ⇒ 取 token 全 401）。
 >
@@ -215,16 +223,18 @@ docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_P
 > 顺手还会拦下 `ARK_HOST` 被绑回环（端口映射会失效）与 `AVM_MINTER_URL` 丢掉 `:-` 默认值
 > （铸造能力被**静默**关掉）这两类"配了不生效"。
 >
-> 🔧 **冷启动那一次铸造**：常规 45s 预算下，冷 profile 的首次铸造在新部署上从未成功过
-> （现象：`mint` 返回 503 + TIMEOUT，而 `/healthz` 早已报 ready）。⚠️ E2E-AVM-004 复盘
-> 已证伪旧的「冷启动 ≈46s 慢成功」解释 —— 120s 冷预算下两次仍精确压线失败，是**卡死**
-> 不是**慢**（疑似 CF 对低信誉 profile 下发交互式挑战）。现状：首轮走冷预算（120s）留
-> 余量；render 带**状态采样**（iframe/`getResponse`），挑战升级交互式时按宽限**快速失败**
-> （`before-interactive-callback`），失败分类与最后状态进 `/healthz` 的 `last_failure`；
-> 失败后保留浏览器只换页面，补货按连续失败指数退避。两条预算可调：
+> 🔧 **冷启动那一次铸造**：常规 45s 预算下，冷 profile 的首次铸造曾在新部署上从未成功过
+> （现象：`mint` 返回 503 + TIMEOUT，而 `/healthz` 早已报 ready）。三轮复盘的定性演变
+> （别再倒回去）：E2E-AVM-004 证伪了旧的「冷启动 ≈46s 慢成功」解释（120s 冷预算下仍
+> 精确压线失败 ⇒ 是**卡死**不是**慢**）；E2E-AVM-005 把预算一路加到 600s 仍不出
+> （⇒ 不是"差一点"）；**E2E-AVM-006 定案：根因是环境缺 `TZ`**（见上面那条 🔴）——
+> 补上后热卷首铸 2.96s、全新冷卷首铸 5.20s，各 4/4 成功。
+> 超时预算与 INTERACTIVE 快速失败现在的价值是**归因**：12s 就给出失败分类与页面内状态
+> （`/healthz` 的 `last_failure`），而不是让人对着 121s 猜。两条预算可调：
 > `AVM_MINTER_RENDER_TIMEOUT_MS`（默认 45000）与 `AVM_MINTER_COLD_RENDER_TIMEOUT_MS`
 > （默认 120000）。`warmed`（**真的铸出过** token）与 `ready`（Chrome 就绪）分开报 ——
-> 只看 `ready` 会误判。**根治要靠热 profile**：新部署建议播种 /data 卷或保持实例常驻。
+> 只看 `ready` 会误判。⚠️ 旧结论"**根治要靠热 profile**（播种 /data 卷）"已被实验否掉
+> （AVM16-SEED-HOT：整卷播种后 3 连败全 interactive）—— 要的是 `TZ` 在场，不是热卷。
 
 **多 worker 是这里唯一的坑。** 上游闸门是进程内 `threading.Semaphore`，「全局只跑 2 个」依赖
 单进程：开 N 个 worker 会让实际并发变成 N×2，第 3 个起上游直接返回 `The queue is full`

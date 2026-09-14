@@ -23,9 +23,12 @@ API（默认 127.0.0.1:8899）：
 
 环境变量：PORT / BIND_HOST / MINTER_KEY / MINTER_ALLOW_INSECURE /
           POOL_TARGET / TOKEN_TTL_S / SITEKEY / LIGHT_URL / HEADLESS /
-          CDP_PORT / CHROME_PROFILE / MINT_TIMEOUT_MS / COLD_MINT_TIMEOUT_MS
-          （后两条是 render 预算，见 tools/turnstile_minter.py 的「render 超时预算」段：
-            首轮用 `COLD_*`，之后回落常规值）
+          CDP_PORT / CHROME_PROFILE / MINT_TIMEOUT_MS / COLD_MINT_TIMEOUT_MS / TZ
+          （`MINT_TIMEOUT_MS` / `COLD_MINT_TIMEOUT_MS` 是 render 预算，见
+            tools/turnstile_minter.py 的「render 超时预算」段：首轮用 `COLD_*`，之后回落常规值）
+          ⚠️ `TZ` **不是**可选的美化项：容器默认 UTC 时 CF 会判定「时区/会话不一致」并下发
+            交互式挑战 ⇒ 铸造恒失败（E2E-AVM-006 的单变量矩阵定案）。本服务只**如实报出**
+            它（见 /healthz 的 `tz` 字段），不做隐式兜底 —— 兜底会把"部署漏配"藏起来。
 """
 import json
 import os
@@ -49,6 +52,39 @@ BIND_HOST = os.environ.get("BIND_HOST", "127.0.0.1")
 KEY = os.environ.get("MINTER_KEY", "")
 POOL_TARGET = int(os.environ.get("POOL_TARGET", "4"))
 TTL_S = float(os.environ.get("TOKEN_TTL_S", "120"))   # 保守：CF 侧约 300s，站点校验按更短算
+
+# ★ 时区（E2E-AVM-006 定案）：**缺 TZ ⇒ CF 判定「时区/会话不一致」⇒ 交互式挑战 ⇒ 铸造恒失败**。
+#   本轮之前，这个变量在部署里根本不存在，而失败现象（503 + TIMEOUT/interactive）看起来
+#   完全像"镜像坏了"或"profile 太新" —— 白跑了 E2E-AVM-004 / 005 两轮实验（各自 1.5 小时以上）。
+#   所以本服务把它做成**一眼可见**：`/healthz` 的 `tz` 字段直接给出 env 原文与 libc 偏移。
+#   刻意**不做**隐式兜底（例如代码里 `os.environ.setdefault("TZ", TZ_DEFAULT)`）：
+#   兜底能让服务"恰好跑对"，但下一次排查时你会以为 TZ 本来就配着 —— 与上面那两轮白跑同源。
+TZ_ENV = os.environ.get("TZ", "").strip()
+TZ_DEFAULT = "Asia/Shanghai"   # 与 docker-compose.yml 的 AVM_MINTER_TZ、镜像 ENV 同一个默认值
+
+
+def tz_state() -> dict:
+    """生效时区的**可验证**三元组：env 原文 / libc 偏移 / 该名字在镜像里存不存在。
+
+    三者必须分开报，因为它们会**互相独立地**出错，且现象都是"铸造失败"：
+      * `env` 为空         ⇒ 部署漏配（compose 插值被改坏、或手工 `docker run` 没带 -e TZ）；
+      * `offset` 是 +0000  ⇒ 名字递到了 libc，但镜像里没有对应 zoneinfo ⇒ 静默按 UTC；
+      * `zoneinfo_present` ⇒ 上面那条的**归因**（是缺 tzdata 包，还是时区名写错了）。
+
+    注：`offset` 是**本进程 libc** 的解析结果，与 Chrome 用的 ICU 时区库是两套数据 ——
+    实测缺 tzdata 时浏览器侧照样能拿到正确时区（E2E-AVM-006 的决定性实验就是在没有
+    tzdata 的镜像上跑通的）。故判"铸造能不能成"以 `env` 在场为准；`offset` 用来识别
+    "设了但只对浏览器生效"这种半吊子状态。
+    """
+    name = TZ_ENV or TZ_DEFAULT
+    return {
+        "env": TZ_ENV or None,
+        "assumed_default": TZ_DEFAULT if not TZ_ENV else None,
+        "name": name,
+        "offset": time.strftime("%z") or None,
+        "zoneinfo_present": os.path.exists("/usr/share/zoneinfo/" + name),
+    }
+
 
 # 只有这些绑定算"本机自用"，无 key 时放行
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -281,6 +317,9 @@ def health() -> dict:
             #    预算与最近一次失败的分类，排障时不必去翻环境变量和容器日志。
             "warmed": CORE.warmed,
             "render_timeout_ms": {"cold": M.COLD_MINT_TIMEOUT_MS, "normal": M.MINT_TIMEOUT_MS},
+            # ★ 时区：E2E-AVM-006 定案的**铸造前提**，与上面两条预算同属"排障时不该再去
+            #   翻环境变量与容器日志"的东西。`env` 为空即部署漏配（见模块顶部 TZ_ENV 注释）。
+            "tz": tz_state(),
             "pool": {"size": pool, "target": POOL_TARGET, "ttl_s": TTL_S},
             "stats": st,
             "last_error": _STATE["last_error"],
@@ -342,11 +381,24 @@ def main():
               "请自行确保该端口不可从公网到达", flush=True)
     elif not KEY:
         print("[warn] MINTER_KEY 未设置 —— 仅回环绑定，切勿暴露公网", flush=True)
+    # ★ 时区自检（E2E-AVM-006）：缺 TZ 的表现是"服务照常 ready、但铸造永远 interactive"，
+    #   是最难从现象反推配置的一种。这里把它挪到**启动日志**里，一眼可见。
+    tz = tz_state()
+    if not tz["env"]:
+        print(f"[warn] TZ 未设置 —— 容器默认 UTC 会让 CF 判定「时区/会话不一致」并下发"
+              f"**交互式挑战** ⇒ 铸造恒失败（现象：interactive、0 token；E2E-AVM-006 定案）。"
+              f"compose 默认给 {TZ_DEFAULT}（AVM_MINTER_TZ）；手工起容器请显式 -e TZ={TZ_DEFAULT}。",
+              flush=True)
+    elif not tz["zoneinfo_present"]:
+        print(f"[warn] TZ={tz['env']} 但镜像内没有 /usr/share/zoneinfo/{tz['name']} —— libc 会"
+              "按 UTC 解释它（浏览器走自带 ICU 库、不受影响，故铸造仍可能成功）。"
+              "装上 tzdata 可消除这层「只对浏览器生效」的半吊子状态。", flush=True)
     threading.Thread(target=refill_loop, daemon=True).start()
     _WAKE.set()
     srv = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
     print(f"Turnstile 铸造服务已启动 http://{BIND_HOST}:{PORT}"
-          f"（池子目标 {POOL_TARGET}，TTL {TTL_S}s，鉴权={'开' if KEY else '关（仅回环）'}）",
+          f"（池子目标 {POOL_TARGET}，TTL {TTL_S}s，鉴权={'开' if KEY else '关（仅回环）'}，"
+          f"TZ={tz['name']}{'（默认值）' if tz['assumed_default'] else ''}）",
           flush=True)
     srv.serve_forever()
 

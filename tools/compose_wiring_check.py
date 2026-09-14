@@ -30,6 +30,10 @@ preflight 照样报 `[ok]`。容器里既没有 docker CLI，也看不见别的�
 退出码：`0` 通过 ｜ `2` 未通过（含无法解析）。
 ⚠️ 它**不**替代容器内的 `minter-preflight` —— 那条守的是"镜像里的守卫本身能不能跑起来"，
 两条都要留。
+
+本轮（E2E-AVM-006）新增的第三类检查：**minter 的 `TZ` 必须在场**。它和 `AVM_MINTER_URL`
+同属"配了才可能对、不配也照样起"的项 —— 缺它时容器按 UTC 跑，CF 判定「时区/会话不一致」
+⇒ 下发交互式挑战 ⇒ **铸造恒失败**，而服务照常 ready、`/healthz` 一片正常。
 """
 
 from __future__ import annotations
@@ -119,20 +123,25 @@ def interp_default(expr: str) -> tuple[str, str | None] | None:
 _FULL_DEFAULT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]*)\}")
 
 
-def capability_problem(expr: str, what: str) -> str | None:
-    """检查一个"留空即静默关掉能力"的地址变量写法。返回问题描述或 `None`。"""
+def capability_problem(expr: str, what: str, effect: str = "") -> str | None:
+    """检查一个"留空即静默失效"的变量的写法。返回问题描述或 `None`。
+
+    `effect` 是"真的留空之后会发生什么"的落地描述 —— 判据共用，后果各不相同
+    （地址变空 ⇒ 不去取 token；时区变空 ⇒ 铸造恒失败），把后果参数化是为了让报错
+    直接指向症状，而不是让运维自己翻译一遍。
+    """
+    consequence = effect or ("能力被静默关掉（容器都在跑、key 也配了，适配层却根本不去取 token）")
     e = expr.strip()
     if not e:
-        return f"{what} 为空 ⇒ 能力被静默关掉。"
+        return f"{what} 为空 ⇒ {consequence}"
     if "${" not in e:
-        return None                       # 写死的字面量地址：没有"留空即关掉"的风险
+        return None                       # 写死的字面量：没有"留空即失效"的风险
     m = _FULL_DEFAULT.fullmatch(e)
     if not m:
         return (f"{what}={e} 不是 `${{VAR:-默认值}}` 形态。写成 `${{VAR}}` / `${{VAR-默认值}}` 时，"
-                "用户把 .env 里那一项**留空**会让地址变空 ⇒ 能力被静默关掉"
-                "（容器都在跑、key 也配了，适配层却根本不去取 token）。")
+                "用户把那一项**留空**会让它变空 ⇒ " + consequence)
     if not m.group(2).strip():
-        return f"{what}={e} 的默认值是**空的** ⇒ .env 里留空会把能力静默关掉。"
+        return f"{what}={e} 的默认值是**空的** ⇒ 那一项留空就会失效（{consequence}）"
     return None
 
 
@@ -196,6 +205,27 @@ def check_static(services: dict) -> list[str]:
             f"[提示] {PREFLIGHT} 缺少 MINTER_ALLOW_INSECURE_RAW 插值 ⇒ 它无法区分"
             "「显式设了 ALLOW_INSECURE」与「取 compose 默认值」，归因会不实（报告 AVM12-PF-07）。"
         )
+
+    # ⑤ 时区（E2E-AVM-006 单变量实验定案）：缺 `TZ` ⇒ 容器按 UTC 跑 ⇒ CF 判定「时区/会话
+    #    不一致」⇒ 下发**交互式挑战** ⇒ 铸造恒失败。它和 AVM_MINTER_URL 属于同一类：
+    #    "配了才可能对、不配也照样起"（不需要代码、不影响启动、/healthz 也照常 ready），
+    #    只能靠部署前校验拦 —— 本轮为此白跑了三轮实验（合 5 小时以上）。
+    #    判据复用同一份写法判定；⚠️ 这里**允许**写死字面量（手工接线时合理），
+    #    仓库侧的 tests/test_minter_timezone.py 更严（要求从 AVM_MINTER_TZ 插值，
+    #    因为文件头的清单声称有这个旋钮）—— 两者严格度不同是有意的，别对齐成一样。
+    tz_expr = minter.get("TZ", "")
+    if not tz_expr:
+        problems.append(
+            f"[接线] {MINTER} 没有 TZ ⇒ 容器按 UTC 跑，CF 会下发交互式挑战、**铸造恒失败**"
+            "（E2E-AVM-006）。写成 `TZ: ${AVM_MINTER_TZ:-Asia/Shanghai}`。"
+        )
+    else:
+        p = capability_problem(
+            tz_expr, f"{MINTER}.TZ",
+            "时区静默退化成 UTC ⇒ CF 下发交互式挑战、铸造恒失败（E2E-AVM-006）",
+        )
+        if p:
+            problems.append("[接线] " + p)
     return problems
 
 
@@ -250,6 +280,13 @@ def check_resolved(services: dict) -> list[str]:
 
     if app.get("ARK_HOST") != "0.0.0.0":
         problems.append(f"[接线] {APP}.ARK_HOST={app.get('ARK_HOST')!r} ⇒ 端口映射失效。")
+
+    # 时区：解析后的**真实值**必须非空（部署机上那份 override 手工改动的概率最高）
+    if not minter.get("TZ", "").strip():
+        problems.append(
+            f"[接线] {MINTER}.TZ 解析后为空 ⇒ 容器按 UTC 跑，铸造会恒 interactive"
+            "（E2E-AVM-006 单变量实验定案）。"
+        )
 
     # 真实守卫判据（复用镜像里那份代码，不重写一遍 —— 重写必然分叉）
     sys.path.insert(0, str(ROOT / "tools"))

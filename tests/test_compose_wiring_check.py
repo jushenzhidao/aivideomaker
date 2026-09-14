@@ -115,6 +115,43 @@ class TestComposeWiringCheck(unittest.TestCase):
         mut = _mutate(self.compose, "ark-compat", "      ARK_HOST: 0.0.0.0", "      ARK_HOST: 127.0.0.1")
         self.assertTrue(any("ARK_HOST" in p for p in self._problems(mut)))
 
+    # ---- 时区（E2E-AVM-006）：缺它 ⇒ 铸造恒 interactive，而服务照常 ready --------------
+    def test_catches_missing_tz_on_the_minter_service(self):
+        """缺 TZ 的部署"看起来完全正常"（不需要代码、不影响启动、healthz 也 ready），
+        只有铸造永远失败 —— 部署前必须拦下。"""
+        mut = _mutate(
+            self.compose, "minter",
+            "      TZ: ${AVM_MINTER_TZ:-Asia/Shanghai}\n",
+            "",
+        )
+        problems = self._problems(mut)
+        self.assertTrue(any("TZ" in p for p in problems), problems)
+
+    def test_catches_tz_without_the_colon_form(self):
+        """`:-` 改回 `-`（或去掉默认值）：.env 里留空 ⇒ 时区静默退化成 UTC。"""
+        for bad in ("${AVM_MINTER_TZ-Asia/Shanghai}", "${AVM_MINTER_TZ}", "${AVM_MINTER_TZ:-}"):
+            with self.subTest(expr=bad):
+                mut = _mutate(
+                    self.compose, "minter",
+                    "      TZ: ${AVM_MINTER_TZ:-Asia/Shanghai}",
+                    f"      TZ: {bad}",
+                )
+                self.assertTrue(any("TZ" in p for p in self._problems(mut)), bad)
+
+    def test_accepts_a_literal_timezone(self):
+        """手工接线时写死 `Asia/Shanghai` 是**允许**的（这台工具只看"留空会不会失效"）。
+
+        ⚠️ 与仓库侧的 tests/test_minter_timezone.py 严格度不同是有意的：那条还要求
+        从 AVM_MINTER_TZ 插值（因为 compose 文件头的清单声称有这个旋钮），
+        这条只守"部署机上的 override 别把时区搞丢"。
+        """
+        mut = _mutate(
+            self.compose, "minter",
+            "      TZ: ${AVM_MINTER_TZ:-Asia/Shanghai}",
+            "      TZ: Asia/Shanghai",
+        )
+        self.assertEqual(self._problems(mut), [])
+
     def test_catches_the_missing_raw_flag_that_made_attribution_lie(self):
         """★ P-07 的契约：少了 RAW，preflight 就分不清"显式设置"与"取默认值"。"""
         mut = _mutate(
