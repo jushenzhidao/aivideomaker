@@ -661,6 +661,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except BaseException as e:
                 # 失败路径最需要证据：上游到底回了什么，只有这次采集里有
                 sp.set_attribute("error", describe_error(e))
+                # ★ 429 归因必须是**结构化属性**（E2E-AVM-008）：node064 那 3 条 429 的
+                #   根因（宿主防火墙丢包）当初只能靠去 minter 上手查 served 才排除——
+                #   归因文本躺在 error 散文里，Logfire 里没法过滤聚合。
+                #   "captcha_gate" 标记闸门路径；minter 取 token 失败时把归因带上，
+                #   `minter_unreachable=True` = 网络层不通（查防火墙路径），False/缺 = 铸造失败。
+                if getattr(e, "code", None) == "CAPTCHA_REQUIRED":
+                    sp.set_attribute("captcha_gate", True)
+                    mle = getattr(e, "minter_last_error", None)
+                    if mle:
+                        sp.set_attribute("minter_last_error", str(mle)[:200])
+                        sp.set_attribute("minter_unreachable", "unreachable" in str(mle))
                 set_upstream_calls(sp, calls)
                 raise
             sp.set_attribute("upstream_task_id", task_id or "")

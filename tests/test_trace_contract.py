@@ -286,6 +286,41 @@ class TestSpanContract(unittest.TestCase):
         rejected = [c for c in calls if c["call"] == "ai.minimaxH3"][0]
         self.assertEqual(rejected["response"]["body"][0]["result"]["data"]["json"], "")
 
+    def test_captcha_gate_span_carries_structured_minter_attribution(self):
+        """★ E2E-AVM-008：闸门路径的 429 必须带**结构化**归因属性。
+
+        node064 那 3 条 429（宿主防火墙丢了桥接容器 → 宿主端口的包）当初只能去 minter
+        上手查 served 才定位；归因若只躺在 error 散文里，Logfire 里没法按属性过滤，
+        "N 条 429 全是网络层不通"这种聚合结论就出不来。契约：
+        `captcha_gate`（闸门路径）+ `minter_unreachable`（网络层 vs 铸造失败）
+        + `minter_last_error`（归因原文）。
+        """
+        from ark_compat.minter import TokenMinter
+
+        def boom(_request):
+            raise httpx.ConnectError("connection refused")
+
+        dead = TokenMinter("http://host.docker.internal:8899", timeout=2)
+        dead._http = httpx.Client(transport=httpx.MockTransport(boom))
+        self.site.set("model.needsCaptcha", True)
+        app = create_app(web_settings(gate_key=GATE))
+        client = make_client(self.site, minter=dead)
+        app.state.upstreams = {
+            "web": WebUpstream(client, WebSubmitQueue(client, max_concurrent=2, poll_interval=0.01))
+        }
+        gated = TestClient(app)
+        r = gated.post(TASKS_PATH, json=ark_body(), headers={"Authorization": f"Bearer {GATE}"})
+        self.assertEqual(r.status_code, 429, r.text)
+        attrs = self.attrs("ark.create.submit")
+        self.assertTrue(attrs["captcha_gate"], "闸门路径必须有 captcha_gate 标记")
+        self.assertTrue(attrs["minter_unreachable"], "网络层不通必须能被属性直接看出来")
+        self.assertIn("unreachable", attrs["minter_last_error"])
+        self.assertIn("8899", attrs["minter_last_error"])
+        self.assertIn("CaptchaRequiredError[CAPTCHA_REQUIRED]", attrs["error"])
+        self.assertNotIn("upstream_task_id", attrs, "没提交成功不该有 taskId")
+        # 核心安全属性顺手复验：取不到 token ⇒ 一次提交都不能发出
+        self.assertEqual(self.site.calls("ai.minimaxH3"), [])
+
     def test_dry_run_records_the_request_without_touching_the_site(self):
         body = ark_body(extra_body={"aivideomaker_dry_run": True})
         self.post_task(body)

@@ -358,11 +358,14 @@ class WebClient:
             token = self._mint_token_from_service()
             if not token:
                 tried = bool(self.minter is not None and getattr(self.minter, "configured", False))
+                last = getattr(self.minter, "last_error", None) if tried else None
                 raise CaptchaRequiredError(
                     "account currently requires a Turnstile captcha (model.needsCaptcha=true). "
                     "This is a dynamic, velocity-based gate, not an account property. "
                     + (self._minter_failure_hint() if tried else "")
-                    + "Supply a fresh Turnstile token, wait for it to decay, or spread the submissions out."
+                    + "Supply a fresh Turnstile token, wait for it to decay, or spread the submissions out.",
+                    # 归因原文随异常上行 ⇒ app 层提升为结构化 span 属性（E2E-AVM-008）
+                    minter_last_error=str(last) if last else None,
                 )
 
         body = {
