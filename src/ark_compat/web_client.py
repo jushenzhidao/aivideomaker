@@ -298,9 +298,12 @@ class WebClient:
 
     # ------------------------------------------------------------- create ----
 
+    def _minter_configured(self) -> bool:
+        return bool(self.minter is not None and getattr(self.minter, "configured", False))
+
     def _mint_token_from_service(self) -> str | None:
         """向铸造服务取一个 token；未配置或失败都返回 None（调用方降级）。"""
-        if self.minter is None or not getattr(self.minter, "configured", False):
+        if not self._minter_configured():
             return None
         tok = self.minter.mint()
         if tok:
@@ -345,6 +348,18 @@ class WebClient:
             "token": token,
         }
         task_id = self.trpc(CREATE_PROCEDURE, body, method="POST")
+        if not task_id and self._minter_configured():
+            # 站点用**空串**表示拒绝（不报错）。两种常见成因：
+            #   ① 手上这个 token 已过期/已被用过（池子里的 token 会自然老死）；
+            #   ② 探测时闸门是关的、提交前刚好被顶开（竞态）。
+            # 两者都能被"**换一个新 token 重试一次**"救回来。空串意味着上游没建任务，
+            # 所以重试不会重复建（已用 token 的情况也一样 —— 它根本没被接受）。
+            fresh = self._mint_token_from_service()
+            if fresh:
+                body["token"] = fresh
+                task_id = self.trpc(CREATE_PROCEDURE, body, method="POST")
+                if task_id:
+                    logger.info("用新铸的 token 重试成功（上一个 token 已过期/已用，或闸门刚被顶开）")
         if not task_id:
             # 站点用空串表示"拒绝"，不报错 —— 必须当成显式失败
             raise WebApiError(

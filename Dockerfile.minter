@@ -1,0 +1,53 @@
+# Turnstile 铸造服务镜像（tools/turnstile_service.py）
+#
+# 为什么**单独一个镜像**：它要装 Google Chrome + Xvfb（约 500MB），而适配层镜像
+# 是 python:3.12-slim 的瘦身版 —— 混在一起会让每次改业务代码都重下 Chrome。
+#
+# 为什么必须 **Xvfb（有头）而不是 --headless**：实测同一台机器、同一 Chrome 版本、
+# 同出口 IP，`--headless=new` **0/4 全部 46 秒超时**，`xvfb-run` 有头 **8/8、3.7 秒/个**。
+# 详见 tools/turnstile_minter.py 顶部的实测表。
+#
+# 安全：该服务能产出"绕过风控的凭证"。**不要映射端口到宿主**，只让同 compose 网络里的
+# ark-compat 用；并且设置 MINTER_KEY（否则它只监听回环、启动时会告警）。
+
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PORT=8899 \
+    CDP_PORT=9222 \
+    CHROME_PROFILE=/data/chrome \
+    POOL_TARGET=4 \
+    TOKEN_TTL_S=120
+
+# Chrome 运行所需的运行库 + Xvfb（生产环境用 xvfb-run 提供虚拟显示）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl xvfb fonts-liberation \
+        libnss3 libxss1 libatk-bridge2.0-0 libatk1.0-0 libgtk-3-0 libgbm1 libasound2 \
+        libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 \
+        libpango-1.0-0 libcairo2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 官方 Chrome 稳定版（deb 安装会自动带上它的依赖）
+RUN curl -fsSL -o /tmp/chrome.deb \
+        https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y /tmp/chrome.deb \
+    && rm -f /tmp/chrome.deb
+
+# CDP 客户端（服务用原生 CDP，不依赖 Playwright：少一层、也少一个浏览器下载）
+RUN pip install --no-cache-dir websocket-client
+
+WORKDIR /app
+COPY tools/turnstile_minter.py tools/turnstile_service.py /app/tools/
+
+# Chrome 的 profile 落在卷里：① 重启后不用重新冷启动（首次 render 有 ~46 秒）
+# ② 画像有点"年龄"总比每次全新好
+VOLUME ["/data"]
+EXPOSE 8899
+
+# start-period 给足：首次冷启动 + 池子补满约 1 分钟
+HEALTHCHECK --interval=30s --timeout=5s --start-period=150s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:8899/healthz" >/dev/null || exit 1
+
+CMD ["python3", "/app/tools/turnstile_service.py"]

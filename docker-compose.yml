@@ -6,6 +6,12 @@
 #   docker compose logs -f
 #   curl -s localhost:8808/healthz | python3 -m json.tool
 #
+# 本文件起**两个**服务：
+#   ark-compat  —— 协议适配层（对外 8808）
+#   minter      —— Turnstile token 铸造服务（Xvfb 有头 Chrome，**不对外映射端口**）
+# 前者在闸门开启且调用方没带 token 时会自动向后者的 /v1/turnstile/mint 取一个
+# （`AVM_MINTER_URL` 默认已指向 http://minter:8899；设成空字符串可关掉这条能力）。
+#
 # 变量从同目录 .env 读取（compose 自动做插值）。这里**逐个显式列出**而不是用
 # env_file：env_file 会把 .env 里所有变量（含无关项）一股脑灌进容器，而显式列举
 # 写错名字会立刻暴露成空值，符合本项目"宁可报错不要静默"的口径。
@@ -35,7 +41,8 @@ services:
       ARK_PORT: "8808"
 
       # ---- 上游：只有 web 线（网页端内部接口）----
-      # 免费窗口只在这里：tier=turbo 且 duration ≤8s（translate.FREE_MAX_DURATION=8）。
+      # 免费窗口只在这里：tier=turbo 且 duration ≤10s（translate.FREE_MAX_DURATION=10，
+      # 2026-09-14 按站点终态记录 `480p/10s/turbo ⇒ paid=False` 更正，原写 8s）。
       AVM_COOKIE: ${AVM_COOKIE:-}
       AVM_BASE_URL: ${AVM_BASE_URL:-https://aivideomaker.ai}
       AVM_VISITOR_ID: ${AVM_VISITOR_ID:-}
@@ -49,6 +56,12 @@ services:
       # 网关密钥。**留空 = 不校验**（仅限本机自用）。对外暴露请务必设置，
       # 因为该服务能直接触发计费的上游调用。
       AVM_GATE_KEY: ${AVM_GATE_KEY:-}
+
+      # ---- Turnstile 铸造服务（同 compose 网络的 minter）----
+      # 闸门开启且调用方没带 token 时自动取一个；取不到会如实报错（绝不静默提交）。
+      # 设成空串 = 关闭这条能力（退回"等闸门衰减"，约 20 条/小时）。
+      AVM_MINTER_URL: ${AVM_MINTER_URL-http://minter:8899}
+      AVM_MINTER_KEY: ${AVM_MINTER_KEY:-}
       AVM_LOG_LEVEL: ${AVM_LOG_LEVEL:-INFO}
 
       # ---- 上游闸门与 worker（见 src/gunicorn_conf.py 顶部两条硬约束）----
@@ -114,5 +127,30 @@ services:
     deploy:
       replicas: 1
 
+  # ---------------------------------------------------------------- minter --
+  # Turnstile token 铸造服务：常驻 Xvfb 有头 Chrome + 令牌池。
+  # **不映射端口**：它能产出"绕过风控的凭证"，只给同网络内的 ark-compat 用。
+  minter:
+    image: ghcr.io/yuanjie-ai/aivideomaker-minter:${AVM_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.minter
+    container_name: avm-minter
+    restart: unless-stopped
+    expose:
+      - "8899"
+    environment:
+      PORT: "8899"
+      MINTER_KEY: ${AVM_MINTER_KEY:-}
+      # 池子水位与 token 存活上限（秒）。池子越大越能扛突发，但 token 会过期，
+      # 别超过"一分钟内会用掉的条数 × 2"。
+      POOL_TARGET: ${AVM_MINTER_POOL:-4}
+      TOKEN_TTL_S: ${AVM_MINTER_TTL:-120}
+    volumes:
+      - minter-chrome:/data
+    # Chrome 吃 /dev/shm；给大一点比依赖 --disable-dev-shm-usage 更稳
+    shm_size: "512m"
 volumes:
   ark-tasks:
+
+  minter-chrome:

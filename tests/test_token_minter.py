@@ -20,7 +20,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from ark_compat.errors import CaptchaRequiredError  # noqa: E402
+from ark_compat.errors import CaptchaRequiredError, WebApiError  # noqa: E402
 from ark_compat.minter import TokenMinter  # noqa: E402
 from ark_compat.settings import Settings  # noqa: E402
 from ark_compat.web_client import WebClient  # noqa: E402
@@ -32,8 +32,9 @@ USER = "u1"
 class FakeSite(httpx.BaseTransport):
     """站点替身：记录每次调用（method/path/body），按闸门状态回 needsCaptcha。"""
 
-    def __init__(self, gate: bool = True):
+    def __init__(self, gate: bool = True, empty_creates: int = 0):
         self.gate = gate
+        self.empty_creates = empty_creates   # 前 K 次 create 返回空串（模拟拒绝）
         self.calls: list[tuple[str, str, str]] = []
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
@@ -43,6 +44,8 @@ class FakeSite(httpx.BaseTransport):
         if path.endswith("model.needsCaptcha"):
             return httpx.Response(200, json=[{"result": {"data": {"json": self.gate}}}])
         if path.endswith("ai.minimaxH3"):
+            if len(self.creates()) <= self.empty_creates:
+                return httpx.Response(200, json=[{"result": {"data": {"json": ""}}}])
             return httpx.Response(200, json=[{"result": {"data": {"json": "t-1"}}}])
         return httpx.Response(200, json=[{"result": {"data": {"json": None}}}])
 
@@ -53,13 +56,17 @@ class FakeSite(httpx.BaseTransport):
 class FakeMinter:
     """铸造服务替身。"""
 
-    def __init__(self, token: str | None = "TOKEN-X", configured: bool = True):
+    def __init__(self, token: str | None = "TOKEN-X", configured: bool = True, tokens=None):
         self.token = token
+        self.tokens = list(tokens) if tokens else None   # 依次返回（模拟"每次都是新 token"）
         self.configured = configured
         self.calls = 0
 
     def mint(self) -> str | None:
         self.calls += 1
+        if self.tokens:
+            idx = min(self.calls - 1, len(self.tokens) - 1)
+            return self.tokens[idx]
         return self.token
 
 
@@ -131,6 +138,43 @@ class TestDegradation(unittest.TestCase):
         with self.assertRaises(CaptchaRequiredError) as ctx:
             c.create(body_params())
         self.assertIn("minter", str(ctx.exception).lower(), "错误里要能看出是铸造服务这条线的问题")
+
+
+
+class TestStaleTokenRetry(unittest.TestCase):
+    """token 过期/用过的形态是**上游静默返回空串** —— 应当换一个新 token 重试一次。
+
+    这是"池子里的 token 会自然老死"带来的必然问题：TTL 内没用掉的 token 发出去就是废的，
+    而废 token 的表现不是报错、是空串。
+    """
+
+    def test_stale_token_is_retried_with_a_fresh_one(self):
+        site = FakeSite(gate=True, empty_creates=1)     # 第 1 次 create 被拒
+        m = FakeMinter(tokens=["STALE-TOKEN", "FRESH-TOKEN"])
+        c = make_client(site, m)
+        self.assertEqual(c.create(body_params()), "t-1")
+        creates = site.creates()
+        self.assertEqual(len(creates), 2, "应当恰好重试一次")
+        self.assertIn("STALE-TOKEN", creates[0])
+        self.assertIn("FRESH-TOKEN", creates[1], "重试必须换**新铸的** token，不能拿旧的再发")
+        self.assertNotIn("STALE-TOKEN", creates[1])
+        self.assertEqual(m.calls, 2, "一次用于首次提交、一次用于重试")
+
+    def test_retry_is_only_once(self):
+        site = FakeSite(gate=True, empty_creates=99)    # 永远被拒
+        m = FakeMinter(tokens=["A", "B", "C", "D"])
+        c = make_client(site, m)
+        with self.assertRaises(WebApiError):
+            c.create(body_params())
+        self.assertEqual(len(site.creates()), 2, "只能重试一次，不能无限循环")
+        self.assertEqual(m.calls, 2)
+
+    def test_empty_response_without_minter_is_not_retried(self):
+        site = FakeSite(gate=False, empty_creates=99)   # 闸门关着，但没有铸造服务
+        c = make_client(site, None)
+        with self.assertRaises(WebApiError):
+            c.create(body_params())
+        self.assertEqual(len(site.creates()), 1, "没有铸造服务时不重试（重试也是白费）")
 
 
 class TestTokenMinterClient(unittest.TestCase):
