@@ -144,6 +144,10 @@ services:
     # ★ 必须用 **host 网络**：默认 bridge + NAT 会改写 TCP MSS/网络指纹 ⇒ CF 判定为机器人：
     #   `turnstile.render()` 一律 46 秒超时（同机同 Chrome：宿主 3.7s ✅ / bridge 容器 46s ❌；实测）。
     #   用 host 后容器内实测 2.3~3.5s/个，与宿主同量级。
+    # ⚠️ 该修复**只在 Linux 原生 Docker 上成立**：macOS 的 Docker Desktop 里 host 网络
+    #   实际是「VM 内 host」，流量仍经 VPNkit NAT 出去 —— 实测（arm64 原生 chromium +
+    #   --network host）0/2、46s 超时，与 bridge 同症状 ⇒ **Mac 上 minter 请宿主直跑**
+    #   （macOS 有头直跑已验证 2.4~3.5s/个），AVM_MINTER_URL 指宿主地址并停用本服务。
     network_mode: host
     expose:
       - "8899"

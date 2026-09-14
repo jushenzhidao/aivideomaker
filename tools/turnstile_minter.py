@@ -106,14 +106,36 @@ def clear_profile_locks() -> list:
     return cleared
 
 
+def kill_all_chrome(force: bool = True) -> None:
+    """杀掉本机上所有残留 Chrome 实例（**包括没有 debug 端口参数的旧实例**）。
+
+    ⚠️ 为什么必须做：2026-09-14 容器里实测踩到 —— 旧版代码的 Chrome（`--user-data-dir=/root/avm-chrome`，
+    8 小时前启动）没被 `pkill -f "remote-debugging-port=9222"` 杀掉（模式里带 `-f` 前缀时
+    pkill 会匹配不到自己的命令行、实际杀不干净），于是**两个实例同时在监听 9222**（一个 IPv4、
+    一个 IPv6）：`cdp_ok()` 连到旧实例 ⇒ 新页面永远开在旧进程里，渲染越拖越慢直到 45s TIMEOUT，
+    且每次失败后 `start_chrome` 又只杀掉新实例 ⇒ **新旧永远叠着跑**。
+    这里先按进程名通杀（`pkill -x chrome`/`google-chrome`/`chromium` 不含模式自身，一定匹配），
+    再补一枪 `remote-debugging-port=`（防换名/换路径的变体）。
+    """
+    names = ["chrome", "google-chrome", "chromium", "chromium-browser"]
+    for n in names:
+        subprocess.run(["pkill", "-9", "-x", n], capture_output=True)
+    subprocess.run(["pkill", "-9", "-f", f"remote-debugging-port={PORT}"], capture_output=True)
+    # 端口真正释放才算清干净（老的 /json/version 探活会连到将死的实例，必须轮询到空）
+    for _ in range(30):
+        if not cdp_ok():
+            return
+        time.sleep(0.2)
+    raise SystemExit("Chrome 清理不干净（9222 一直被占）")
+
+
 def start_chrome():
     if cdp_ok() and KEEP:
         return
-    subprocess.run(["pkill", "-f", f"remote-debugging-port={PORT}"], capture_output=True)
+    kill_all_chrome()
     locks = clear_profile_locks()
     if locks:
         print(f"[info] 已清掉陈旧的 profile 锁：{', '.join(locks)}", flush=True)
-    time.sleep(2)
     args = [chrome_bin(), f"--remote-debugging-port={PORT}",
             "--remote-debugging-address=127.0.0.1", f"--user-data-dir={PROFILE_DIR}",
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled",

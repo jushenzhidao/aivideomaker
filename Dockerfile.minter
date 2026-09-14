@@ -51,7 +51,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # （bookworm-security 的 152.x 与 Chrome 153 同代，不算旧）。二进制路径由
 # turnstile_minter.chrome_bin() 自动发现（google-chrome → chromium）。
 ARG TARGETARCH
-RUN apt-get update \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && printf 'Acquire::Retries "6";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+        > /etc/apt/apt.conf.d/80avm-retries \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl xvfb xauth dbus dbus-x11 \
         fonts-liberation fonts-dejavu-core fonts-noto-core fonts-noto-color-emoji \
