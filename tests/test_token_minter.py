@@ -252,5 +252,73 @@ class TestSettingsWiring(unittest.TestCase):
         self.assertEqual(m.url, "http://minter.test")
 
 
+
+
+class TestMultiMinter(unittest.TestCase):
+    """多铸造实例（AVM_MINTER_URL 逗号分隔）：轮询分摊 + 故障转移。
+
+    背景：20 账号（全 pro 满负荷）需要 ~0.67 token/s，单实例产能 ~0.35 ⇒ 必须双实例；
+    适配层侧因此支持逗号分隔多地址。
+    """
+
+    def _tm(self, url: str, handler) -> TokenMinter:
+        tm = TokenMinter(url, timeout=2.0)
+        hits: list[str] = []
+
+        def h(request: httpx.Request) -> httpx.Response:
+            hits.append(str(request.url))
+            return handler(request)
+
+        tm._http = httpx.Client(transport=httpx.MockTransport(h), trust_env=False)
+        tm._hits = hits          # 测试断言用
+        return tm
+
+    @staticmethod
+    def _ok(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"token": "TK-" + _request.url.host})
+
+    def test_url_parsing(self):
+        tm = TokenMinter(" http://a:8899/ , http://b:8899 ,", timeout=2)
+        self.assertEqual(tm.urls, ["http://a:8899", "http://b:8899"])
+        self.assertEqual(tm.url, "http://a:8899", "兼容旧引用：返回第一个地址")
+        self.assertFalse(TokenMinter("").configured)
+        self.assertIsNone(TokenMinter("").mint())
+
+    def test_round_robin_spread_across_urls(self):
+        tm = self._tm("http://a:8899,http://b:8899", self._ok)
+        self.assertEqual(tm.mint(), "TK-a")
+        self.assertEqual(tm.mint(), "TK-b")
+        self.assertEqual(tm.mint(), "TK-a")     # 回到第一个 ⇒ 均匀轮询
+        hosts = [u.split("//")[1].split(":")[0] for u in tm._hits]
+        self.assertEqual(hosts, ["a", "b", "a"])
+
+    def test_failover_to_next_on_503(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "a":
+                return httpx.Response(503, json={"error": "down"})
+            return self._ok(request)
+
+        tm = self._tm("http://a:8899,http://b:8899", handler)
+        self.assertEqual(tm.mint(), "TK-b", "a 挂 ⇒ 自动转移到 b")
+        self.assertEqual(tm.mint(), "TK-b", "a 仍挂 ⇒ 再次转移；指针只在成功时推进")
+        self.assertEqual([u.split("//")[1].split(":")[0] for u in tm._hits],
+                         ["a", "b", "a", "b"],
+                         "每次都先从上次成功者的下一个开始 ⇒ 持续探测 a 的恢复")
+
+    def test_all_fail_returns_none(self):
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, json={"error": "down"})
+
+        tm = self._tm("http://a:8899,http://b:8899", handler)
+        self.assertIsNone(tm.mint())
+        self.assertEqual(len(tm._hits), 2, "两个实例都必须被尝试过")
+
+    def test_single_url_behavior_unchanged(self):
+        tm = self._tm("http://only:8899", self._ok)
+        self.assertEqual(tm.mint(), "TK-only")
+        self.assertEqual(tm.mint(), "TK-only")
+        self.assertEqual(len(tm._hits), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
