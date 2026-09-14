@@ -6,6 +6,11 @@
 #   docker compose logs -f
 #   curl -s localhost:8808/healthz | python3 -m json.tool
 #
+# 部署口径（2026-09-14 定）：**Linux 服务器 = 生产一等公民**，本文件开箱即用
+# （minter 必须跑在 Linux 原生 Docker 的 host 网络下，见 minter 段注释）；
+# macOS 只是开发机 —— Docker Desktop 的 host 网络仍经 VPNkit NAT，minter 在 Mac 上
+# 请宿主直跑并把 AVM_MINTER_URL 指过去（容器内铸造实测不可行）。
+#
 # 本文件起**两个**服务：
 #   ark-compat  —— 协议适配层（对外 8808）
 #   minter      —— Turnstile token 铸造服务（Xvfb 有头 Chrome，**不对外映射端口**）
@@ -23,7 +28,7 @@
 
 services:
   ark-compat:
-    image: ghcr.io/yuanjie-ai/aivideomaker:${AVM_IMAGE_TAG:-latest}
+    image: ghcr.io/jushenzhidao/aivideomaker:${AVM_IMAGE_TAG:-latest}
     build:
       context: .
       args:
@@ -135,7 +140,7 @@ services:
   # Turnstile token 铸造服务：常驻 Xvfb 有头 Chrome + 令牌池。
   # **不映射端口**：它能产出"绕过风控的凭证"，只给同网络内的 ark-compat 用。
   minter:
-    image: ghcr.io/yuanjie-ai/aivideomaker-minter:${AVM_IMAGE_TAG:-latest}
+    image: ghcr.io/jushenzhidao/aivideomaker-minter:${AVM_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile.minter
@@ -149,8 +154,7 @@ services:
     #   --network host）0/2、46s 超时，与 bridge 同症状 ⇒ **Mac 上 minter 请宿主直跑**
     #   （macOS 有头直跑已验证 2.4~3.5s/个），AVM_MINTER_URL 指宿主地址并停用本服务。
     network_mode: host
-    expose:
-      - "8899"
+    # （host 网络下没有端口映射，`expose` 是死配置，已删——服务直接监听宿主 8899）
     environment:
       PORT: "8899"
       MINTER_KEY: ${AVM_MINTER_KEY:-}

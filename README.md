@@ -149,6 +149,14 @@ Seedance 2.5「全能参考」上限为**图 4 / 视频 1 / 音频 2**，超限�
 
 ## 部署
 
+> **生产口径（2026-09-14 定）：Linux 服务器是一等公民**，下面两步开箱即用——
+> Release 流水线会把主镜像与 minter（Turnstile 铸造服务）镜像一起推 GHCR
+> （`ghcr.io/jushenzhidao/aivideomaker[-minter]`），compose 直接拉取。
+> minter 必须跑在 **Linux 原生 Docker 的 host 网络**下（bridge + NAT 的 TCP MSS/指纹
+> 改写会被 CF 判机器人，`render()` 一律 46s 超时；host 网络实测 2.3~3.5s/个）。
+> macOS 只是开发机：Docker Desktop 的 host 网络仍经 VPNkit NAT，minter 请宿主直跑
+> 并把 `AVM_MINTER_URL` 指过去。
+
 ```bash
 cp .env.example .env      # 填 AVM_COOKIE（.env 已被 gitignore）
 docker compose up -d      # 宿主端口见 AVM_HOST_PORT（默认 8808）

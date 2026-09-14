@@ -183,3 +183,87 @@ jobs:
           # /healthz 永远起不来（2026-09-14 实测：报 "至少要配一份凭据"）。
           # 选透传而不是塞一份真 cookie：它不需要任何真实凭据即可通过校验，且不落任何密文。
           python3 -c "import json;d=json.load(open('/tmp/healthz.json'));assert d.get('ok') is True, d;print('healthz ok |', d.get('service'), '| task_store =', d.get('task_store'))"
+
+  # minter 镜像（Turnstile 铸造服务：Chrome + Xvfb，约 1.6GB）。
+  # 与主镜像同 tag 规则、同 digest 门禁。**必须与 image job 并行**——两者都只依赖 release，
+  # 串行会白白多等一次全量 Chrome 装机（~5 分钟）。
+  minter-image:
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}-minter
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.version }}   # 与主镜像同一 tag，绝不漂移
+
+      - name: Build and push (linux/amd64)
+        id: build
+        env:
+          VERSION: ${{ needs.release.outputs.version_bare }}
+        run: |
+          set -euo pipefail
+          IMAGE="${IMAGE,,}"                 # GHCR 要求仓库路径全小写
+          echo "image=${IMAGE}  version=${VERSION}"
+
+          echo '${{ secrets.GITHUB_TOKEN }}' \
+            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+          docker build \
+            -f Dockerfile.minter \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:sha-$(git rev-parse --short=7 HEAD)" \
+            .
+
+          # 同主镜像的门禁：三 tag 必须出自同一次 build（digest 唯一）
+          : > /tmp/digests.txt
+          for T in "${VERSION}" latest "sha-$(git rev-parse --short=7 HEAD)"; do
+            OUT="$(docker push "${IMAGE}:${T}" 2>&1)"
+            printf '%s\n' "$OUT" | tail -n 3
+            D="$(printf '%s' "$OUT" \
+                 | sed -n 's/.*digest: \(sha256:[a-f0-9]\{64\}\).*/\1/p' | tail -n1)"
+            [ -n "$D" ] || { echo "::error::没能从 push 输出里解析出 ${T} 的 digest"; exit 1; }
+            printf '%s -> %s\n' "$T" "$D"
+            printf '%s=%s\n' "$T" "$D" >> /tmp/digests.txt
+          done
+          UNIQ="$(cut -d= -f2 /tmp/digests.txt | sort -u | wc -l | tr -d ' ')"
+          if [ "${UNIQ}" -ne 1 ]; then
+            echo "::error::三个 tag 的 manifest digest 不一致（${UNIQ} 种）—— 不是同一次 build"
+            exit 1
+          fi
+          DIGEST="$(cut -d= -f2 /tmp/digests.txt | head -n1)"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+          for T in "${VERSION}" latest "sha-$(git rev-parse --short=7 HEAD)"; do
+            docker image rm "${IMAGE}:${T}" >/dev/null 2>&1 || true
+          done
+
+      # 冒烟：只验证「HTTP 服务起来 + Chrome 被拉起」，**不要求 ready=true**——
+      # ready 取决于 CF 放行 runner 的出口 IP，那是风控问题不是镜像问题，拿它当门禁会误红。
+      # host 网络是部署契约（bridge + NAT 会让 render 46s 超时），冒烟也按契约跑。
+      - name: Smoke test the pushed digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IMAGE="${IMAGE,,}"
+          docker pull "${IMAGE}@${DIGEST}"
+
+          CID="$(docker run -d --network host "${IMAGE}@${DIGEST}")"
+          trap 'docker logs "${CID}" 2>&1 | tail -n 20 || true; docker rm -f "${CID}" >/dev/null 2>&1 || true' EXIT
+
+          BROWSER=""
+          for _ in $(seq 1 45); do
+            if curl -fsS --max-time 3 http://127.0.0.1:8899/healthz -o /tmp/minter.json 2>/dev/null; then
+              BROWSER="$(python3 -c "import json;print(json.load(open('/tmp/minter.json')).get('browser') or '')" 2>/dev/null || true)"
+              [ -n "$BROWSER" ] && break
+            fi
+            sleep 2
+          done
+          if [ -z "$BROWSER" ]; then
+            echo "::error::45s 内铸造服务的 HTTP 没起来或 Chrome 没被拉起"
+            exit 1
+          fi
+          cat /tmp/minter.json
+          echo "minter 冒烟通过：HTTP 200，Chrome = ${BROWSER}"
