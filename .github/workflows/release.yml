@@ -242,6 +242,11 @@ jobs:
       # 冒烟：只验证「HTTP 服务起来 + Chrome 被拉起」，**不要求 ready=true**——
       # ready 取决于 CF 放行 runner 的出口 IP，那是风控问题不是镜像问题，拿它当门禁会误红。
       # host 网络是部署契约（bridge + NAT 会让 render 46s 超时），冒烟也按契约跑。
+      #
+      # 🔴 必须带 MINTER_KEY：镜像里 BIND_HOST=0.0.0.0，而服务是 **fail-closed**
+      #    （非回环绑定 + 无 key ⇒ 拒绝启动，退出码 2）。2026-09-14 这次冒烟正是因此变红 ——
+      #    那是"守卫按设计生效"，不是镜像坏。所以冒烟按**生产形态**跑（带 key），
+      #    并额外做两次反向断言，把安全契约钉进 CI。
       - name: Smoke test the pushed digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -250,7 +255,25 @@ jobs:
           IMAGE="${IMAGE,,}"
           docker pull "${IMAGE}@${DIGEST}"
 
-          CID="$(docker run -d --network host "${IMAGE}@${DIGEST}")"
+          # ---- 反向断言 ①：非回环绑定 + 无 MINTER_KEY ⇒ 必须拒绝启动 ----
+          # 契约依据：本服务产出的 token 能直接过掉上游提交闸门，暴露即等于免费分发。
+          set +e
+          NOKEY_OUT="$(timeout 90 docker run --rm --network host "${IMAGE}@${DIGEST}" 2>&1)"
+          NOKEY_RC=$?
+          set -e
+          if [ "${NOKEY_RC}" -eq 0 ]; then
+            echo "::error::未设 MINTER_KEY 却启动成功了 —— fail-closed 契约被破坏"
+            exit 1
+          fi
+          if ! grep -q "拒绝启动" <<<"${NOKEY_OUT}"; then
+            echo "::error::容器没起来，但原因不是绑定守卫（退出码 ${NOKEY_RC}）。日志尾部："
+            tail -n 20 <<<"${NOKEY_OUT}"
+            exit 1
+          fi
+          echo "ok：无 key + 非回环 ⇒ 按契约拒绝启动（退出码 ${NOKEY_RC}）"
+
+          # ---- 正向冒烟：带上 key，按生产形态起 ----
+          CID="$(docker run -d --network host -e MINTER_KEY=smoke-only "${IMAGE}@${DIGEST}")"
           trap 'docker logs "${CID}" 2>&1 | tail -n 20 || true; docker rm -f "${CID}" >/dev/null 2>&1 || true' EXIT
 
           BROWSER=""
@@ -266,4 +289,14 @@ jobs:
             exit 1
           fi
           cat /tmp/minter.json
+
+          # ---- 反向断言 ②：服务起来了，但**没有凭据的铸造请求必须被拒**（401）----
+          # 放在 healthz 之后：此刻服务已监听，401 只可能来自鉴权而不是"没起来"。
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            -X POST http://127.0.0.1:8899/v1/turnstile/mint || true)"
+          if [ "${CODE}" != "401" ]; then
+            echo "::error::未带 X-Minter-Key 的铸造请求返回 ${CODE}，应为 401（鉴权没接线）"
+            exit 1
+          fi
+          echo "ok：无凭据的铸造请求被拒（401）"
           echo "minter 冒烟通过：HTTP 200，Chrome = ${BROWSER}"

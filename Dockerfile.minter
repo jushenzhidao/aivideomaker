@@ -8,7 +8,12 @@
 # 详见 tools/turnstile_minter.py 顶部的实测表。
 #
 # 安全：该服务能产出"绕过风控的凭证"。**不要映射端口到宿主**，只让同 compose 网络里的
-# ark-compat 用；并且设置 MINTER_KEY（否则它只监听回环、启动时会告警）。
+# ark-compat 用。
+# 🔴 **MINTER_KEY 是必设项，不是可选项**：本镜像里 BIND_HOST=0.0.0.0（非回环），
+#    而未设 MINTER_KEY 时服务会**拒绝启动**（退出码 2，fail-closed）—— 容器表现为
+#    restart 循环，日志里写明原因与三条出路。这是刻意的取舍：宁可起不来，也不把
+#    "过闸能力"匿名挂在公网端口上。仅私有网络可用 MINTER_ALLOW_INSECURE=1 显式放行。
+#    （2026-09-14 发版流水线正是因此变红：那时冒烟没带 key —— 守卫按设计生效，镜像没坏。）
 
 # ⚠️ 必须钉 **bookworm**：`python:3.12-slim` 现在基于 Debian 13(trixie)，而 Chrome 的 deb
 # 依赖 `libasound2` —— 该包在 trixie 里改名为 `libasound2t64` ⇒ apt 直接以 exit 100 失败
