@@ -165,8 +165,35 @@ Seedance 2.5「全能参考」上限为**图 4 / 视频 1 / 音频 2**，超限�
 
 ```bash
 cp .env.example .env      # 填 AVM_COOKIE（.env 已被 gitignore）
-docker compose up -d      # 宿主端口见 AVM_HOST_PORT（默认 8808）
+docker compose up -d      # 只起 ark-compat（宿主端口见 AVM_HOST_PORT，默认 8808）
 ```
+
+> **需要 Turnstile 铸造能力时**（闸门开启且调用方不带 token；吞吐 20 → ~120 条/小时）：
+> minter 与它的前置校验在 `minter` profile 里，**默认不起**。理由：它的产物（token）
+> 能直接过掉上游提交闸门，而它走 host 网络 ⇒ 8899 就是宿主端口；不用它的人既不必配凭据，
+> 也省掉一份常驻 Chrome 和一个 ~870MB 镜像。
+>
+> ```bash
+> echo "AVM_MINTER_URL=http://host.docker.internal:8899" >> .env
+> echo "AVM_MINTER_KEY=$(openssl rand -hex 16)" >> .env
+> docker compose --profile minter up -d
+> ```
+>
+> ⚠️ 只把 profile 启起来还不够：**`AVM_MINTER_URL` 为空时适配层不会去取 token**
+> （模板里它默认留空 = 关掉这条能力），前置校验会就这点在日志里告警。
+>
+> 🔴 **启用 minter profile 时必须给它一把凭据**（0.0.7 起它是 fail-closed 的）。
+> minter 镜像内 `BIND_HOST=0.0.0.0`（非回环），未设 `AVM_MINTER_KEY` 时它**拒绝启动**
+> （退出码 2）—— 这是刻意的：它产出的 Turnstile token 等于"免额度过闸能力"，
+> 宁可起不来，也不匿名挂在公网端口上。两条出路：`AVM_MINTER_KEY=<随机串>`（推荐），
+> 或仅在私有网络 / 已有外层 ACL 时 `AVM_MINTER_ALLOW_INSECURE=1` 显式放行。
+>
+> **两侧必须成对相等**：minter 的 `MINTER_KEY` 与 ark-compat 的 `AVM_MINTER_KEY` 是同一个
+> 值（compose 里两者同源于 `AVM_MINTER_KEY`；**手工接线**时最容易只改一边 ⇒ 取 token 全 401）。
+>
+> compose 已带**前置校验**（`minter-preflight` 一次性容器，直接复用 minter 自己的守卫函数）：
+> 缺 key 且未显式放行时 `docker compose up` **直接失败并打印两条出路** —— 不会再出现
+> "命令退出 0、minter 却在 restart 循环里"的静默失败（那正是 0.0.7 上线时的部署陷阱）。
 
 **多 worker 是这里唯一的坑。** 上游闸门是进程内 `threading.Semaphore`，「全局只跑 2 个」依赖
 单进程：开 N 个 worker 会让实际并发变成 N×2，第 3 个起上游直接返回 `The queue is full`

@@ -240,8 +240,8 @@ node tools/session-diagnose.mjs --submit
 
 ## 6. 计费护栏（最高优先级，先读再跑）
 
-- web 线的免费窗口只有：**`tier=turbo` 且 `duration ≤ 8s`**（如 480p / 5s）。
-  `tier=base` **一律计费**；`turbo` 且 `≥ 9s` 也计费。
+- web 线的免费窗口只有：**`tier=turbo` 且 `duration ≤ 10s`**（如 480p / 5s 或 10s）。
+  `tier=base` **一律计费**；`turbo` 且 `≥ 11s` 也计费。
 - `--submit` 的请求体**硬编码**为该免费组合，**故意不可参数化** —— 它是安全带，不是便利项。
 - 判断一次生成是否花钱，看任务记录的 **`paid` 字段**；**别看 `credits`**（两者反相）。
 - 批量/自动化前先读 [`src/web-adapter/README.md`](../../src/web-adapter/README.md) 的提交队列与

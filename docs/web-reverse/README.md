@@ -23,7 +23,7 @@
    完整对照表见 [`model-inventory.md`](./model-inventory.md)。
 
 2. **网页端计费口径（实测修正）**：以任务记录的 `paid` 布尔字段为准 ——
-   `tier=base` **一律计费**；`tier=turbo` 时 `duration ≤ 8s` 免费、`≥ 9s` 计费。
+   `tier=base` **一律计费**；`tier=turbo` 时 `duration ≤ 10s` 免费、`≥ 11s` 计费。
    注意 `credits` 字段与 `paid` **反相**（`paid=false` 记 1、`paid=true` 记 0），
    判断是否花钱只看 `paid`。34 条任务样本与 480p 时长吸附断层的完整数据见
    [`TESTCASES.md` §1](./TESTCASES.md)。

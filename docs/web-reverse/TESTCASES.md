@@ -31,7 +31,7 @@
 
 ### K 组：真实提交（免费组合）
 
-`--live` 会真实提交，使用**免费组合**——`tier:turbo` 且 `duration ≤ 8s`
+`--live` 会真实提交，使用**免费组合**——`tier:turbo` 且 `duration ≤ 10s`
 （480p 合法时长只有 5/10/15/20，所以**只有 5s 落在免费区**）：
 
 | 用例 | taskId | 成片 | 计费断言 |
@@ -68,8 +68,8 @@
 | 条件 | 计费 |
 | --- | --- |
 | `tier = "base"` | **一律计费**（与分辨率、时长无关） |
-| `tier = "turbo"` 且 `duration ≤ 8s` | 免费 |
-| `tier = "turbo"` 且 `duration ≥ 9s` | 计费 |
+| `tier = "turbo"` 且 `duration ≤ 10s` | 免费 |
+| `tier = "turbo"` 且 `duration ≥ 11s` | 计费 |
 
 ### 证据：按时长分组统计
 

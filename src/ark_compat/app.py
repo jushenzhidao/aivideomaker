@@ -25,7 +25,8 @@
 
 四条安全约定：
   1. 站点**没有取消端点** —— 删除只删本地记录，跑着的任务照跑照扣，绝不谎报"已取消"。
-  2. 计费有两个陷阱：`tier=base` 一律计费；`turbo` 只在 `duration ≤ 8s` 时免费。
+  2. 计费有两个陷阱：`tier=base` 一律计费；`turbo` 只在 `duration ≤ 10s` 时免费
+     （`translate.FREE_MAX_DURATION`；口径载体清单见 `tests/test_docs_billing_sync.py`）。
      判据是任务记录里的 `paid`（`credits` 与它反相，别用它判断）。
   3. 会话 cookie / Bearer token **不进日志、不进 span 属性** —— 靠
      `capture_headers=False`（硬过滤）而不是靠脱敏；请求 / 响应**原文**进 trace，
