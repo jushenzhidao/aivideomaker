@@ -83,16 +83,42 @@ def chrome_bin() -> str:
     return "/usr/bin/google-chrome"
 
 
+def clear_profile_locks() -> list:
+    """清掉上一次运行留下的 profile 锁。
+
+    ⚠️ 容器里**必须做**：profile 落在卷上，容器重建后 hostname 变了，Chrome 会认定
+    "profile 被另一台机器上的进程占用"并**直接拒绝启动**（日志只有一句 SingletonLock 的
+    ERROR，CDP 永不就绪 ⇒ 服务一直 ready=false，看不出是为什么）。
+    """
+    cleared = []
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        path = os.path.join(PROFILE_DIR, name)
+        try:
+            if os.path.islink(path) or os.path.exists(path):
+                os.remove(path)
+                cleared.append(name)
+        except OSError:
+            pass
+    return cleared
+
+
 def start_chrome():
     if cdp_ok() and KEEP:
         return
     subprocess.run(["pkill", "-f", f"remote-debugging-port={PORT}"], capture_output=True)
+    locks = clear_profile_locks()
+    if locks:
+        print(f"[info] 已清掉陈旧的 profile 锁：{', '.join(locks)}", flush=True)
     time.sleep(2)
     args = [chrome_bin(), f"--remote-debugging-port={PORT}",
             "--remote-debugging-address=127.0.0.1", f"--user-data-dir={PROFILE_DIR}",
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled",
             "--no-first-run", "--no-default-browser-check", "--window-size=1280,900",
-            "--remote-allow-origins=*"]
+            "--remote-allow-origins=*",
+            # 容器/无 GPU 环境：显式走软件渲染。CF 会查 WebGL 渲染器，
+            # 缺 GPU 又不给 SwiftShader 时报"无 WebGL" ⇒ 强负信号（宿主机有真 GPU，
+            # 所以这条在 Mac 上不影响）。
+            "--disable-gpu", "--use-gl=swiftshader", "--enable-unsafe-swiftshader"]
     if HEADLESS:
         args.append("--headless=new")
     # setsid / xvfb-run 都是 Linux 专有：macOS 上要按 which 判断（少了 setsid 会直接报

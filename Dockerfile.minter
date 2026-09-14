@@ -10,30 +10,53 @@
 # 安全：该服务能产出"绕过风控的凭证"。**不要映射端口到宿主**，只让同 compose 网络里的
 # ark-compat 用；并且设置 MINTER_KEY（否则它只监听回环、启动时会告警）。
 
-FROM python:3.12-slim
+# ⚠️ 必须钉 **bookworm**：`python:3.12-slim` 现在基于 Debian 13(trixie)，而 Chrome 的 deb
+# 依赖 `libasound2` —— 该包在 trixie 里改名为 `libasound2t64` ⇒ apt 直接以 exit 100 失败
+# （实测踩到：构建卡在装 Chrome 那一步，日志只给一句 "did not complete successfully"）。
+FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=8899 \
+    BIND_HOST=0.0.0.0 \
     CDP_PORT=9222 \
     CHROME_PROFILE=/data/chrome \
     POOL_TARGET=4 \
     TOKEN_TTL_S=120
 
-# Chrome 运行所需的运行库 + Xvfb（生产环境用 xvfb-run 提供虚拟显示）
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl xvfb fonts-liberation \
+# 额外装的几组（都有理由，不是"顺手多加"）：
+#   * xauth      —— 没有它 `xvfb-run` 直接起不来（容器里实测踩到，且补货线程会被
+#                   SystemExit 静默打死 ⇒ ready=false / last_error=null，极难查）；
+#   * 多字体      —— 只装 liberation 时字体家族只有 4 个，而真人浏览器有几十个，
+#                   这是容器里最容易被 CF 当机器人的信号之一；
+#   * libgl1/mesa —— CF 会查 WebGL 渲染器，缺库时报"无 WebGL" ⇒ 强负信号。
+# ⚠️ 这些注释**不能写在 RUN 的续行里面**：Dockerfile 只在行首识别注释，续行里的 `#`
+#    会被 shell 当注释，把后半行命令（含 `&& curl ... install chrome`）整段吃掉，
+#    而该层还会"成功"—— 典型的静默破坏。
+#
+# Chrome 运行库 + Xvfb，**与装 Chrome 合成一层**。
+#
+# ⚠️ 为什么不能拆成两个 RUN：拆开时若在前一层结尾清理了 `/var/lib/apt/lists/*`，
+# 后一层装 deb 就会因为**没有 apt 索引**而报
+#   `google-chrome-stable : Depends: libvulkan1 but it is not installable`
+# （libvulkan1 / wget / xdg-utils 全"不可安装"，exit code 100）。实测踩过。
+#
+# 注：Docker 的 linter 会就 `ENV TOKEN_TTL_S` 报 SecretsUsedInArgOrEnv —— 名字里有 "TOKEN"
+# 触发的误报（它是**存活秒数**，不是密钥），仅是 warning。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl xvfb xauth dbus dbus-x11 \
+        fonts-liberation fonts-dejavu-core fonts-noto-core fonts-noto-color-emoji \
+        libgl1 libglx-mesa0 libegl1 \
         libnss3 libxss1 libatk-bridge2.0-0 libatk1.0-0 libgtk-3-0 libgbm1 libasound2 \
         libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 \
         libpango-1.0-0 libcairo2 \
-    && rm -rf /var/lib/apt/lists/*
-
-# 官方 Chrome 稳定版（deb 安装会自动带上它的依赖）
-RUN curl -fsSL -o /tmp/chrome.deb \
+    && curl -fsSL -o /tmp/chrome.deb \
         https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get install -y /tmp/chrome.deb \
-    && rm -f /tmp/chrome.deb
+    && rm -f /tmp/chrome.deb \
+    && rm -rf /var/lib/apt/lists/*
 
 # CDP 客户端（服务用原生 CDP，不依赖 Playwright：少一层、也少一个浏览器下载）
 RUN pip install --no-cache-dir websocket-client

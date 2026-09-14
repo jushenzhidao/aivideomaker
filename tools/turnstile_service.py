@@ -31,6 +31,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import turnstile_minter as M  # noqa: E402  （同目录，复用铸造核心）
 
 PORT = int(os.environ.get("PORT", "8899"))
+# ⚠️ 绑定地址：默认只绑回环（本机跑最安全）；**容器里必须绑 0.0.0.0**，
+# 否则 docker-proxy 从容器 eth0 转发进来的连接无人接收 —— 宿主侧表现为
+# `Connection reset by peer`，而容器内 curl 自己却是好的（最迷惑的一种）。
+# 与主 Dockerfile 里 `ARK_HOST=0.0.0.0` 是同一条教训。
+BIND_HOST = os.environ.get("BIND_HOST", "127.0.0.1")
 KEY = os.environ.get("MINTER_KEY", "")
 POOL_TARGET = int(os.environ.get("POOL_TARGET", "4"))
 TTL_S = float(os.environ.get("TOKEN_TTL_S", "120"))   # 保守：CF 侧约 300s，站点校验按更短算
@@ -127,7 +132,11 @@ def refill_loop():
             tok = CORE.mint()
             with _STATE_LOCK:
                 _STATE["pool"].append((tok, time.time()))
-        except Exception as e:  # noqa: BLE001 补货失败不影响已服务能力
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            # ⚠️ 必须连 SystemExit 一起接：`ensure()` 起不来 Chrome 时抛的是 SystemExit，
+            # 它是 BaseException 的子类 —— 只 catch Exception 会让**补货线程静默死亡**，
+            # 表现为 ready=false / minting=false / last_error=null（实测在容器里踩到，
+            # 因为没有 xauth，xvfb-run 起不来）。线程死掉还查不到原因是最坏的情况。
             with _STATE_LOCK:
                 _STATE["last_error"] = f"{type(e).__name__}: {e}"[:200]
             time.sleep(3)
@@ -198,8 +207,9 @@ def main():
         print("[warn] MINTER_KEY 未设置 —— 只应监听回环，切勿暴露公网", flush=True)
     threading.Thread(target=refill_loop, daemon=True).start()
     _WAKE.set()
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Turnstile 铸造服务已启动 http://127.0.0.1:{PORT}（池子目标 {POOL_TARGET}，TTL {TTL_S}s）", flush=True)
+    srv = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
+    print(f"Turnstile 铸造服务已启动 http://{BIND_HOST}:{PORT}"
+          f"（池子目标 {POOL_TARGET}，TTL {TTL_S}s）", flush=True)
     srv.serve_forever()
 
 
