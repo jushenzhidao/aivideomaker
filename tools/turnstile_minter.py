@@ -80,6 +80,10 @@ def chrome_bin() -> str:
     mac = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     if sys.platform == "darwin" and os.path.exists(mac):
         return mac
+    # arm64 容器里装的是 Debian 原生 chromium（Google 不出 Linux/arm64 的 Chrome）
+    for cand in ("/usr/bin/google-chrome", "/usr/bin/chromium"):
+        if os.path.exists(cand):
+            return cand
     return "/usr/bin/google-chrome"
 
 

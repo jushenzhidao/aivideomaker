@@ -34,6 +34,8 @@ services:
     ports:
       # 容器内固定 8808；这里只管宿主侧端口（用独立变量名，避免与 ARK_PORT 混淆）
       - "${AVM_HOST_PORT:-8808}:8808"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     environment:
       # 容器内必须绑 0.0.0.0 —— 绑回环会让端口映射失效
@@ -60,7 +62,7 @@ services:
       # ---- Turnstile 铸造服务（同 compose 网络的 minter）----
       # 闸门开启且调用方没带 token 时自动取一个；取不到会如实报错（绝不静默提交）。
       # 设成空串 = 关闭这条能力（退回"等闸门衰减"，约 20 条/小时）。
-      AVM_MINTER_URL: ${AVM_MINTER_URL-http://minter:8899}
+      AVM_MINTER_URL: ${AVM_MINTER_URL-http://host.docker.internal:8899}
       AVM_MINTER_KEY: ${AVM_MINTER_KEY:-}
       AVM_LOG_LEVEL: ${AVM_LOG_LEVEL:-INFO}
 
@@ -72,7 +74,7 @@ services:
       #    设 **0 = 按账号额度自动**（推荐）：写死 2 会让 pro 账号的 4 并发用不满。
       #    加 worker 不会提高吞吐（上游按账号不放行），只会增加故障隔离；
       #    要提吞吐靠"缩短单次占用时间"或"多账号"（账号轮询放在 new-api 那层）。
-      AVM_MAX_CONCURRENT: ${AVM_MAX_CONCURRENT:-2}
+      AVM_MAX_CONCURRENT: ${AVM_MAX_CONCURRENT:-0}
       AVM_WORKERS: ${AVM_WORKERS:-2}
       AVM_POLL_SECONDS: ${AVM_POLL_SECONDS:-10}
       # 号池上报：余额/闸门 → Logfire 指标（只读）。0=关；多 worker 各报一份。
@@ -139,6 +141,10 @@ services:
       dockerfile: Dockerfile.minter
     container_name: avm-minter
     restart: unless-stopped
+    # ★ 必须用 **host 网络**：默认 bridge + NAT 会改写 TCP MSS/网络指纹 ⇒ CF 判定为机器人：
+    #   `turnstile.render()` 一律 46 秒超时（同机同 Chrome：宿主 3.7s ✅ / bridge 容器 46s ❌；实测）。
+    #   用 host 后容器内实测 2.3~3.5s/个，与宿主同量级。
+    network_mode: host
     expose:
       - "8899"
     environment:

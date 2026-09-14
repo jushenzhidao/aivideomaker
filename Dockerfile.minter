@@ -44,6 +44,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #
 # 注：Docker 的 linter 会就 `ENV TOKEN_TTL_S` 报 SecretsUsedInArgOrEnv —— 名字里有 "TOKEN"
 # 触发的误报（它是**存活秒数**，不是密钥），仅是 warning。
+# ⚠️ **多架构**：Google 不发布 Linux/arm64 的 Chrome，而本机（Apple Silicon）+ 任何
+# arm64 主机都必须走原生 arm64 —— 若用 `--platform linux/amd64` 让 Chrome 跑在
+# Rosetta/QEMU 模拟层里，CF 挑战的 JS 计时/行为信号会明显异常（等于把"我是模拟器"
+# 写在脸上）。所以：amd64 用 Google Chrome 官方 deb；arm64 用 Debian 原生 chromium
+# （bookworm-security 的 152.x 与 Chrome 153 同代，不算旧）。二进制路径由
+# turnstile_minter.chrome_bin() 自动发现（google-chrome → chromium）。
+ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl xvfb xauth dbus dbus-x11 \
@@ -52,10 +59,14 @@ RUN apt-get update \
         libnss3 libxss1 libatk-bridge2.0-0 libatk1.0-0 libgtk-3-0 libgbm1 libasound2 \
         libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 \
         libpango-1.0-0 libcairo2 \
-    && curl -fsSL -o /tmp/chrome.deb \
-        https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
-    && apt-get install -y /tmp/chrome.deb \
-    && rm -f /tmp/chrome.deb \
+    && if [ "$TARGETARCH" = "arm64" ]; then \
+        apt-get install -y --no-install-recommends chromium; \
+    else \
+        curl -fsSL -o /tmp/chrome.deb \
+            https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+        && apt-get install -y /tmp/chrome.deb \
+        && rm -f /tmp/chrome.deb; \
+    fi \
     && rm -rf /var/lib/apt/lists/*
 
 # CDP 客户端（服务用原生 CDP，不依赖 Playwright：少一层、也少一个浏览器下载）
