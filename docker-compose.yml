@@ -22,19 +22,25 @@
 # `AVM_MINTER_URL` 用 `:-` 插值：.env 里**留空与未设同义**，回退到
 # http://host.docker.internal:8899（minter 走 host 网络 ⇒ 就监听在宿主 8899，故"Linux
 # 容器化"与"Mac 宿主直跑"两种情形都适用，详见 minter 段注释）。
-# ⚠️ 能力默认开 ⇒ **`AVM_MINTER_KEY` 必设**：minter 是 fail-closed 的，缺 key 会被下面的
-# 前置校验直接拦下（不再"up 退 0 + 容器循环重启"）。
+# 🔓 **铸造服务默认开放：不需要 `AVM_MINTER_KEY`**（2026-09-14 用户口径）。
+# 代价必须知道：minter 走 host 网络 ⇒ 8899 就是**宿主端口**，无凭据即"谁连得上谁就能领
+# token"（等于把过闸能力分发出去，也会让账号更快撞风控）。敞开不等于必须挂公网 —— 两条收口路：
+#   ① 限绑定地址：`AVM_MINTER_BIND_HOST=127.0.0.1`（需 ark-compat 也走 host 网络）或内网地址；
+#   ② 配 key 并关掉开放模式：`AVM_MINTER_KEY=<随机串>` + `AVM_MINTER_ALLOW_INSECURE=0`
+#      —— 此时前置校验恢复"缺 key 就让 `up` 直接失败"（fail-closed 机制仍在，只是默认不启用）。
 #
 # 变量从同目录 .env 读取（compose 自动做插值）。这里**逐个显式列出**而不是用
 # env_file：env_file 会把 .env 里所有变量（含无关项）一股脑灌进容器，而显式列举
 # 写错名字会立刻暴露成空值，符合本项目"宁可报错不要静默"的口径。
 #
-# 三个 compose 专属变量（**故意不写进 .env.example** —— 那里只放代码实际读取的变量，
+# **六个** compose 专属变量（**故意不写进 .env.example** —— 那里只放代码实际读取的变量，
 # 有 tests/test_env_template.py 的**双向**门禁把关；需要时直接写进你的 .env 即可）：
 #   AVM_IMAGE_TAG              拉取/构建用的镜像 tag，默认 latest（也可填版本如 0.0.1）
 #   AVM_HOST_PORT              宿主侧映射端口，默认 8808（容器内固定 8808）
-#   AVM_MINTER_ALLOW_INSECURE  见 minter 段：放行"非回环 + 无凭据"的铸造服务，
-#                              仅限私有网络 / 已有外层 ACL 时使用
+#   AVM_MINTER_ALLOW_INSECURE  铸造服务的安全开关，**默认 1 = 开放**（见文件头）；置 0 恢复 fail-closed
+#   AVM_MINTER_BIND_HOST       铸造服务的绑定地址，默认 0.0.0.0；收到回环/内网即"开放但不挂公网"
+#   AVM_MINTER_POOL            单个铸造器实例的池子水位，默认 4（≈ 账号额度 × TTL/一轮时长）
+#   AVM_MINTER_TTL             铸出的 token 存活上限（秒），默认 120（CF 侧约 300s，按更短算）
 
 services:
   ark-compat:
@@ -98,6 +104,28 @@ services:
       AVM_ACCOUNT_REPORT_SECONDS: ${AVM_ACCOUNT_REPORT_SECONDS:-300}
       AVM_QUEUE_MAX_ATTEMPTS: ${AVM_QUEUE_MAX_ATTEMPTS:-8}
       AVM_RETRY_CAPTCHA: ${AVM_RETRY_CAPTCHA:-0}
+
+      # ---- ★ 补透传（2026-09-14 env 比对发现）----
+      # 下面这些键**容器内的代码会读**，但 compose 此前从没传过它们 ⇒ 在 .env 里改
+      # **完全不生效**（静默无效配置：名字对、门禁过、就是没用）。空串 = 没设：代码侧一律
+      # `or 默认值` / `_int(name, default)`，已实测「全空串」与「不设」加载结果逐项相同。
+      # gunicorn 侧（src/gunicorn_conf.py；GRACEFUL_TIMEOUT 要与 stop_grace_period 配套改）：
+      AVM_GUNICORN_TIMEOUT: ${AVM_GUNICORN_TIMEOUT:-}
+      AVM_GUNICORN_GRACEFUL_TIMEOUT: ${AVM_GUNICORN_GRACEFUL_TIMEOUT:-}
+      AVM_GUNICORN_KEEPALIVE: ${AVM_GUNICORN_KEEPALIVE:-}
+      AVM_GUNICORN_MAX_REQUESTS: ${AVM_GUNICORN_MAX_REQUESTS:-}
+      AVM_GUNICORN_MAX_REQUESTS_JITTER: ${AVM_GUNICORN_MAX_REQUESTS_JITTER:-}
+      AVM_GUNICORN_BACKLOG: ${AVM_GUNICORN_BACKLOG:-}
+      AVM_GUNICORN_WORKER_CONNECTIONS: ${AVM_GUNICORN_WORKER_CONNECTIONS:-}
+      AVM_GUNICORN_FORWARDED_IPS: ${AVM_GUNICORN_FORWARDED_IPS:-}
+      AVM_GUNICORN_LOGLEVEL: ${AVM_GUNICORN_LOGLEVEL:-}
+      AVM_GUNICORN_WATCHDOG_URL: ${AVM_GUNICORN_WATCHDOG_URL:-}
+      # 应用侧（src/ark_compat/settings.py）：
+      AVM_SERVICE_NAME: ${AVM_SERVICE_NAME:-}
+      AVM_ENVIRONMENT: ${AVM_ENVIRONMENT:-}
+      AVM_PROBE_TIMEOUT: ${AVM_PROBE_TIMEOUT:-}
+      AVM_MINTER_TIMEOUT: ${AVM_MINTER_TIMEOUT:-}
+      AVM_ACCOUNT_REPORT_IDENTITY: ${AVM_ACCOUNT_REPORT_IDENTITY:-}
 
       # ---- 存活看门狗（默认关）----
       # 打开后：连续 N 次本地 /healthz 失败就令 master 退出，交给 restart 策略重建。
@@ -186,7 +214,10 @@ services:
     environment:
       MINTER_KEY: ${AVM_MINTER_KEY:-}          # = minter 服务读到的值
       ARK_MINTER_KEY: ${AVM_MINTER_KEY:-}      # = ark-compat 读到的值
-      MINTER_ALLOW_INSECURE: ${AVM_MINTER_ALLOW_INSECURE:-0}
+      # 与 minter 用**同一个表达式**（默认 1 = 开放）⇒ 校验按真实开关判定
+      MINTER_ALLOW_INSECURE: ${AVM_MINTER_ALLOW_INSECURE:-1}
+      # 也与 minter 同源 ⇒ 按真实绑定地址判定，不再硬套镜像里的 0.0.0.0
+      BIND_HOST: ${AVM_MINTER_BIND_HOST:-0.0.0.0}
       # 与 ark-compat 用**完全相同的插值表达式**（注意那个 `:-`）⇒ 校验看到的就是适配层真实
       # 拿到的值；否则会出现"这里读到空、那边拿到兜底"的假告警。
       ARK_MINTER_URL: ${AVM_MINTER_URL:-http://host.docker.internal:8899}
@@ -250,6 +281,19 @@ services:
                       "**不会去取 token**。检查 compose 里该变量的默认值写法是否带冒号"
                       "（留空也回退），或直接在 .env 里填 "
                       "AVM_MINTER_URL=http://host.docker.internal:8899。", file=sys.stderr)
+            if allow_insecure and not minter_side.strip():
+                # 默认开放是本项目**唯一**的 fail-open 处：不拦，但每次部署都要把它喊出来，
+                # 免得"服务在跑"被当成"服务是安全的"。
+                # 只在**非回环**绑定下喊：回环绑定时外部根本连不上，跟着喊只会让人对告警脱敏。
+                # 判据复用 minter 自己那份回环名单（`LOOPBACK_HOSTS`），不另写一套。
+                _bh = os.environ.get("BIND_HOST", "127.0.0.1")
+                _loopback = _bh.strip() in getattr(S, "LOOPBACK_HOSTS", frozenset())
+                if not _loopback:
+                    print("[warn] 铸造服务以**开放模式**运行（未设 MINTER_KEY，绑定 %s）—— 任何能连上"
+                          "该地址的人都能领 Turnstile token（等于分发过闸能力，也会让账号更快撞"
+                          "风控）。收口二选一：① AVM_MINTER_BIND_HOST 收到回环/内网；"
+                          "② 设 MINTER_KEY 且把 AVM_MINTER_ALLOW_INSECURE 置 0。" % _bh,
+                          file=sys.stderr)
             print("[ok] minter 前置校验通过（%s）" % why)
             sys.exit(0)
 
@@ -289,14 +333,16 @@ services:
     # （host 网络下没有端口映射，`expose` 是死配置，已删——服务直接监听宿主 8899）
     environment:
       PORT: "8899"
-      # 🔴 **生产必设**。本服务用 host 网络（8899 直达宿主网络栈），而它产出的 token
-      #    能直接过掉上游提交闸门 ⇒ 因此按 fail-closed 收口：**非回环绑定 + 未设 key
-      #    时拒绝启动**（退出码 2；容器会进入 restart 循环，stderr 写明原因与三条出路）。
-      #    刻意的取舍：宁可起不来，也不把"过闸能力"匿名挂在公网端口上。
+      # 🔓 **默认开放**（2026-09-14 用户口径：默认参数就能跑，不新增必填项）：不配 key
+      #    直接跑，故 MINTER_ALLOW_INSECURE 默认 1 —— 这是本文件**唯一**的 fail-open 处
+      #    （服务启动时那句 fail-closed 守卫就被这一位放行）。
+      #    代价见文件头：host 网络下 8899 即宿主端口，无凭据 = 谁连得上谁就能领 token。
       MINTER_KEY: ${AVM_MINTER_KEY:-}
-      # 显式自担风险开关（默认关）。只有确实处于私有网络、或外层已有 ACL 时才置 1，
-      # 否则请改用 MINTER_KEY —— 留空又暴露在非回环地址上会被上面那条守卫直接拦下。
-      MINTER_ALLOW_INSECURE: ${AVM_MINTER_ALLOW_INSECURE:-0}
+      # 默认 1 = 开放（见上）。要恢复 fail-closed：置 0 并配 MINTER_KEY。
+      MINTER_ALLOW_INSECURE: ${AVM_MINTER_ALLOW_INSECURE:-1}
+      # 绑定地址，默认与镜像一致（0.0.0.0 = 开箱即用）。"开放但不挂公网"就收到回环/内网地址，
+      # 例如 AVM_MINTER_BIND_HOST=172.17.0.1（docker0 网关，桥接网络里的 ark-compat 可达）。
+      BIND_HOST: ${AVM_MINTER_BIND_HOST:-0.0.0.0}
       # 池子水位与 token 存活上限（秒）。
       # ⚠️ POOL_TARGET 是**每个铸造器实例**的池子，不是账号维度（token 绑 sitekey+域名，
       #    不绑账号 ⇒ 一个铸造器可服务所有账号）。

@@ -164,7 +164,7 @@ Seedance 2.5「全能参考」上限为**图 4 / 视频 1 / 音频 2**，超限�
 > 也可以单实例透传（`AVM_PASSTHROUGH_COOKIE=1`，每凭据仍是独立账号上下文、零串扰）。
 
 ```bash
-cp .env.example .env      # 填 AVM_COOKIE 与 AVM_MINTER_KEY（.env 已被 gitignore）
+cp .env.example .env      # 只需填 AVM_COOKIE（.env 已被 gitignore）—— 铸造服务不需要凭据
 docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_PORT，默认 8808）
 ```
 
@@ -174,29 +174,24 @@ docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_P
 > `http://host.docker.internal:8899`（minter 走 host 网络 ⇒ 就监听在宿主 8899；Mac 上
 > 宿主直跑 minter 也是这个地址）。**别把留空理解成"关掉能力"**。
 >
-> **只要适配层、不要铸造**时：`docker compose up -d ark-compat`（少一份常驻 Chrome，
-> 也免掉下面的凭据要求）。
+> 🔓 **铸造服务默认开放：不需要 `AVM_MINTER_KEY`**（2026-09-14 定）—— **默认参数直接能跑**，
+> 不新增任何必填项。代价必须知道：minter 走 host 网络 ⇒ 8899 就是**宿主端口**，无凭据即
+> "谁连得上谁就能领 token"（等于把过闸能力分发出去，也会让账号更快撞风控）。三条应对：
+> - **有公网 IP 就别敞开**：`AVM_MINTER_BIND_HOST=127.0.0.1`（需 ark-compat 也走 host 网络）
+>   或内网地址；或在外层防火墙只放行 8808；
+> - **要恢复 fail-closed**：`AVM_MINTER_KEY=<随机串>` 且 `AVM_MINTER_ALLOW_INSECURE=0`
+>   —— 于是缺 key 会让 `docker compose up` 直接失败并打印两条出路（机制仍在，默认不启用）；
+> - 开放模式启动时，minter 与前置校验都会打一条**显式告警**（仅非回环绑定时）。
 >
-> ```bash
-> echo "AVM_MINTER_KEY=$(openssl rand -hex 16)" >> .env    # 或手填任意随机串
-> ```
->
-> 🔴 **能力默认开 ⇒ `AVM_MINTER_KEY` 必设**（0.0.7 起 minter 是 fail-closed 的）。
-> minter 镜像内 `BIND_HOST=0.0.0.0`（非回环），未设 `AVM_MINTER_KEY` 时它**拒绝启动**
-> （退出码 2）—— 这是刻意的：它产出的 Turnstile token 等于"免额度过闸能力"，
-> 宁可起不来，也不匿名挂在公网端口上。两条出路：`AVM_MINTER_KEY=<随机串>`（推荐），
-> 或仅在私有网络 / 已有外层 ACL 时 `AVM_MINTER_ALLOW_INSECURE=1` 显式放行。
-> minter 镜像内 `BIND_HOST=0.0.0.0`（非回环），未设 `AVM_MINTER_KEY` 时它**拒绝启动**
-> （退出码 2）—— 这是刻意的：它产出的 Turnstile token 等于"免额度过闸能力"，
-> 宁可起不来，也不匿名挂在公网端口上。两条出路：`AVM_MINTER_KEY=<随机串>`（推荐），
-> 或仅在私有网络 / 已有外层 ACL 时 `AVM_MINTER_ALLOW_INSECURE=1` 显式放行。
+> **只要适配层、不要铸造**时：`docker compose up -d ark-compat`（少一份常驻 Chrome）。
 >
 > **两侧必须成对相等**：minter 的 `MINTER_KEY` 与 ark-compat 的 `AVM_MINTER_KEY` 是同一个
 > 值（compose 里两者同源于 `AVM_MINTER_KEY`；**手工接线**时最容易只改一边 ⇒ 取 token 全 401）。
 >
-> compose 已带**前置校验**（`minter-preflight` 一次性容器，直接复用 minter 自己的守卫函数）：
-> 缺 key 且未显式放行时 `docker compose up` **直接失败并打印两条出路** —— 不会再出现
-> "命令退出 0、minter 却在 restart 循环里"的静默失败（那正是 0.0.7 上线时的部署陷阱）。
+> compose 仍带**前置校验**（`minter-preflight` 一次性容器，直接复用 minter 自己的守卫函数）：
+> 默认（开放）模式下它只告警不拦；一旦按上面的方式恢复 fail-closed，缺 key 会让
+> `docker compose up` **直接失败并打印两条出路** —— 不会再出现"命令退出 0、minter 却在
+> restart 循环里"的静默失败（那正是 0.0.7 上线时的部署陷阱）。
 
 **多 worker 是这里唯一的坑。** 上游闸门是进程内 `threading.Semaphore`，「全局只跑 2 个」依赖
 单进程：开 N 个 worker 会让实际并发变成 N×2，第 3 个起上游直接返回 `The queue is full`
