@@ -13,12 +13,20 @@
 三条纪律（与 `test_ark_compat.py` 一致）：
   1. **零额度消耗** —— 提交一律走 dry-run，或让拦截发生在发出上游请求**之前**
      （死端口上游从头到尾不被碰到）；
-  2. **零外发** —— 上游 base_url = 127.0.0.1:9，客户端 trust_env=False；
+  2. **零外发** —— 上游 base_url = 127.0.0.1:9，客户端 trust_env=False。
+     🔴 但**只把 base_url 指向死端口是不够的**：适配层会把外链素材转存到站点 CDN，
+     那一步是 `httpx.get(绝对 URL)`，**不受 base_url 约束** ⇒ 会真的去公网下载。
+     所以凡是会真正发出请求的用例，素材 URL 必须先换成死端口地址
+     （见 `offline_doc_example()`）。实测（2026-09-14）：下面那个"对照组"用例
+     原先每次运行都向文档站 TOS 发一次真实 HTTPS 请求
+     （拦 `socket.connect` 抓到 220.181.116.10x:443），既让"零外发"名不副实，
+     也让用例依赖外部 CDN 的可用性（下载超时上限 60s）。
   3. 主要压纯函数，HTTP 层只做路由与错误信封的往返回归。
 
 运行：python3 tests/test_seedance25_omni.py
 """
 
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -67,6 +75,26 @@ def doc_example(**kw) -> dict:
     }
     b.update(kw)
     return b
+
+
+def _to_dead_port(value):
+    """把任意嵌套结构里 http(s) URL 的**主机部分**换成死端口。"""
+    if isinstance(value, str):
+        return re.sub(r"^https?://[^/]+", DEAD_UPSTREAM, value)
+    if isinstance(value, dict):
+        return {k: _to_dead_port(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_dead_port(v) for v in value]
+    return value
+
+
+def offline_doc_example(**kw) -> dict:
+    """`doc_example()` 的**无外发**版本：素材 URL 全部改指死端口。
+
+    语义不变：请求照样过兼容门禁（不返回 400），照样在"真正发出请求"那一步
+    以连接失败收场 —— 只是不再真的触网，也不再依赖外部 CDN 可用。
+    """
+    return _to_dead_port(doc_example(**kw))
 
 
 def minimal(**kw) -> dict:
@@ -306,10 +334,15 @@ class TestOmniHttpLayer(unittest.TestCase):
         self.assertIn("edit", live.json()["error"]["message"])
 
     def test_reference_task_is_not_refused_by_the_compatibility_gate(self):
-        """对照组：reference 类请求不该被兼容门禁拦下 —— 它会真的打上游（死端口），
-        以 5xx 收场。关键是**不是** 400 InvalidParameter。"""
-        r = self.client.post(TASKS_PATH, json=doc_example())
-        self.assertNotEqual(r.status_code, 400)
+        """对照组：reference 类请求不该被兼容门禁拦下。
+
+        素材用**死端口**地址（`offline_doc_example()`）：转存那步会连接失败，
+        于是请求走完门禁后在网络层收场 —— 与"真的打上游"结果一致，但**零外发**。
+        断言落到具体状态码而不只是"不是 400"：否则连接失败与"提交成功"都能通过，
+        用例会退化成只检查一个否定条件。
+        """
+        r = self.client.post(TASKS_PATH, json=offline_doc_example())
+        self.assertEqual(r.status_code, 502, f"期望网络层失败，实际 {r.status_code}: {r.text[:200]}")
         self.assertNotEqual(r.json().get("error", {}).get("code"), "InvalidParameter")
 
 

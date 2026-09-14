@@ -12,12 +12,16 @@ API（默认 127.0.0.1:8899）：
                                     → {"token": "...", "source": "pool|live", "age_ms": 1200}
   POST /v1/turnstile/mint?n=4       取 n 个 → {"tokens": [...], "sources": [...]}
 
-鉴权：设了 `MINTER_KEY` 就要求 `X-Minter-Key` 头；没设则只应监听回环（启动会告警）。
+鉴权（**fail-closed**）：设了 `MINTER_KEY` 就要求 `X-Minter-Key` 头；
+**非回环绑定 + 未设 key ⇒ 启动即拒**（退出码 2），不再只告警后继续服务 ——
+本服务产出的 token 能直接过掉上游风控闸门，暴露到公网等于免费分发过闸能力。
+确需在私有网络内匿名运行时，显式设 `MINTER_ALLOW_INSECURE=1` 自担风险。
 
 降级：铸造失败一律返回 503 + 明确错误，调用方据此退回"等闸门衰减"的慢路径 ——
       **绝不能让上游把"铸造失败"当成"闸门放行"**。
 
-环境变量：PORT / MINTER_KEY / POOL_TARGET / TOKEN_TTL_S / SITEKEY / LIGHT_URL / HEADLESS
+环境变量：PORT / BIND_HOST / MINTER_KEY / MINTER_ALLOW_INSECURE /
+          POOL_TARGET / TOKEN_TTL_S / SITEKEY / LIGHT_URL / HEADLESS
 """
 import json
 import os
@@ -36,10 +40,29 @@ PORT = int(os.environ.get("PORT", "8899"))
 # 否则 docker-proxy 从容器 eth0 转发进来的连接无人接收 —— 宿主侧表现为
 # `Connection reset by peer`，而容器内 curl 自己却是好的（最迷惑的一种）。
 # 与主 Dockerfile 里 `ARK_HOST=0.0.0.0` 是同一条教训。
+# 🔴 但 0.0.0.0 **不是**可以裸奔的：见下方 `bind_guard_error()`。
 BIND_HOST = os.environ.get("BIND_HOST", "127.0.0.1")
 KEY = os.environ.get("MINTER_KEY", "")
 POOL_TARGET = int(os.environ.get("POOL_TARGET", "4"))
 TTL_S = float(os.environ.get("TOKEN_TTL_S", "120"))   # 保守：CF 侧约 300s，站点校验按更短算
+
+# 只有这些绑定算"本机自用"，无 key 时放行
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def env_flag(raw: str) -> bool:
+    """环境变量字面值 → 布尔。**只认开启值**（大小写不敏感、允许空白）。
+
+    刻意采用白名单：`0` / `false` / `no` / `off` / 空串 / 任何拼错的值
+    一律判为关闭。因为这里是安全开关，**判错的代价不对称** ——
+    把关闭误判成开启会直接暴露铸造能力，反之只是让人多设一个 MINTER_KEY。
+    """
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+# 显式自担风险的开关（私有网络 / 已有外层 ACL 时用）。故意做得"必须显式"：
+# 默认不设 ⇒ 无 key + 非回环一律拒启动。
+ALLOW_INSECURE = env_flag(os.environ.get("MINTER_ALLOW_INSECURE", ""))
 
 _STATE = {
     "pool": [],            # [(token, minted_at)]
@@ -54,6 +77,30 @@ _STATE = {
 _MINT_LOCK = threading.Lock()
 _STATE_LOCK = threading.Lock()
 _WAKE = threading.Event()
+
+
+def bind_guard_error(bind_host: str, key: str, allow_insecure: bool = False) -> str | None:
+    """非回环绑定且无凭据 ⇒ 返回拒绝启动的原因；`None` 表示放行。
+
+    为什么是**拒绝启动**而不是打条告警：本服务的产物（Turnstile token）能直接过掉
+    上游的提交闸门，等同于"不限次数的免费提交额度"。容器形态下 `BIND_HOST=0.0.0.0`
+    ＋ `network_mode: host` ⇒ 0.0.0.0 就是**宿主公网地址**，匿名即可领 token
+    （一个 curl 就能把铸造池刷干，也把账号推到风控面前）。
+
+    姿态一致性：本项目其余入口都是 fail-closed —— `Settings.validate()` 直接拒绝启动、
+    `ARK_HOST` 必须显式设置、`AVM_TASK_STORE` 写错即抛错。这里曾经只 `print` 一行 warn
+    就照常服务，是**全项目唯一的 fail-open**，故按同一口径收口。
+    """
+    if key.strip() or bind_host.strip() in LOOPBACK_HOSTS or allow_insecure:
+        return None
+    return (
+        f"拒绝启动：BIND_HOST={bind_host!r} 是非回环地址，但 MINTER_KEY 未设置 ——\n"
+        "  任何能访问该端口的人都能**匿名领取 Turnstile token**，"
+        "等于把「过闸能力」分发出去（并让账号更快撞上风控）。\n"
+        "  出路一（推荐）：设 MINTER_KEY=<随机串>，调用方带 X-Minter-Key 头。\n"
+        "  出路二（仅私有网络 / 已有外层 ACL）：显式设 MINTER_ALLOW_INSECURE=1 自担风险。\n"
+        "  出路三（仅本机自用）：BIND_HOST=127.0.0.1（也是默认值）。"
+    )
 
 
 def _prune():
@@ -177,6 +224,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authed(self) -> bool:
+        # 空 KEY ⇒ 放行：**只在回环绑定或显式 MINTER_ALLOW_INSECURE 下可达**
+        # （非回环 + 无 key 的组合已被 bind_guard_error() 拦在启动之前）。
         if not KEY:
             return True
         return self.headers.get("X-Minter-Key") == KEY
@@ -208,13 +257,21 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    if not KEY:
-        print("[warn] MINTER_KEY 未设置 —— 只应监听回环，切勿暴露公网", flush=True)
+    err = bind_guard_error(BIND_HOST, KEY, ALLOW_INSECURE)
+    if err:
+        print(f"[fatal] {err}", file=sys.stderr, flush=True)
+        raise SystemExit(2)
+    if ALLOW_INSECURE and not KEY:
+        print("[warn] MINTER_ALLOW_INSECURE 已开启且未设 MINTER_KEY —— "
+              "请自行确保该端口不可从公网到达", flush=True)
+    elif not KEY:
+        print("[warn] MINTER_KEY 未设置 —— 仅回环绑定，切勿暴露公网", flush=True)
     threading.Thread(target=refill_loop, daemon=True).start()
     _WAKE.set()
     srv = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
     print(f"Turnstile 铸造服务已启动 http://{BIND_HOST}:{PORT}"
-          f"（池子目标 {POOL_TARGET}，TTL {TTL_S}s）", flush=True)
+          f"（池子目标 {POOL_TARGET}，TTL {TTL_S}s，鉴权={'开' if KEY else '关（仅回环）'}）",
+          flush=True)
     srv.serve_forever()
 
 

@@ -23,8 +23,8 @@
 
 | 情形 | 是否计费 |
 |---|---|
-| `tier=turbo` 且 `duration ≤ 8s` | ❌ **免费** |
-| `tier=turbo` 且 `duration ≥ 9s` | ✅ 计费 |
+| `tier=turbo` 且 `duration ≤ 10s` | ❌ **免费** |
+| `tier=turbo` 且 `duration ≥ 11s` | ✅ 计费 |
 | `tier=base`（任何时长） | ✅ 计费 |
 
 判据只有一个：任务记录里的 **`paid`** 字段。
@@ -59,7 +59,7 @@ aivideomaker/
 │       ├── submit-queue.mjs           提交队列（并发闸门 + 延迟执行 + 退避重试）
 │       ├── tests/                     端到端测试（fixtures/ 内素材、archive/ 一次性探针）
 │       └── tools/                     check-session / session-diagnose / credit-report / collect-tasks / upload
-├── tests/                             Python 单测（220 项，零消耗、零外发）
+├── tests/                             Python 单测（300+ 项，零消耗、零外发）
 ├── docs/
 │   ├── web-reverse/
 │   │   ├── README.md                  调研笔记（接口形态、数据模型、待办）
@@ -144,7 +144,8 @@ r = client.content_generation.tasks.create(
 Seedance 2.5「全能参考」上限为**图 4 / 视频 1 / 音频 2**，超限条目会被截断并在响应的
 `unsupported` 中留痕。
 
-测试：`python3 -m unittest discover -s tests`（241 项，零消耗、零外发）。
+测试：`python3 -m unittest discover -s tests`（300+ 项，零消耗、零外发）。
+零外发可复验：`python3 tools/egress_audit.py`（有非回环出站即以非 0 退出）。
 完整说明见 [`src/ark_compat/README.md`](src/ark_compat/README.md)。
 
 ## 部署

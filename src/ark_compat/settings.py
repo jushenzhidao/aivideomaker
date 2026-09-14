@@ -105,7 +105,9 @@ class Settings:
     # AVM_NO_TRUST_ENV=1，否则请求会被代理走并拿到网关的 502。
     trust_env: bool = True
     # 号池上报周期（秒）：每 N 秒把**每个凭据**的余额 / 闸门状态作为 Logfire 指标
-    # 上报（只读探测）。0 = 关闭；Logfire 未装配时**不采样**（避免白打上游）。
+    # 上报（只读探测）。0 = 关闭。
+    # ⚠️ 采集与出口**解耦**：Logfire 未装配/出口不通时**照样采样**（否则出口坏掉的
+    #    那一刻反而彻底瞎掉），只是指标不可用。见 app.py 的 _account_reporter。
     account_report_seconds: int = 300
 
     # ---- 任务持久化 ----
@@ -131,10 +133,10 @@ class Settings:
             minter_key=(env.get("AVM_MINTER_KEY") or "").strip(),
             minter_timeout=float(env.get("AVM_MINTER_TIMEOUT") or 25),
             account_report_identity=_env_flag(env, "AVM_ACCOUNT_REPORT_IDENTITY"),
-            base_url=str(env.get("AVM_BASE_URL", DEFAULT_BASE_URL)).rstrip("/"),
+            base_url=str(env.get("AVM_BASE_URL") or DEFAULT_BASE_URL).rstrip("/"),
             gate_key=str(env.get("AVM_GATE_KEY", "")).strip(),
             # 服务名可用 AVM_SERVICE_NAME 临时覆盖，但默认值只有一个来源
-            service_name=str(env.get("AVM_SERVICE_NAME", SERVICE_NAME)).strip(),
+            service_name=str(env.get("AVM_SERVICE_NAME") or SERVICE_NAME).strip(),
             environment=str(env.get("AVM_ENVIRONMENT", "")).strip(),
             log_level=str(env.get("AVM_LOG_LEVEL", "INFO")).strip().upper(),
             # 任务持久化

@@ -40,7 +40,7 @@ python3 src/ark_server.py --port 8808
 ```
 [ark-compat] Ark SDK base_url : http://127.0.0.1:8808/api/v3
 [ark-compat] available lines  : web
-[ark-compat] billing          : web upstream: tier=base is always billed; tier=turbo is free up to 8s
+[ark-compat] billing          : web upstream: tier=base is always billed; tier=turbo is free up to 10s
 [ark-compat] upstream host    : https://aivideomaker.ai
 [ark-compat] gate             : sk-local
 ```
@@ -206,14 +206,14 @@ first/last frame`），混用时适配层直接 400，不再让上游拒绝。
 
 | 规则 |
 |---|
-| `tier=base` **一律计费**；`tier=turbo` 且 `duration ≤ 8s` **免费** |
+| `tier=base` **一律计费**；`tier=turbo` 且 `duration ≤ 10s` **免费** |
 
 判据只有一个：站点任务记录里的 **`paid`** 字段（`credits` 与它**反相** ——
 免费任务也记 `credits`，不要拿它判断）。
 
 响应里的 `effective.billed` 会预告是否计费，并附一句 `billing_note`。
-`extra_body.aivideomaker_prefer_free=true` 是省钱开关：把超过 8s 的**合法**时长
-主动拉回 8s（不只是越界时才生效）。
+`extra_body.aivideomaker_prefer_free=true` 是省钱开关：把超过 10s 的**合法**时长
+主动拉回 10s（不只是越界时才生效）。
 
 > 多素材请求要留意累加效应：参考素材本身可能带时长，
 > `duration:15` 这类请求**必然越过免费窗口**。
@@ -239,7 +239,7 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
   "dry_run": true, "upstream": "web",
   "effective": {"resolution": "480p", "duration": 5, "output_format": "mp4",
                 "billed": false, "tier": "turbo",
-                "billing_note": "web upstream: tier=base is always billed; tier=turbo is free up to 8s"}
+                "billing_note": "web upstream: tier=base is always billed; tier=turbo is free up to 10s"}
 }
 ```
 
@@ -302,14 +302,14 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
 
 | 指标 | 含义 |
 |---|---|
-| `avm.account.credits` | 剩余积分。**两线是同一个积分池**，所以 official 与 web 采到的是同一个数 |
+| `avm.account.credits` | 剩余积分（web 线账号的积分池） |
 | `avm.account.captcha_required` | 当前是否需要 Turnstile（`1`=需要）。它**按速率动态翻转**，只有时间序列才看得出"开多久会衰减" |
-| `avm.account.reachable` | 凭据是否可用（`0`=会话过期 / API Key 失效） |
+| `avm.account.reachable` | 凭据是否可用（`0`=会话过期 / 凭据失效） |
 
 - 标签只有：`upstream` / `account`（**凭据 sha256 前 16 位**）/ `source`
   （`process`=本进程持凭据，`passthrough`=调用方自带）/ `pid`。
   🔴 **凭据原文绝不进遥测** —— `tests/test_pool_metrics.py` 专门守这条，并做了变异测试。
-- **只读**：`credits.getCredits` / `GET /api/v1/account` / `model.needsCaptcha` ——
+- **只读**：`credits.getCredits` / `model.needsCaptcha` ——
   不创建任务、不计费（实测：连续采样期间余额不变）。
 - **采集与出口解耦**：Logfire 未装配或出口不通时**照样采样**，只是指标不可用
   （启动日志会写明"仅本地日志"，`/healthz.accounts_tracked` 仍给号池规模）。
@@ -334,7 +334,7 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests      # 220 项，零消耗、零外发
+python3 -m unittest discover -s tests      # 300+ 项，零消耗、零外发
 ```
 
 三条纪律：
@@ -344,7 +344,13 @@ python3 -m unittest discover -s tests      # 220 项，零消耗、零外发
 2. **零外发** —— 上游 `base_url` 指向没人监听的本地端口，且客户端 `trust_env=False`
    （httpx 默认会把回环地址也交给系统代理，那会让"死端口"验证失效）；web 线的测试
    全部用 `httpx.MockTransport` 做站点替身；Logfire 用 `send_to_logfire=False`。
-   （已用 `socket.socket.connect` 审计全量运行：非回环 TCP 出站为 **0**。）
+   🔴 **"死端口"只覆盖 `base_url` 那条路径**：媒体转存走的是 `httpx.get(绝对 URL)`，
+   **不受 `base_url` 约束**，会真的去公网下载。2026-09-14 复跑时抓到一次真实出站
+   （`220.181.116.10x:443`，来自 `upstreams._rehost` → `web_client.upload_file`）：
+   那个用例每次运行都向文档站 TOS 发请求 —— 既让这条纪律名不副实，也让用例依赖
+   外部 CDN 的可用性与延迟（下载超时上限 60s）。已修（素材 URL 改指死端口）。
+   并固化为**可执行的审计**：`python3 tools/egress_audit.py` —— 跑全量单测、拦下
+   所有非回环 TCP 并打印调用栈，有出站即退出码 1。当前实测非回环出站 **0 次**。
 3. **门禁要能被证伪** —— 关键门禁（截断、截断留痕、悬空占位符点名、`incompatible`
    拦截、枚举校验、trace 属性契约与凭证红线）都做过**变异证明**：逐条回退后测试确实变红。
 
@@ -353,27 +359,41 @@ python3 -m unittest discover -s tests      # 220 项，零消耗、零外发
 ```
 src/
 ├── ark_server.py            启动入口（uvicorn）
+├── asgi_app.py / gunicorn_conf.py ASGI 入口与 gunicorn 装配（多 worker 额度分摊）
 └── ark_compat/
     ├── __init__.py          包说明、版本、服务名（改名只改这里）
     ├── translate.py         纯函数翻译层（Ark ↔ 站点接口）+ 计费口径渲染
     ├── upstreams.py         上游统一接口 + 媒体转存 + 上游工厂
     ├── web_client.py        网页端客户端（tRPC / 上传 / SSE）
     ├── web_queue.py         并发闸门（信号量 + 终态释放）
+    ├── minter.py            铸造服务客户端（取 Turnstile token；多地址轮询/故障转移）
     ├── sniff.py             magic bytes 媒体嗅探 + 图片尺寸
     ├── store.py             任务持久化（SQLite 默认 / 显式内存开关）
-    ├── settings.py          环境变量配置
+    ├── settings.py          环境变量配置（唯一集中解析处）
     ├── observability.py     loguru + logfire 装配（可失败降级）
     ├── app.py               FastAPI 路由与 Ark 错误信封
     └── errors.py            ParamError / WebApiError / CaptchaRequiredError
-tests/
+tools/
+├── turnstile_service.py    铸造服务（常驻；非回环绑定 + 无 MINTER_KEY ⇒ 拒绝启动）
+├── turnstile_minter.py     铸造核心（Xvfb 有头 Chrome + CDP）
+└── egress_audit.py         零外发审计（跑全量单测 + 拦非回环 TCP，非 0 即有出站）
+tests/                       # 见下；`python3 -m unittest discover -s tests`
 ├── test_ark_compat.py       翻译层（时长吸附、计费口径、unsupported）、HTTP 层
 ├── test_web_upstream.py     web 上游（全部离线，MockTransport）
 ├── test_cookie_normalize.py Cookie 头规范化（含 JS↔Python 一致性）
-├── test_seedance25_omni.py  Seedance 2.5 全能参考（截断、专属字段、前置拒绝）
+├── test_free_window.py      免费窗口（常量 ↔ billing_note）
+├── test_docs_billing_sync.py 文档里的免费秒数必须跟着 FREE_MAX_DURATION 走
+├── test_seedance25_omni.py  Seedance 2.5 全能参考（截断、专属字段、前置拒绝；零外发）
 ├── test_trace_contract.py   trace 属性契约（内存 exporter 捞 span 断言 + 凭证红线）
 ├── test_passthrough_cookie.py 透传（多租户隔离、缓存淘汰、闸门互斥）
 ├── test_task_store.py       任务持久化（跨实例可读 = 重启不丢）
-├── test_env_template.py     .env 模板门禁（声明了却不被代码读取 → 判失败）
+├── test_env_template.py     .env 模板门禁（**双向**：声明 ↔ 生产代码读取）
+├── test_auto_concurrency.py 并发槽位按账号额度自动定（含多 worker 分摊）
+├── test_probe_retry.py      只读探测的超时与重试（写入绝不重试）
+├── test_pool_metrics.py     号池指标（凭据原文绝不进遥测，含变异测试）
+├── test_token_minter.py     铸造服务接线（取不到 token 就如实失败）
+├── test_minter_chrome_guard.py 铸造器 Chrome 生命周期守卫（绝不叠实例）
+├── test_minter_bind_guard.py 铸造服务绑定安全（非回环 + 无 key ⇒ 拒绝启动）
 └── test_ua_consistency.py   UA / 服务名一致性
 ```
 
