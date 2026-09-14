@@ -64,12 +64,21 @@ def http_json(url, timeout=15):
     return json.load(urllib.request.urlopen(url, timeout=timeout))
 
 
-def cdp_ok():
-    try:
-        http_json(f"http://127.0.0.1:{PORT}/json/version")
-        return True
-    except Exception:
-        return False
+def cdp_ok(port: int | None = None) -> bool:
+    """CDP 就绪探测：IPv4 与 IPv6 回环**都试**。
+
+    Chrome 的 DevTools 在端口被占时可能只绑到 [::1]（2026-09-14 宿主机实测：
+    新实例 bind IPv4 失败后落 IPv6），只探 127.0.0.1 会把活着的实例
+    误报成"CDP 起不来"。
+    """
+    p = PORT if port is None else port
+    for host in ("127.0.0.1", "[::1]"):
+        try:
+            http_json(f"http://{host}:{p}/json/version")
+            return True
+        except Exception:
+            continue
+    return False
 
 
 def chrome_bin() -> str:
@@ -107,26 +116,25 @@ def clear_profile_locks() -> list:
 
 
 def kill_all_chrome(force: bool = True) -> None:
-    """杀掉本机上所有残留 Chrome 实例（**包括没有 debug 端口参数的旧实例**）。
+    """杀掉**本项目**的残留 Chrome 实例，并等 CDP 端口真正释放。
 
-    ⚠️ 为什么必须做：2026-09-14 容器里实测踩到 —— 旧版代码的 Chrome（`--user-data-dir=/root/avm-chrome`，
-    8 小时前启动）没被 `pkill -f "remote-debugging-port=9222"` 杀掉（模式里带 `-f` 前缀时
-    pkill 会匹配不到自己的命令行、实际杀不干净），于是**两个实例同时在监听 9222**（一个 IPv4、
-    一个 IPv6）：`cdp_ok()` 连到旧实例 ⇒ 新页面永远开在旧进程里，渲染越拖越慢直到 45s TIMEOUT，
-    且每次失败后 `start_chrome` 又只杀掉新实例 ⇒ **新旧永远叠着跑**。
-    这里先按进程名通杀（`pkill -x chrome`/`google-chrome`/`chromium` 不含模式自身，一定匹配），
-    再补一枪 `remote-debugging-port=`（防换名/换路径的变体）。
+    只按**自己的特征**杀 —— profile 路径 + 调试端口，**绝不按进程名通杀**：
+    宿主机上用户自己的浏览器（macOS 进程名 "Google Chrome"）绝不能被误伤。
+    2026-09-14 宿主机实测：9222 上叠着两个旧调试实例（IPv4+IPv6 各一），
+    按端口 pkill 没杀干净 ⇒ 新实例落到 [::1] 而 cdp_ok 只探 127.0.0.1
+    ⇒ 误报"CDP 起不来"。按 profile 补杀是第二层覆盖；若端口仍被外来实例
+    占着，这里宁可报错也别带旧实例跑 —— 换 CDP_PORT 即可绕开。
     """
-    names = ["chrome", "google-chrome", "chromium", "chromium-browser"]
-    for n in names:
-        subprocess.run(["pkill", "-9", "-x", n], capture_output=True)
-    subprocess.run(["pkill", "-9", "-f", f"remote-debugging-port={PORT}"], capture_output=True)
+    for pat in (f"user-data-dir={PROFILE_DIR}", f"remote-debugging-port={PORT}"):
+        subprocess.run(["pkill", "-9", "-f", pat], capture_output=True)
     # 端口真正释放才算清干净（老的 /json/version 探活会连到将死的实例，必须轮询到空）
     for _ in range(30):
         if not cdp_ok():
             return
         time.sleep(0.2)
-    raise SystemExit("Chrome 清理不干净（9222 一直被占）")
+    raise SystemExit(
+        f"Chrome 清理不干净（CDP 端口 {PORT} 一直被占）—— 换 CDP_PORT 可绕开外来实例"
+    )
 
 
 def start_chrome():

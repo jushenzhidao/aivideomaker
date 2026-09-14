@@ -7,7 +7,9 @@
 而每次失败后只杀掉新实例 ⇒ 新旧永远叠着跑。
 
 三条必须钉住：
-1. **按进程名通杀**（`pkill -x chrome` 等，模式不含自身 ⇒ 一定匹配），再补杀按端口；
+1. **只按自己的特征杀**（profile 路径 + 调试端口），**绝不按进程名通杀** —— 宿主机上
+   用户自己的浏览器（macOS 进程名 "Google Chrome"）绝不能被误伤（2026-09-14 宿主机实测：
+   进程名通杀在 macOS 匹配不到、按端口又杀不干净 ⇒ 新实例落 [::1] 被误报"起不来"）；
 2. 杀完必须等 **9222 真正释放**才放行（老探活会连到将死实例）；
 3. 释放不了就报错（SystemExit），**绝不带着旧实例继续跑**。
 
@@ -48,15 +50,22 @@ class TestKillAllChrome(unittest.TestCase):
         self.addCleanup(mock.patch.stopall)
         return runs
 
-    def test_kills_by_exact_name_then_by_port(self):
+    def test_kills_by_profile_then_by_port_never_by_name(self):
         runs = self._patch([False])
         M.kill_all_chrome()
-        plain = [c for c in runs if "-x" in c]
-        self.assertEqual(len(plain), 4, "必须按 4 个进程名逐个通杀")
-        names = {c[c.index("-x") + 1] for c in plain}
-        self.assertEqual(names, {"chrome", "google-chrome", "chromium", "chromium-browser"})
-        by_port = [c for c in runs if "remote-debugging-port" in " ".join(c)]
-        self.assertTrue(by_port, "必须再按端口补杀一次")
+        joined = [" ".join(c) for c in runs]
+        self.assertTrue(
+            any(f"user-data-dir={M.PROFILE_DIR}" in j for j in joined),
+            "必须按 profile 精准杀（覆盖所有本项目实例，不误伤用户浏览器）",
+        )
+        self.assertTrue(
+            any("remote-debugging-port" in j for j in joined),
+            "必须再按调试端口补杀（兜底 profile 路径变迁的旧实例）",
+        )
+        self.assertFalse(
+            any("-x " in j for j in joined),
+            "绝不按进程名通杀 —— macOS 上匹配不到 Google Chrome，Linux 容器外有误伤风险",
+        )
 
     def test_returns_promptly_when_port_freed(self):
         # 端口在轮询第 2 秒释放 ⇒ 正常返回（不拖满也不抛）
@@ -113,6 +122,27 @@ class TestModuleContract(unittest.TestCase):
                 cleared = M.clear_profile_locks()
             self.assertEqual(set(cleared), {"SingletonLock", "SingletonCookie"})
             self.assertFalse((Path(d) / "SingletonLock").exists())
+
+
+class TestCdpOkDualStack(unittest.TestCase):
+    """cdp_ok 必须 IPv4/IPv6 双栈探测 —— 新 Chrome 可能只绑 [::1]（2026-09-14 实测）。"""
+
+    def test_falls_back_to_ipv6(self):
+        calls = []
+
+        def fake_http_json(url, timeout=15):
+            calls.append(url)
+            if url.startswith("http://127.0.0.1"):
+                raise OSError("connection refused")
+            return {}
+
+        with mock.patch.object(M, "http_json", side_effect=fake_http_json):
+            self.assertTrue(M.cdp_ok())
+        self.assertTrue(any("[::1]" in u for u in calls), "IPv4 不通时必须试 IPv6")
+
+    def test_both_down_is_false(self):
+        with mock.patch.object(M, "http_json", side_effect=OSError("down")):
+            self.assertFalse(M.cdp_ok())
 
 
 if __name__ == "__main__":
