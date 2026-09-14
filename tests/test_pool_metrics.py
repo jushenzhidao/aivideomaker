@@ -60,7 +60,6 @@ def fp(secret: str) -> str:
 
 class FakeWebUp:
     kind = "web"
-    supports_cancel = False
 
     # 站点返回的订阅形状（billing.subscription，实测字段）：没有套餐名，只有 planId
     SUB = {

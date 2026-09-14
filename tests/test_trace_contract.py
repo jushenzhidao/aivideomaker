@@ -382,18 +382,6 @@ class TestSpanContract(unittest.TestCase):
         self.assertEqual(calls[0]["status"], "error")
         self.assertEqual(calls[0]["response"]["body"][0]["error"]["json"]["data"]["code"], "NOT_FOUND")
 
-    # ---- 取消 ----
-
-    def test_cancel_span_reports_the_truth_about_the_missing_endpoint(self):
-        tid = self.post_task()["id"]
-        j = self.client.delete(f"{TASKS_PATH}/{tid}", headers={"Authorization": f"Bearer {GATE}"}).json()
-        self.assertFalse(j["cancelled"])
-        attrs = self.attrs("ark.task.cancel")
-        self.assertEqual(attrs["upstream_task_id"], "t1")
-        self.assertEqual(attrs["ark_id"], tid)
-        self.assertFalse(attrs["cancelled"], "站点没有取消端点，绝不能上报已取消")
-        self.assertIn("no cancel endpoint", self.as_json(attrs["upstream_response"])["reason"])
-
     # ---- 凭证红线 ----
 
     def test_no_credential_ever_reaches_a_span(self):

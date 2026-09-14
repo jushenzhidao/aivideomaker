@@ -1,11 +1,10 @@
 """FastAPI 应用：把 aivideomaker 暴露成火山方舟 Seedance 协议。
 
-路由（与 Ark 原生一致）：
+路由（与 Ark 原生一致，**只保留创建 + 查询**）：
 
     POST   /api/v3/contents/generations/tasks          创建任务
     GET    /api/v3/contents/generations/tasks          列表（本进程内）
     GET    /api/v3/contents/generations/tasks/{id}     查询
-    DELETE /api/v3/contents/generations/tasks/{id}     取消/删除
     GET    /healthz                                    存活 + 上游体检
 
 把火山官方 SDK 的 base_url 指向本服务即可直接使用。
@@ -23,8 +22,18 @@
 **互斥** —— 同一个 Bearer 不可能既是闸门密钥又是上游凭据（`Settings.validate()`
 直接拒绝启动）。透传即多租户：任务表按**凭据指纹**隔离，见 `store.py` 的 `owner`。
 
+**任务查询的凭据绑定（E2E-AVM-011）**：透传的鉴权前置在 newapi —— 调用方
+（newapi 的任务轮询）**不再要求重带凭据**。创建任务时把当时的凭据绑定到这条
+任务上（task_id ↔ api-key，sqlite 的 `credential` 列），`GET /tasks/{id}`
+没带凭据就按绑定解析上游凭据；带了凭据则必须与任务归属一致（否则 404）。
+列表 `GET /tasks` 是**跨任务**的租户视图，仍然必须带凭据（否则 401）——
+不然没法界定"这是谁的列表"。凭据原文只落 sqlite（文件 0600），绝不进
+日志 / span / 响应体。
+
 四条安全约定：
-  1. 站点**没有取消端点** —— 删除只删本地记录，跑着的任务照跑照扣，绝不谎报"已取消"。
+  1. 站点**没有取消端点**，本服务也**不提供删除/取消** —— 对外接口面只有创建 +
+     查询；任务记录随保留窗口（7 天）自然淘汰。跑着的任务照跑照扣，这是上游事实，
+     不提供"已删除"的错觉入口。
   2. 计费有两个陷阱：`tier=base` 一律计费；`turbo` 只在 `duration ≤ 10s` 时免费
      （`translate.FREE_MAX_DURATION`；口径载体清单见 `tests/test_docs_billing_sync.py`）。
      判据是任务记录里的 `paid`（`credits` 与它反相，别用它判断）。
@@ -44,6 +53,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import threading
 import time
 import uuid
 import warnings
@@ -187,6 +197,62 @@ def _sweep(cache: dict, limit: int) -> None:
         _close_upstream(cache.pop(key))
 
 
+# Ark 归一化后的终态集合（translate._WEB_STATUS_TO_ARK 的值域子集）。
+# 终态视图**不可变**：站点的任务记录定格，视频地址与用量不会再变 —— 缓存到记录删除为止。
+_TERMINAL_ARK_STATUS = frozenset({"succeeded", "failed", "cancelled"})
+
+
+class TaskViewCache:
+    """`GET /tasks/{id}` 的上游视图缓存 —— **轮询节流，避免把上游打到 429**。
+
+    任务从提交到出片要 ~60s，而调用方（newapi 的任务轮询）可能每秒来一发：
+    每次都实时回上游取，查询请求就成了上游的主要负载来源（429 的常见成因）。
+    两条规则：
+
+      - **非终态**视图：TTL 秒内直接复用（任务要跑 ~60s，15s 的粒度不丢信息）；
+      - **终态**视图（succeeded/failed/cancelled）：**永久**复用 —— 记录已定格，
+        多查一次只是白挨限流的风险。
+
+    `ttl <= 0` = 显式关闭（每次都实时回上游，行为与旧版完全一致）。
+    只有**成功取到**的视图才进缓存（上游失败时的空壳不该被记住）。
+    """
+
+    def __init__(self, ttl: float, max_entries: int = 1024):
+        self.ttl = max(0.0, float(ttl))
+        self.max_entries = max(1, int(max_entries))
+        self._lock = threading.Lock()
+        # ark_id -> (view, expires_ms)；expires_ms=None 表示终态（不过期）
+        self._views: dict[str, tuple[dict, float | None]] = {}
+
+    def get(self, ark_id: str) -> dict | None:
+        if self.ttl <= 0:
+            return None
+        with self._lock:
+            hit = self._views.get(ark_id)
+            if hit is None:
+                return None
+            view, expires_ms = hit
+            if expires_ms is not None and time.time() * 1000 >= expires_ms:
+                del self._views[ark_id]
+                return None
+            return dict(view)
+
+    def put(self, ark_id: str, view: dict) -> None:
+        if self.ttl <= 0 or not view:
+            return
+        terminal = str((view or {}).get("status") or "") in _TERMINAL_ARK_STATUS
+        expires_ms = None if terminal else time.time() * 1000 + self.ttl * 1000
+        with self._lock:
+            if len(self._views) >= self.max_entries and ark_id not in self._views:
+                # 超限先扔非终态（随时可重取），还不够就扔最早插入的一条。
+                # 任务量是每小时几条，1024 的上限只是防无界增长的保险丝。
+                for k in [k for k, (_, exp) in self._views.items() if exp is not None]:
+                    del self._views[k]
+                if len(self._views) >= self.max_entries:
+                    del self._views[next(iter(self._views))]
+            self._views[ark_id] = (dict(view), expires_ms)
+
+
 def _passthrough_web_upstream(request: Request, cookie: str):
     """按调用方凭据取（或建）一个 web 上游：同一凭据复用同一客户端与并发闸门。"""
     cache: dict = request.app.state.passthrough_web
@@ -201,36 +267,44 @@ def _passthrough_web_upstream(request: Request, cookie: str):
     return upstream
 
 
-def _upstream_for(request: Request):
-    """取本次请求要用的 web 上游。
+def _passthrough_cookie_of(request: Request) -> str:
+    """透传模式：从 Bearer 解出**规范化后**的会话 cookie。不合格式直接 401。"""
+    raw = _bearer(request)
+    if not raw:
+        raise ArkError(
+            401,
+            "AuthenticationError",
+            "passthrough mode requires a bearer token (your aivideomaker session cookie)",
+        )
+    # 裸 token 在透传里是**推荐形态**，所以这里不弹"你可能贴错了"的告警：
+    # 那条告警的读者是配 AVM_COOKIE 的人（见 ark_compat/cookie.py 的取舍）。
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        cookie = normalize_cookie_header(raw)
+    if f"{AUTH_COOKIE_NAME}=" not in cookie:
+        raise ArkError(
+            401,
+            "AuthenticationError",
+            f"凭据里没有 {AUTH_COOKIE_NAME} —— 透传请把网页会话 cookie 放在 "
+            f"Authorization: Bearer 里（裸 token 或完整 Cookie 串都行）",
+        )
+    return cookie
+
+
+def _upstream_and_credential_for(request: Request):
+    """取本次请求要用的 web 上游，以及**本次请求的凭据原文**。
 
     - **透传模式**（`AVM_PASSTHROUGH_COOKIE=1`）：调用方的 Bearer 就是网页会话 cookie，
       按凭据指纹建/复用客户端 —— 每个调用方用自己的账号与免费窗口。
-    - 否则用本进程持有的那份（`AVM_COOKIE`）。
+      返回 `(upstream, cookie)`；cookie 只用于创建时的凭据绑定（见 create_task）。
+    - 否则用本进程持有的那份（`AVM_COOKIE`），返回 `(upstream, "")` ——
+      凭据在 env 里，不需要（也不应该）再往任务表里写一份。
     """
     settings = request.app.state.settings
 
     if settings.passthrough_cookie:
-        raw = _bearer(request)
-        if not raw:
-            raise ArkError(
-                401,
-                "AuthenticationError",
-                "passthrough mode requires a bearer token (your aivideomaker session cookie)",
-            )
-        # 裸 token 在透传里是**推荐形态**，所以这里不弹"你可能贴错了"的告警：
-        # 那条告警的读者是配 AVM_COOKIE 的人（见 ark_compat/cookie.py 的取舍）。
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            cookie = normalize_cookie_header(raw)
-        if f"{AUTH_COOKIE_NAME}=" not in cookie:
-            raise ArkError(
-                401,
-                "AuthenticationError",
-                f"凭据里没有 {AUTH_COOKIE_NAME} —— 透传请把网页会话 cookie 放在 "
-                f"Authorization: Bearer 里（裸 token 或完整 Cookie 串都行）",
-            )
-        return _passthrough_web_upstream(request, cookie)
+        cookie = _passthrough_cookie_of(request)
+        return _passthrough_web_upstream(request, cookie), cookie
 
     pool: dict = request.app.state.upstreams
     if "web" not in pool:
@@ -240,7 +314,40 @@ def _upstream_for(request: Request):
             "web upstream is not configured in this process (needs AVM_COOKIE); "
             f"available: {sorted(pool)}",
         )
-    return pool["web"]
+    return pool["web"], ""
+
+
+def _upstream_for(request: Request):
+    """取本次请求要用的 web 上游（不需要凭据原文的调用方用这个薄壳）。"""
+    return _upstream_and_credential_for(request)[0]
+
+
+def _upstream_for_task(request: Request, entry: dict):
+    """按**这条任务**取上游 —— 任务查询的凭据绑定（E2E-AVM-011）。
+
+    透传模式下轮询 `GET /tasks/{id}` 的调用方（newapi 的任务轮询）**不再要求
+    重带凭据**：用创建任务时绑定到这条任务上的那份（sqlite `credential` 列）。
+    调用方带了凭据则按它解析 —— 归属一致性已由 `_visible` 挡在前面（404）。
+    非透传模式无所谓绑定：进程内只有一份凭据。
+    """
+    settings = request.app.state.settings
+    if not settings.passthrough_cookie:
+        return _upstream_for(request)
+
+    if _bearer(request):
+        return _passthrough_web_upstream(request, _passthrough_cookie_of(request))
+
+    credential = request.app.state.tasks.credential_for(entry["id"])
+    if not credential:
+        # 两种可能：任务创建于绑定机制上线之前；或非透传时期留下的记录。
+        # 如实说清，别让它看起来像"任务不存在"。
+        raise ArkError(
+            401,
+            "AuthenticationError",
+            "该任务没有绑定凭据（旧版本创建），且本次请求未带凭据 —— "
+            "请带上创建任务时的 Authorization: Bearer 重试",
+        )
+    return _passthrough_web_upstream(request, credential)
 
 
 async def _json_body(request: Request) -> dict:
@@ -482,10 +589,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.info("任务表已清理过期记录 {} 条", purged)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"清理过期任务失败（不影响启动）：{e}")
+    # 查询节流缓存：挡调用方的高频轮询，别把上游打到 429（ttl<=0 = 关闭）
+    app.state.task_cache = TaskViewCache(settings.task_cache_ttl)
     logger.info(
-        "上游就绪 available={} task_store={}",
+        "上游就绪 available={} task_store={} task_cache_ttl={}s",
         sorted(app.state.upstreams),
         app.state.tasks.describe(),
+        settings.task_cache_ttl,
     )
 
     if logfire_ok:
@@ -551,9 +661,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "upstream": "web",
             "available_upstreams": kinds,
             "billing_notes": {k: billing_note() for k in kinds},
-            "supports_cancel": {
-                k: bool(getattr(pool.get(k), "supports_cancel", False)) for k in kinds
-            },
             "base_url": s.base_url,
             "gate": "required" if s.gate_key else "open",
             "passthrough_cookie": s.passthrough_cookie,
@@ -564,6 +671,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "tasks_tracked": request.app.state.tasks.count(),
             # 一眼看出任务表是否真的在持久化（kind=sqlite 才跨重启可读）
             "task_store": request.app.state.tasks.describe(),
+            # 查询节流：0 = 关闭（每次实时回上游）
+            "task_cache_ttl": s.task_cache_ttl,
             # ⚠️ 两个信号必须**分开**报（2026-09-14 报告 AVM12-OPEN-LOGFIRE 实测发现）：
             #   `logfire`          = SDK 装配成功（span 会生成，但可能一条都不外发）
             #   `logfire_exporting`= 数据**真的**在往外发（需要 token，或显式强制发送）
@@ -602,7 +711,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         body = await _json_body(request)
         # 先解析上游：透传模式下这一步同时完成鉴权 —— 未授权的请求
         # 不该先拿到"参数不合法"这种更像配置问题的错误。
-        upstream = _upstream_for(request)
+        upstream, credential = _upstream_and_credential_for(request)
 
         plan = translate_create(body)
         eff, warns = billing_view(plan)
@@ -693,7 +802,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "unsupported": plan["unsupported"],
             "createdAtMs": int(time.time() * 1000),
         }
-        request.app.state.tasks.put(entry)
+        # 凭据绑定（E2E-AVM-011）：task_id ↔ api-key（透传下即 newapi 传来的会话凭据）。
+        # 之后 GET/DELETE /tasks/{id} 不带凭据也按这条绑定解析上游凭据 —— 轮询方
+        # 不必再持 cookie。原文只进 sqlite（0600），绝不进日志 / span / 响应体。
+        request.app.state.tasks.put(entry, credential=credential)
         logger.info(
             "已提交 ark_id={} upstream={} upstream_task={} billed={}",
             entry["id"],
@@ -710,6 +822,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         page_size: int = 20,
         _: str = Depends(require_bearer),
     ):
+        # 列表是**跨任务**的租户视图：透传下没凭据就没法界定"这是谁的列表"，
+        # 也不能退化成"返回所有人的任务"（会把 B 的 prompt 泄给 A）—— 必须 401。
+        # 单条查询不同：它有凭据绑定兜底，见 _upstream_for_task。
+        if request.app.state.settings.passthrough_cookie and not _bearer(request):
+            raise ArkError(
+                401,
+                "AuthenticationError",
+                "passthrough mode requires a bearer token to scope the task list "
+                "(tasks are isolated per credential)",
+            )
         page_size = max(1, min(100, page_size))
         page_num = max(1, page_num)
         store = request.app.state.tasks
@@ -717,7 +839,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         owner = _owner_of(request) or None
         # 分页下推到存储层：sqlite 后端只取当前页，不必把整表读进内存
         window = store.list_recent(page_size, (page_num - 1) * page_size, owner)
-        items = [await _task_view(request, e) for e in window]
+        upstream = _upstream_for(request)
+        items = [await _task_view(request, e, upstream) for e in window]
         # 说明：本服务只知道自己创建过的任务；上游的列表按会话维度，未在此合并。
         return {
             "items": items,
@@ -731,69 +854,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         entry = request.app.state.tasks.get(task_id)
         if not _visible(request, entry):
             raise ArkError(404, "TaskNotFound", f"task {task_id} not found")
-        return await _task_view(request, entry)
+        # 透传下调用方可以不带凭据 —— 按创建时绑定的凭据回上游取（E2E-AVM-011）
+        return await _task_view(request, entry, _upstream_for_task(request, entry))
 
-    @app.delete(TASKS_PATH + "/{task_id}")
-    async def delete_task(task_id: str, request: Request, _: str = Depends(require_bearer)):
-        entry = request.app.state.tasks.get(task_id)
-        if not _visible(request, entry):
-            raise ArkError(404, "TaskNotFound", f"task {task_id} not found")
-        request.app.state.tasks.delete(task_id)
-        upstream = _upstream_for(request)
-        # 取消失败（web 线根本没有取消端点）时，上游原文是唯一的证据 —— 所以错误
-        # 分支留在 span 内部处理，而不是把异常抛出去让 span 只剩一个空壳。
-        with upstream_exchanges() as calls, span(
-            "ark.task.cancel",
-            upstream=upstream.kind,
-            ark_id=entry["id"],
-            upstream_task_id=entry["taskId"],
-        ) as sp:
-            try:
-                result = await asyncio.to_thread(upstream.cancel_task, entry["taskId"])
-            except WebApiError as e:
-                # 记录已删，但不能谎报"已取消"
-                sp.set_attribute("cancelled", False)
-                sp.set_attribute("error", describe_error(e))
-                set_upstream_calls(sp, calls)
-                logger.warning("取消失败 upstream_task={} — {}", entry["taskId"], e)
-                return {"cancelled": False, "task_id": entry["taskId"], "reason": str(e)}
-            sp.set_attribute("cancelled", bool(result.get("cancelled")))
-            sp.set_attribute("upstream_response", result)
-            set_upstream_calls(sp, calls)
-        if result.get("cancelled"):
-            logger.info("已取消并全额退积分 upstream_task={}", entry["taskId"])
+    # ⚠️ 刻意**没有** DELETE /tasks/{id}（2026-09-15 定）：上游没有取消端点，
+    # "删本地记录"只会制造"任务没了"的错觉（跑着的照跑照扣）。对外接口面
+    # 只有创建 + 查询；记录随保留窗口自然淘汰。
+
+    async def _task_view(request: Request, entry: dict, upstream) -> dict:
+        # 先看节流缓存：非终态 TTL 内复用、终态永久复用 —— 轮询的请求量不能
+        # 原样打到上游（429 的主要来源，任务出片要 ~60s）。
+        view = request.app.state.task_cache.get(entry["id"])
+        cached = view is not None
+        if cached:
+            # 命中缓存：没有上游调用可记，但 span 契约属性（status/paid）照样给 ——
+            # 对账口径不因缓存出现空洞；cached=True 说明这次没打上游。
+            with span(
+                "ark.task.fetch",
+                upstream=upstream.kind,
+                ark_id=entry["id"],
+                upstream_task_id=entry["taskId"],
+                cached=True,
+                status=(view or {}).get("status") or "",
+                paid=bool(((view or {}).get("usage") or {}).get("paid")),
+                upstream_response=view or {},
+            ):
+                pass
         else:
-            logger.warning(
-                "仅删除记录，未真正取消 upstream_task={} — {}", entry["taskId"], result.get("reason")
-            )
-        return result
-
-    async def _task_view(request: Request, entry: dict) -> dict:
-        upstream = _upstream_for(request)
-        with upstream_exchanges() as calls:
-            try:
-                with span(
-                    "ark.task.fetch",
-                    upstream=upstream.kind,
-                    ark_id=entry["id"],
-                    upstream_task_id=entry["taskId"],
-                ) as sp:
-                    # 上游层返回的已经是归一化好的 Ark 任务对象
-                    try:
-                        view = await asyncio.to_thread(upstream.get_task, entry["taskId"])
-                    except WebApiError as e:
-                        sp.set_attribute("error", describe_error(e))
+            with upstream_exchanges() as calls:
+                try:
+                    with span(
+                        "ark.task.fetch",
+                        upstream=upstream.kind,
+                        ark_id=entry["id"],
+                        upstream_task_id=entry["taskId"],
+                        cached=False,
+                    ) as sp:
+                        # 上游层返回的已经是归一化好的 Ark 任务对象
+                        try:
+                            view = await asyncio.to_thread(upstream.get_task, entry["taskId"])
+                        except WebApiError as e:
+                            sp.set_attribute("error", describe_error(e))
+                            set_upstream_calls(sp, calls)
+                            raise
+                        # 终态与**实际计费结果**必须进 trace —— 出片后对账就靠这两项
+                        sp.set_attribute("status", (view or {}).get("status") or "")
+                        sp.set_attribute("paid", bool(((view or {}).get("usage") or {}).get("paid")))
+                        # 归一化后的任务对象（出片地址、用量、resolution 回填都在这里）
+                        sp.set_attribute("upstream_response", view or {})
                         set_upstream_calls(sp, calls)
-                        raise
-                    # 终态与**实际计费结果**必须进 trace —— 出片后对账就靠这两项
-                    sp.set_attribute("status", (view or {}).get("status") or "")
-                    sp.set_attribute("paid", bool(((view or {}).get("usage") or {}).get("paid")))
-                    # 归一化后的任务对象（出片地址、用量、resolution 回填都在这里）
-                    sp.set_attribute("upstream_response", view or {})
-                    set_upstream_calls(sp, calls)
-            except WebApiError as e:
-                logger.warning("查任务失败 upstream_task={} — {}", entry["taskId"], e)
-                view = {}
+                        # 只有**成功取到**的视图才进缓存（上游失败的空壳不该被记住）
+                        request.app.state.task_cache.put(entry["id"], view or {})
+                except WebApiError as e:
+                    logger.warning("查任务失败 upstream_task={} — {}", entry["taskId"], e)
+                    view = {}
         view = dict(view or {})
         view["id"] = entry["id"]
         # `model` = **调用方请求的**模型（覆盖掉上游记录里的同名值）

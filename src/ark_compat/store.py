@@ -12,6 +12,13 @@
 所以每条记录带一个 `owner`，其值是**凭据的 sha256 前 16 位**（`app._owner_of`），
 **绝不落凭据原文**。非透传模式 `owner` 为空串且查询不做归属过滤（进程内只有一份凭据）。
 
+**凭据绑定（credential 列，E2E-AVM-011）**：透传下轮询 `GET /tasks/{id}` 的调用方
+（newapi 的任务轮询）**不会再带凭据** —— 所以创建任务时把当时的凭据原文绑定到这条
+任务上（task_id ↔ api-key），查询侧按绑定解析上游凭据。这是一处**刻意知情**的取舍：
+sqlite 里从此有会话凭据（等价于 newapi 渠道 key 已落库这件事），换来的免凭据轮询。
+防线相应调整：文件权限 0600、凭据**绝不**进日志/span/响应体、删除任务时随行删除；
+`owner` 指纹仍照旧（两者用途不同：owner 管租户隔离，credential 管上游解析）。
+
 后端（`AVM_TASK_STORE`）：
 
 ===========  ================================================================
@@ -41,6 +48,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     upstream   TEXT NOT NULL,
     model      TEXT NOT NULL DEFAULT '',
     owner      TEXT NOT NULL DEFAULT '',
+    credential TEXT NOT NULL DEFAULT '',
     created_ms INTEGER NOT NULL,
     entry      TEXT NOT NULL
 );
@@ -70,11 +78,18 @@ class MemoryTaskStore:
     def __init__(self, path: str = "") -> None:
         self.path = ":memory:"
         self._rows: dict[str, dict] = {}
+        self._credentials: dict[str, str] = {}
         self._lock = threading.Lock()
 
-    def put(self, entry: dict) -> None:
+    def put(self, entry: dict, credential: str = "") -> None:
         with self._lock:
             self._rows[entry["id"]] = dict(entry)
+            self._credentials[entry["id"]] = str(credential or "")
+
+    def credential_for(self, ark_id: str) -> str:
+        """这条任务创建时绑定的凭据（task_id ↔ api-key）。没有绑定返回空串。"""
+        with self._lock:
+            return self._credentials.get(ark_id, "")
 
     def get(self, ark_id: str) -> dict | None:
         with self._lock:
@@ -84,6 +99,8 @@ class MemoryTaskStore:
     def delete(self, ark_id: str) -> dict | None:
         with self._lock:
             row = self._rows.pop(ark_id, None)
+            # 绑定的凭据随记录一起消失：记录没了，"用哪份凭据查上游"也就无意义
+            self._credentials.pop(ark_id, None)
             return dict(row) if row else None
 
     def list_recent(self, limit: int, offset: int = 0, owner: str | None = None) -> list[dict]:
@@ -102,6 +119,8 @@ class MemoryTaskStore:
             dead = [k for k, v in self._rows.items() if (v.get("createdAtMs") or 0) < cutoff]
             for k in dead:
                 del self._rows[k]
+                # 过期记录连同绑定的凭据一起清掉 —— 保留窗口的语义对两者一致
+                self._credentials.pop(k, None)
             return len(dead)
 
     def describe(self) -> dict:
@@ -129,7 +148,17 @@ class SqliteTaskStore:
                 # 在透传模式下查不到它们；这比"替它们猜一个归属"安全，而保留窗口
                 # 只有 7 天，很快自然淘汰。
                 conn.execute("ALTER TABLE tasks ADD COLUMN owner TEXT NOT NULL DEFAULT ''")
+            if "credential" not in cols:
+                # 同样就地升级（E2E-AVM-011 凭据绑定）。老行 credential 为空 ⇒ 免凭据
+                # 轮询会拿到明确的 401 提示，而不是被静默当成"任务不存在"。
+                conn.execute("ALTER TABLE tasks ADD COLUMN credential TEXT NOT NULL DEFAULT ''")
             conn.execute(OWNER_INDEX)
+        # 这份库从此存有会话凭据（credential 列）⇒ 权限收到 0600。尽力而为：
+        # 某些文件系统（如 Windows FAT）不支持时静默放过，不影响服务。
+        try:
+            Path(self.path).chmod(0o600)
+        except OSError:
+            pass
 
     # ---- plumbing ----------------------------------------------------------
 
@@ -157,22 +186,33 @@ class SqliteTaskStore:
 
     # ---- api ---------------------------------------------------------------
 
-    def put(self, entry: dict) -> None:
+    def put(self, entry: dict, credential: str = "") -> None:
         with self._session() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO tasks"
-                " (id, task_id, upstream, model, owner, created_ms, entry)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " (id, task_id, upstream, model, owner, credential, created_ms, entry)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     entry["id"],
                     entry.get("taskId") or "",
                     entry.get("upstream") or "",
                     entry.get("model") or "",
                     entry.get("owner") or "",
+                    # 凭据绑定（task_id ↔ api-key）：**独立列**，绝不写进 entry JSON ——
+                    # entry 会被读出来参与组装响应，列则只被 credential_for 读取
+                    str(credential or ""),
                     int(entry.get("createdAtMs") or 0),
                     json.dumps(entry, ensure_ascii=False),
                 ),
             )
+
+    def credential_for(self, ark_id: str) -> str:
+        """这条任务创建时绑定的凭据（task_id ↔ api-key）。没有绑定返回空串。"""
+        with self._session() as conn:
+            row = conn.execute(
+                "SELECT credential FROM tasks WHERE id = ?", (ark_id,)
+            ).fetchone()
+        return (row["credential"] if row else "") or ""
 
     def get(self, ark_id: str) -> dict | None:
         with self._session() as conn:

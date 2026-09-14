@@ -116,6 +116,11 @@ class Settings:
     task_store: str = "sqlite"
     task_db: str = DEFAULT_DB_PATH
     task_retention_days: int = DEFAULT_RETENTION_DAYS
+    # GET /tasks/{id} 的上游视图缓存 TTL（秒）：非终态 TTL 内复用、终态永久复用。
+    # 用途 = 轮询节流（E2E-AVM-011 配套）：任务出片要 ~60s，调用方高频轮询时在
+    # TTL 内直接回缓存，不打上游 —— 否则查询请求会变成 429 的主要来源。
+    # 0 = 显式关闭（每次实时回上游，行为与旧版一致）。
+    task_cache_ttl: float = 15.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -143,6 +148,7 @@ class Settings:
             task_store=str(env.get("AVM_TASK_STORE", "sqlite")).strip().lower() or "sqlite",
             task_db=str(env.get("AVM_TASK_DB", DEFAULT_DB_PATH)).strip() or DEFAULT_DB_PATH,
             task_retention_days=int(env.get("AVM_TASK_RETENTION_DAYS") or DEFAULT_RETENTION_DAYS),
+            task_cache_ttl=float(env.get("AVM_TASK_CACHE_TTL") or 15),
             # 可观测性
             enable_logfire=not _env_flag(env, "AVM_DISABLE_LOGFIRE"),
             logfire_send=_parse_send(env.get("AVM_LOGFIRE_SEND", "if-token-present")),

@@ -90,7 +90,6 @@ class FakeWebUpstream:
     """只实现 app.py 真正碰到的那几个成员。"""
 
     kind = "web"
-    supports_cancel = False
 
     def __init__(self, cookie: str, *, running: bool = False):
         self.cookie = cookie
@@ -104,9 +103,6 @@ class FakeWebUpstream:
 
     def get_task(self, task_id: str) -> dict:
         return {"status": "Success", "usage": {"paid": False}, "upstream_task_id": task_id}
-
-    def cancel_task(self, task_id: str) -> dict:
-        return {"cancelled": False, "task_id": task_id, "reason": "web 线没有取消端点"}
 
     def health(self) -> dict:
         return {"upstream": "web", "ok": True}
@@ -240,7 +236,7 @@ class TestHealthzHidesNothing(PassthroughHttpCase):
         self.assertTrue(j["passthrough_cookie"])
         self.assertTrue(j["credentials_from_caller"])
         self.assertIn("billing_notes", j)
-        self.assertIn("web", j["supports_cancel"])
+        self.assertNotIn("supports_cancel", j, "2026-09-15 接口面收窄：取消/删除已整体移除")
         # 已移除的官方线不该在健康检查里留下任何字段
         for gone in ("switch_via", "max_credits", "default_model", "passthrough_key"):
             self.assertNotIn(gone, j, f"{gone} 属于已移除的 official 线，不该再出现")
@@ -272,12 +268,6 @@ class TestTenantIsolation(PassthroughHttpCase):
         self.assertEqual(r.status_code, 404)
         self.assertEqual(r.json()["error"]["code"], "TaskNotFound")
 
-    def test_other_credential_cannot_delete_it_and_it_stays(self):
-        ark_id = self._create(TOKEN_A)
-        r = self.client.delete(f"{TASKS_PATH}/{ark_id}", headers=auth(TOKEN_B))
-        self.assertEqual(r.status_code, 404)
-        self.assertIsNotNone(self.app.state.tasks.get(ark_id), "别人的删除不该删掉任务")
-
     def test_list_only_shows_my_own_tasks(self):
         mine = self._create(TOKEN_A)
         theirs = self._create(TOKEN_B)
@@ -291,6 +281,22 @@ class TestTenantIsolation(PassthroughHttpCase):
         self.assertNotIn(mine, [i["id"] for i in b["items"]])
         self.assertEqual(a["total"], 1)
         self.assertEqual(b["total"], 1)
+
+
+class TestDeleteEndpointGone(PassthroughHttpCase):
+    """2026-09-15 接口面收窄为创建+查询：DELETE 整体移除（405）。
+
+    独立成类：PassthroughHttpCase 的 setUpClass **按子类**各建一份 app，
+    这里不污染 TestTenantIsolation 里对 total 的精确断言。
+    """
+
+    def test_delete_is_gone_even_for_the_owner(self):
+        r = self.client.post(TASKS_PATH, json=body(), headers=auth(TOKEN_A))
+        self.assertEqual(r.status_code, 200, r.text)
+        ark_id = r.json()["id"]
+        r = self.client.delete(f"{TASKS_PATH}/{ark_id}", headers=auth(TOKEN_A))
+        self.assertEqual(r.status_code, 405)
+        self.assertIsNotNone(self.app.state.tasks.get(ark_id), "路由没了，记录也不该被动过")
 
 
 class TestEviction(unittest.TestCase):

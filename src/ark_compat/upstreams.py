@@ -7,14 +7,16 @@
 
     create(plan) -> taskId       提交（**唯一会产生费用的动作**）
     get_task(taskId) -> dict     读任务，**已归一化成 Ark 任务对象**
-    cancel_task(taskId) -> dict  取消 / 删除
     balance() -> int | None      余额
     health() -> dict             /healthz 用
+
+（**没有** cancel/delete：站点没有取消端点，"删本地记录"只会制造任务已消失的
+错觉 —— 对外接口面刻意只有创建 + 查询，记录随保留窗口自然淘汰。）
 
 计费语义（见 `translate.billing_view`）：
 
 ==========  ==========================================================
-`web`       `tier=base` 一律计费；`tier=turbo` 且 ≤10s **免费**；无取消端点；并发上限**按套餐**（premium 2 / pro 4）
+`web`       `tier=base` 一律计费；`tier=turbo` 且 ≤10s **免费**；并发上限**按套餐**（premium 2 / pro 4）
 ==========  ==========================================================
 """
 
@@ -47,10 +49,9 @@ def _decode_data_uri(value: str) -> dict | None:
 
 
 class WebUpstream:
-    """网页端内部接口（会话 cookie）。有免费窗口，但没有取消端点。"""
+    """网页端内部接口（会话 cookie）。有免费窗口；没有取消端点，也不提供删除。"""
 
     kind = "web"
-    supports_cancel = False
 
     def __init__(self, client: WebClient, queue: WebSubmitQueue):
         self.client = client
@@ -93,19 +94,6 @@ class WebUpstream:
 
     def get_task(self, task_id: str) -> dict:
         return normalize_web_task(self.client.get_task(task_id))
-
-    def cancel_task(self, task_id: str) -> dict:
-        # 站点**没有**取消端点。删记录 ≠ 取消生成：跑着的任务照跑照扣。
-        # 所以这里如实返回 cancelled=false，绝不谎报。
-        self.client.delete_tasks([task_id])
-        return {
-            "cancelled": False,
-            "task_id": task_id,
-            "reason": (
-                "aivideomaker exposes no cancel endpoint for this task type; "
-                "only the local record was deleted — a running task keeps running and keeps costing"
-            ),
-        }
 
     def balance(self) -> int | None:
         return self.client.get_credits()

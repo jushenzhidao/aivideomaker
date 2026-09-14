@@ -157,6 +157,9 @@ services:
       AVM_TASK_STORE: ${AVM_TASK_STORE:-sqlite}
       AVM_TASK_DB: /data/.ark-tasks.db
       AVM_TASK_RETENTION_DAYS: ${AVM_TASK_RETENTION_DAYS:-7}
+      # 查询节流：GET /tasks/{id} 的上游视图缓存 TTL（秒）；非终态 TTL 内复用、
+      # 终态永久复用。0 = 关闭。留空 = 代码默认 15s（`:-` 语义与其它可选项一致）。
+      AVM_TASK_CACHE_TTL: ${AVM_TASK_CACHE_TTL:-}
 
       # ---- 可观测性 ----
       LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}

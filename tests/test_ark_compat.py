@@ -286,9 +286,9 @@ class TestHttpLayer(unittest.TestCase):
         for gone in ("switch_via", "max_credits", "default_model", "passthrough_key", "supported_models"):
             self.assertNotIn(gone, j, f"{gone} 属于已移除的 official 线")
 
-    def test_supports_cancel_is_reported_honestly(self):
-        """站点没有取消端点 —— 健康检查必须如实说 false。"""
-        self.assertFalse(self.client.get("/healthz").json()["supports_cancel"]["web"])
+    def test_supports_cancel_field_is_gone(self):
+        """2026-09-15 接口面收窄为创建+查询：取消/删除整体移除，healthz 不再报。"""
+        self.assertNotIn("supports_cancel", self.client.get("/healthz").json())
 
     def test_request_id_is_echoed(self):
         r = self.client.get("/healthz", headers={"x-request-id": "rid-123"})

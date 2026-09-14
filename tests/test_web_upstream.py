@@ -330,11 +330,9 @@ class TestGetTask(unittest.TestCase):
         site.set("model.queryQueueByModel", {"queue": 0, "etaSeconds": 0})
         self.assertEqual(make_client(site).query_queue("t1")["queue"], 0)
 
-    def test_delete_only_removes_the_record(self):
-        site = FakeSite()
-        site.set("model.deleteModel", None)
-        make_client(site).delete_tasks(["t1"])
-        self.assertEqual(len(site.calls("model.deleteModel")), 1)
+    def test_delete_tasks_method_is_gone(self):
+        """2026-09-15 接口面收窄：客户端不再暴露站点删除（删除只会制造任务消失的错觉）。"""
+        self.assertFalse(hasattr(WebClient, "delete_tasks"))
 
 
 # -------------------------------------------------------------------- upload ----
@@ -382,7 +380,6 @@ class FakeWebClient:
         self.created: list[str] = []
         self.created_params: list[dict] = []
         self.uploaded: list = []
-        self.deleted: list[str] = []
 
     def create(self, params, token=None):
         with self._lock:
@@ -412,9 +409,6 @@ class FakeWebClient:
 
     def get_credits(self):
         return 796
-
-    def delete_tasks(self, ids):
-        self.deleted.extend(ids)
 
 
 class TestSubmitQueue(unittest.TestCase):
@@ -577,16 +571,14 @@ class TestWebAppLayer(unittest.TestCase):
         j = self.client.get("/healthz").json()
         self.assertEqual(j["upstream"], "web")  # 默认线
         self.assertEqual(j["available_upstreams"], ["web"])
-        self.assertFalse(j["supports_cancel"]["web"])
+        self.assertNotIn("supports_cancel", j, "2026-09-15 接口面收窄：取消/删除已整体移除")
         self.assertIn("submit_queue", j)
         self.assertNotIn("supported_models", j)
 
-    def test_delete_reports_that_it_did_not_cancel(self):
+    def test_delete_endpoint_is_gone(self):
         tid = self.client.post(TASKS_PATH, json=ark_body()).json()["id"]
-        j = self.client.delete(f"{TASKS_PATH}/{tid}").json()
-        self.assertFalse(j["cancelled"], "站点没有取消端点，绝不能谎报已取消")
-        self.assertIn("no cancel endpoint", j["reason"])
-        self.assertEqual(self.fake.deleted, ["t1"])
+        r = self.client.delete(f"{TASKS_PATH}/{tid}")
+        self.assertEqual(r.status_code, 405, "DELETE 路由已移除（接口面 = 创建 + 查询）")
 
     def test_task_view_is_normalized_to_the_ark_shape(self):
         tid = self.client.post(TASKS_PATH, json=ark_body()).json()["id"]
@@ -673,7 +665,7 @@ class TestWebOnlyUpstream(unittest.TestCase):
     def test_healthz_declares_only_the_web_line(self):
         j = self.client.get("/healthz").json()
         self.assertEqual(j["available_upstreams"], ["web"])
-        self.assertFalse(j["supports_cancel"]["web"], "web 线没有取消端点，不许谎报")
+        self.assertNotIn("supports_cancel", j, "2026-09-15 接口面收窄：取消/删除已整体移除")
         self.assertIn("free up to 10s", j["billing_notes"]["web"])
         # 已移除的官方线不该在健康检查里留下任何字段
         for gone in ("switch_via", "max_credits", "default_model", "passthrough_key"):

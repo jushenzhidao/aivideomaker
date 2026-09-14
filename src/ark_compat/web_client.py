@@ -21,7 +21,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import unquote
 
 import httpx
@@ -451,14 +451,6 @@ class WebClient:
 
     def query_queue(self, task_id: str) -> dict | None:
         return self.trpc("model.queryQueueByModel", {"id": task_id})
-
-    def delete_tasks(self, ids: str | Iterable[str]) -> Any:
-        """从历史里删除记录。
-
-        ⚠️ **只删记录，不能取消**。站点没有取消端点，跑着的任务照跑照扣。
-        """
-        seq = [ids] if isinstance(ids, str) else list(ids)
-        return self.trpc("model.deleteModel", {"ids": [str(i) for i in seq]}, method="POST")
 
     def mint_token(self, task_id: str) -> str:
         """换取状态流令牌（`expiresInSec` 约 300）。
