@@ -123,8 +123,8 @@ export AVM_GATE_KEY=sk-local           # 本机闸门（不设则对任何调用
 python3 src/ark_server.py --port 8808  # base_url: http://127.0.0.1:8808/api/v3
 ```
 
-> **多租户场景改用透传**：`export AVM_PASSTHROUGH_COOKIE=1`，调用方的
-> `Authorization: Bearer` 直接携带自己的网页会话 cookie，本进程不再需要 `AVM_COOKIE`；
+> **调用方自带凭据（透传）**：`export AVM_PASSTHROUGH_COOKIE=1`，调用方的
+> `Authorization: Bearer` 直接携带**账号的**网页会话 cookie，本进程不再需要 `AVM_COOKIE`；
 > 它与 `AVM_GATE_KEY` 互斥（同一个 Bearer 不可能既是闸门密钥又是上游凭据）。
 
 ```python
@@ -156,6 +156,11 @@ Seedance 2.5「全能参考」上限为**图 4 / 视频 1 / 音频 2**，超限�
 > 改写会被 CF 判机器人，`render()` 一律 46s 超时；host 网络实测 2.3~3.5s/个）。
 > macOS 只是开发机：Docker Desktop 的 host 网络仍经 VPNkit NAT，minter 请宿主直跑
 > 并把 `AVM_MINTER_URL` 指过去。
+>
+> **项目定位：账号级语义 —— 一个实例服务一个账号。** 凭据、并发额度、免费窗口、
+> 任务归属全部按账号隔离。多账号 = **部署多实例**（每实例一份 `AVM_COOKIE`，或调用方
+> 固定带同一账号的 cookie）+ new-api 轮询（每渠道填一个账号的 cookie）；账号很少时
+> 也可以单实例透传（`AVM_PASSTHROUGH_COOKIE=1`，每凭据仍是独立账号上下文、零串扰）。
 
 ```bash
 cp .env.example .env      # 填 AVM_COOKIE（.env 已被 gitignore）
