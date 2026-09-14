@@ -164,25 +164,28 @@ Seedance 2.5「全能参考」上限为**图 4 / 视频 1 / 音频 2**，超限�
 > 也可以单实例透传（`AVM_PASSTHROUGH_COOKIE=1`，每凭据仍是独立账号上下文、零串扰）。
 
 ```bash
-cp .env.example .env      # 填 AVM_COOKIE（.env 已被 gitignore）
-docker compose up -d      # 只起 ark-compat（宿主端口见 AVM_HOST_PORT，默认 8808）
+cp .env.example .env      # 填 AVM_COOKIE 与 AVM_MINTER_KEY（.env 已被 gitignore）
+docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_PORT，默认 8808）
 ```
 
-> **需要 Turnstile 铸造能力时**（闸门开启且调用方不带 token；吞吐 20 → ~120 条/小时）：
-> minter 与它的前置校验在 `minter` profile 里，**默认不起**。理由：它的产物（token）
-> 能直接过掉上游提交闸门，而它走 host 网络 ⇒ 8899 就是宿主端口；不用它的人既不必配凭据，
-> 也省掉一份常驻 Chrome 和一个 ~870MB 镜像。
+> 🔴 **铸造能力是默认开启的**（2026-09-14 定）：闸门开启时没 token 的提交吞吐约 20 条/小时，
+> 有铸造约 120 条/小时 —— 生产默认需要它，所以 `minter` 随 `up -d` 一起起。为此
+> ark-compat 侧的 `AVM_MINTER_URL` 用 `:-` 插值：.env 里**留空与未设同义**，回退到
+> `http://host.docker.internal:8899`（minter 走 host 网络 ⇒ 就监听在宿主 8899；Mac 上
+> 宿主直跑 minter 也是这个地址）。**别把留空理解成"关掉能力"**。
+>
+> **只要适配层、不要铸造**时：`docker compose up -d ark-compat`（少一份常驻 Chrome，
+> 也免掉下面的凭据要求）。
 >
 > ```bash
-> echo "AVM_MINTER_URL=http://host.docker.internal:8899" >> .env
-> echo "AVM_MINTER_KEY=$(openssl rand -hex 16)" >> .env
-> docker compose --profile minter up -d
+> echo "AVM_MINTER_KEY=$(openssl rand -hex 16)" >> .env    # 或手填任意随机串
 > ```
 >
-> ⚠️ 只把 profile 启起来还不够：**`AVM_MINTER_URL` 为空时适配层不会去取 token**
-> （模板里它默认留空 = 关掉这条能力），前置校验会就这点在日志里告警。
->
-> 🔴 **启用 minter profile 时必须给它一把凭据**（0.0.7 起它是 fail-closed 的）。
+> 🔴 **能力默认开 ⇒ `AVM_MINTER_KEY` 必设**（0.0.7 起 minter 是 fail-closed 的）。
+> minter 镜像内 `BIND_HOST=0.0.0.0`（非回环），未设 `AVM_MINTER_KEY` 时它**拒绝启动**
+> （退出码 2）—— 这是刻意的：它产出的 Turnstile token 等于"免额度过闸能力"，
+> 宁可起不来，也不匿名挂在公网端口上。两条出路：`AVM_MINTER_KEY=<随机串>`（推荐），
+> 或仅在私有网络 / 已有外层 ACL 时 `AVM_MINTER_ALLOW_INSECURE=1` 显式放行。
 > minter 镜像内 `BIND_HOST=0.0.0.0`（非回环），未设 `AVM_MINTER_KEY` 时它**拒绝启动**
 > （退出码 2）—— 这是刻意的：它产出的 Turnstile token 等于"免额度过闸能力"，
 > 宁可起不来，也不匿名挂在公网端口上。两条出路：`AVM_MINTER_KEY=<随机串>`（推荐），
