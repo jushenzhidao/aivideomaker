@@ -21,6 +21,7 @@ API（默认 127.0.0.1:8899）：
 """
 import json
 import os
+import random
 import sys
 import threading
 import time
@@ -132,6 +133,9 @@ def refill_loop():
             tok = CORE.mint()
             with _STATE_LOCK:
                 _STATE["pool"].append((tok, time.time()))
+            # 每次成功铸造之间随机喘息，避免形成"每 3.5 秒一个挑战"的机械流量。
+            time.sleep(2 + random.random() * 6)   # 2~8s 随机
+
         except (Exception, SystemExit) as e:  # noqa: BLE001
             # ⚠️ 必须连 SystemExit 一起接：`ensure()` 起不来 Chrome 时抛的是 SystemExit，
             # 它是 BaseException 的子类 —— 只 catch Exception 会让**补货线程静默死亡**，
@@ -139,7 +143,8 @@ def refill_loop():
             # 因为没有 xauth，xvfb-run 起不来）。线程死掉还查不到原因是最坏的情况。
             with _STATE_LOCK:
                 _STATE["last_error"] = f"{type(e).__name__}: {e}"[:200]
-            time.sleep(3)
+            # 抖动：失败后不要固定 3 秒重试（机械节奏是速率风控的强信号）。
+            time.sleep(8 + random.random() * 12)   # 8~20s 随机
 
 
 def health() -> dict:
