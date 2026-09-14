@@ -2,12 +2,13 @@
 """Turnstile token 铸造**服务**（常驻）—— 把 tools/turnstile_minter.py 包成 HTTP 服务。
 
 为什么需要"常驻 + 流水线"：
-  * 首次 render 有 **~46 秒冷启动** ⇒ 按需拉起必死，必须常驻预热；
+  * 冷 profile 的**首次** render 可能远超常规预算、甚至**永久卡死**（E2E-AVM-004：120s
+    冷预算也不出 token，疑似交互式挑战等人操作）⇒ 按需拉起必死，必须常驻预热；
   * token **单次有效**，且每条提交都要一个 ⇒ 需要"取一个、补一个"的流水线；
   * 调用方（适配层/其他服务）只想要"给我一个能用的 token"，不想关心 Chrome。
 
 API（默认 127.0.0.1:8899）：
-  GET  /healthz                     服务与浏览器状态、池子水位、铸造统计
+  GET  /healthz                     服务与浏览器状态、池子水位、铸造统计、最近一次失败分类
   POST /v1/turnstile/mint           取一个 token（优先取池子；池空则现铸）
                                     → {"token": "...", "source": "pool|live", "age_ms": 1200}
   POST /v1/turnstile/mint?n=4       取 n 个 → {"tokens": [...], "sources": [...]}
@@ -17,14 +18,14 @@ API（默认 127.0.0.1:8899）：
 本服务产出的 token 能直接过掉上游风控闸门，暴露到公网等于免费分发过闸能力。
 确需在私有网络内匿名运行时，显式设 `MINTER_ALLOW_INSECURE=1` 自担风险。
 
-降级：铸造失败一律返回 503 + 明确错误，调用方据此退回"等闸门衰减"的慢路径 ——
-      **绝不能让上游把"铸造失败"当成"闸门放行"**。
+降级：铸造失败一律返回 503 + 明确错误（含失败分类与页面内状态采样），
+调用方据此退回"等闸门衰减"的慢路径 —— **绝不能让上游把"铸造失败"当成"闸门放行"**。
 
 环境变量：PORT / BIND_HOST / MINTER_KEY / MINTER_ALLOW_INSECURE /
           POOL_TARGET / TOKEN_TTL_S / SITEKEY / LIGHT_URL / HEADLESS /
           CDP_PORT / CHROME_PROFILE / MINT_TIMEOUT_MS / COLD_MINT_TIMEOUT_MS
           （后两条是 render 预算，见 tools/turnstile_minter.py 的「render 超时预算」段：
-            首轮用 `COLD_*`，之后回落常规值 —— 全新 profile 首次 render 实测 ≈46s）
+            首轮用 `COLD_*`，之后回落常规值）
 """
 import json
 import os
@@ -71,10 +72,11 @@ _STATE = {
     "pool": [],            # [(token, minted_at)]
     "stats": {"minted": 0, "failed": 0, "served": 0, "spawned_at": time.time()},
     "last_error": None,
+    "last_failure": None,  # 最近一次铸造失败的分类证据 {"reason","why","state","at"}
     "ready": False,
     "browser": None,
 }
-# 两把锁**必须分开**：铸造一把（串行化 Chrome，可能持有数秒到 46 秒冷启动），
+# 两把锁**必须分开**：铸造一把（串行化 Chrome，可能持有数秒到两分钟冷预算），
 # 状态一把（毫秒级）。曾经共用一把 ⇒ `/healthz` 被正在进行的铸造阻塞、探活直接超时，
 # 那是最糟的组合：服务看着"挂了"，其实只是忙。
 _MINT_LOCK = threading.Lock()
@@ -111,16 +113,29 @@ def _prune():
     _STATE["pool"] = [p for p in _STATE["pool"] if now - p[1] < TTL_S]
 
 
+def backoff_delay(fail_streak: int) -> float:
+    """连续失败后的补货退避：8s 起步指数翻倍、封顶 300s，再叠 ±25% 抖动。
+
+    曾经固定 8~20s：冷 profile 卡死时，补货线程以 ~2.5 分钟一周期无限杀/重启 Chrome
+    （120s 卡死 + 退避 + 冷启动各来一遍），宿主侧持续制造进程抖动却永无产出
+    （E2E-AVM-004 实测形态，宿主当时已背着上千个 chrome 进程）。
+    指数退避让空转成本随连续失败收敛，同时保留"偶尔再试"（profile 可能被外部热化）。
+    """
+    base = min(300.0, 8.0 * (2 ** max(0, fail_streak - 1)))
+    return base * (0.75 + random.random() * 0.5)
+
+
 class MintCore:
     """持有 Chrome + 一个热页面；mint() 串行执行（并行无收益，见 minter 的实测注释）。"""
 
     def __init__(self):
         self.bc = None
         self.page = None
-        # ★ 本进程**第一次**铸造用**冷启动预算**：全新 profile 的首次 render 实测 ≈46 秒，
-        #   越过常规 45 秒线 ⇒「新部署的第一次铸造必然失败一次」，而 `/healthz` 早就报了
-        #   `ready=true`，看起来像"镜像坏了"（报告 AVM12-MINT，两次 46.01s TIMEOUT）。
-        #   只给首轮放宽：常态用常规预算，免得把一次**真卡死**的铸造从 45s 拉长到 120s。
+        # ★ 本进程**第一次**铸造用**冷启动预算**：冷 profile 的首铸可能远慢于常规线
+        #   甚至卡死（E2E-AVM-004）。只给首轮放宽：常态用常规预算，免得把一次真卡死
+        #   的铸造从 45s 拉长到 120s。
+        #   ⚠️ `warmed` 只在**真的铸出过** token 后置位 —— `/healthz` 早就 ready
+        #   而铸造一直超时的形态（报告 AVM12-MINT）正是靠它与 `ready` 分开表达。
         self.warmed = False
 
     def ensure(self):
@@ -140,17 +155,57 @@ class MintCore:
         with _STATE_LOCK:
             _STATE["ready"] = False
 
+    def reload_page(self) -> bool:
+        """轻量恢复：**保留 Chrome 进程**，只换一个干净的热页面。
+
+        为什么失败后不再整体 reset：CF 对"这个 profile 信誉如何"的判定落在 profile
+        （卷）上，杀 Chrome 重启**不会**重置那个判定，只会白付一次冷启动 —— E2E-AVM-004
+        里"失败 ⇒ reset ⇒ 杀/重启 Chrome ⇒ 再失败"以 ~2.5 分钟一周期无限空转，宿主侧
+        净赚进程抖动。失败的 mint 里 JS 都能跑到 TIMEOUT ⇒ CDP 与页面本身是活的，
+        换页重开挑战就够；reload 也失败（多半是 CDP 死了）才降级 reset()，
+        交给下次 ensure() 重启浏览器。
+        """
+        if self.bc is None:
+            return False
+        try:
+            if self.page:
+                try:
+                    self.bc.call("Target.closeTarget", targetId=self.page[0])
+                except Exception:
+                    pass
+            self.page = M.open_warm_page(self.bc)
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.reset()
+            with _STATE_LOCK:
+                _STATE["last_error"] = f"reload_page failed: {type(e).__name__}: {e}"[:200]
+            return False
+
     def mint(self) -> str:
         with _MINT_LOCK:
             self.ensure()
             budget = M.MINT_TIMEOUT_MS if self.warmed else M.COLD_MINT_TIMEOUT_MS
-            tok, dt = M.mint_on(self.bc, self.page[1], 0, timeout_ms=budget)
+            tok, _dt, val = M.mint_on(self.bc, self.page[1], 0, timeout_ms=budget)
             if not tok:
-                self.reset()
+                reason = M.failure_reason(val)
+                state = val.get("state") if isinstance(val, dict) else None
                 with _STATE_LOCK:
                     _STATE["stats"]["failed"] += 1
-                    _STATE["last_error"] = "mint failed (page/browser reset)"
-                raise RuntimeError("mint failed")
+                    _STATE["last_error"] = f"mint failed: {reason}" + (f" state={state}" if state else "")
+                    # 失败分类 + 页面内状态采样的完整证据，排障不必再翻容器日志：
+                    #   interactive ⇒ 挑战要人点（低信誉 profile 的典型形态），等预算没有意义
+                    #   timeout     ⇒ 打满预算仍无回调（state 里能看出 iframe 是否挂上）
+                    #   error       ⇒ CF 主动报错，带原始错误码
+                    _STATE["last_failure"] = {
+                        "reason": reason,
+                        "why": val.get("why") if isinstance(val, dict) else None,
+                        "state": state,
+                        "at": time.time(),
+                    }
+                # ★ 失败后**保留浏览器**只换页面（见 reload_page）—— INTERACTIVE/TIMEOUT
+                #   都换：交互式挑战留下的半成品 widget 随旧页一起丢弃，下次干净开始。
+                self.reload_page()
+                raise RuntimeError(f"mint failed: {reason}")
             self.warmed = True      # 说明这个页面**真的**铸出过 token（heat ≠ ready）
             with _STATE_LOCK:
                 _STATE["stats"]["minted"] += 1
@@ -178,6 +233,7 @@ def take_token() -> dict:
 
 def refill_loop():
     """流水线：把池子维持到 POOL_TARGET（每次补一个，避免把 Chrome 打满）。"""
+    fail_streak = 0
     while True:
         _WAKE.wait(timeout=1.0)
         _WAKE.clear()
@@ -188,20 +244,23 @@ def refill_loop():
             if need <= 0:
                 continue
             tok = CORE.mint()
+            fail_streak = 0
             with _STATE_LOCK:
                 _STATE["pool"].append((tok, time.time()))
             # 每次成功铸造之间随机喘息，避免形成"每 3.5 秒一个挑战"的机械流量。
             time.sleep(2 + random.random() * 6)   # 2~8s 随机
 
         except (Exception, SystemExit) as e:  # noqa: BLE001
+            fail_streak += 1
             # ⚠️ 必须连 SystemExit 一起接：`ensure()` 起不来 Chrome 时抛的是 SystemExit，
             # 它是 BaseException 的子类 —— 只 catch Exception 会让**补货线程静默死亡**，
             # 表现为 ready=false / minting=false / last_error=null（实测在容器里踩到，
             # 因为没有 xauth，xvfb-run 起不来）。线程死掉还查不到原因是最坏的情况。
             with _STATE_LOCK:
                 _STATE["last_error"] = f"{type(e).__name__}: {e}"[:200]
-            # 抖动：失败后不要固定 3 秒重试（机械节奏是速率风控的强信号）。
-            time.sleep(8 + random.random() * 12)   # 8~20s 随机
+            # 退避：按连续失败次数指数拉长（带抖动）—— 固定短周期重试会把"卡死的铸造"
+            # 变成宿主上无休止的 Chrome 杀/起循环（E2E-AVM-004 实测形态）。
+            time.sleep(backoff_delay(fail_streak))
 
 
 def health() -> dict:
@@ -217,14 +276,15 @@ def health() -> dict:
             "browser": _STATE["browser"],
             "ready": _STATE["ready"],
             # ⚠️ `ready`（Chrome/页面就绪）与 `warmed`（**真的铸出过** token）是两件事：
-            #    冷启动期 `ready=true` 而铸造仍会超时 —— 只看 `ready` 会误判成"服务是好的"
-            #    （报告 AVM12-MINT 就是这个形状：healthz 10 秒即 ready，铸造就 46s TIMEOUT）。
-            #    再挂上两条实际生效的预算，排障时不必去翻环境变量。
+            #    冷启动/卡死期 `ready=true` 而铸造仍会失败 —— 只看 `ready` 会误判成
+            #    "服务是好的"（报告 AVM12-MINT 就是这个形状）。再挂上两条实际生效的
+            #    预算与最近一次失败的分类，排障时不必去翻环境变量和容器日志。
             "warmed": CORE.warmed,
             "render_timeout_ms": {"cold": M.COLD_MINT_TIMEOUT_MS, "normal": M.MINT_TIMEOUT_MS},
             "pool": {"size": pool, "target": POOL_TARGET, "ttl_s": TTL_S},
             "stats": st,
             "last_error": _STATE["last_error"],
+            "last_failure": _STATE["last_failure"],
         }
 
 

@@ -83,8 +83,11 @@ RUN pip install --no-cache-dir websocket-client
 WORKDIR /app
 COPY tools/turnstile_minter.py tools/turnstile_service.py /app/tools/
 
-# Chrome 的 profile 落在卷里：① 重启后不用重新冷启动（首次 render 有 ~46 秒）
-# ② 画像有点"年龄"总比每次全新好
+# Chrome 的 profile 落在卷里：① 重启后不用重新冷启动 ② 画像有点"年龄"总比每次全新好
+# ⚠️ 实测复盘（E2E-AVM-004）：全新 profile 的**首铸**在新部署上可能**卡死**而非"慢"——
+#    120s 冷预算也不出 token（挑战不回调成功也不回调失败，疑似交互式挑战等人操作）。
+#    旧注释里的「首次 render ~46 秒」是 45s 超时签名的误读，已证伪，别再改回去。
+#    新部署建议：用长期实例的热 profile 播种 /data 卷，或保持实例常驻不重建。
 VOLUME ["/data"]
 EXPOSE 8899
 

@@ -377,4 +377,4 @@ AVM_COOKIE='auth_session=...' AVM_MAX_CONCURRENT=6 python3 src/ark_server.py
 ⚠️ 三个已踩过的坑（都会表现成"莫名其妙起不来"）：
 1. `--user-data-dir` 给了别的平台的路径 ⇒ Chrome 静默回落默认 profile ⇒"在现有会话中打开"、CDP 不开；
 2. `HTTP_PROXY` 劫持回环 ⇒ CDP 的 127.0.0.1 请求被拐走（已用 ProxyHandler({}) 与 http_no_proxy 绕开）；
-3. 探活与铸造共用锁 ⇒ 冷启动 46 秒期间 `/healthz` 超时（已拆两把锁）。
+3. 探活与铸造共用锁 ⇒ 铸造持有锁的几十秒里 `/healthz` 超时（已拆两把锁）。

@@ -215,12 +215,16 @@ docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_P
 > 顺手还会拦下 `ARK_HOST` 被绑回环（端口映射会失效）与 `AVM_MINTER_URL` 丢掉 `:-` 默认值
 > （铸造能力被**静默**关掉）这两类"配了不生效"。
 >
-> 🔧 **冷启动那一次铸造**：全新 profile 的**首次** render 实测 ≈46s，而常规预算是 45s
-> ⇒ 不加宽就会"新部署的第一次铸造必然失败一次"（现象：`mint` 返回 503 + TIMEOUT，
-> 而 `/healthz` 早已报 ready）。现在首轮走冷启动预算并在超时后用冷预算重试一次；
-> 两条预算可调：`AVM_MINTER_RENDER_TIMEOUT_MS`（默认 45000）与
-> `AVM_MINTER_COLD_RENDER_TIMEOUT_MS`（默认 120000）。`/healthz` 会把
-> `warmed`（**真的铸出过** token）与 `ready`（Chrome 就绪）分开报 —— 只看 `ready` 会误判。
+> 🔧 **冷启动那一次铸造**：常规 45s 预算下，冷 profile 的首次铸造在新部署上从未成功过
+> （现象：`mint` 返回 503 + TIMEOUT，而 `/healthz` 早已报 ready）。⚠️ E2E-AVM-004 复盘
+> 已证伪旧的「冷启动 ≈46s 慢成功」解释 —— 120s 冷预算下两次仍精确压线失败，是**卡死**
+> 不是**慢**（疑似 CF 对低信誉 profile 下发交互式挑战）。现状：首轮走冷预算（120s）留
+> 余量；render 带**状态采样**（iframe/`getResponse`），挑战升级交互式时按宽限**快速失败**
+> （`before-interactive-callback`），失败分类与最后状态进 `/healthz` 的 `last_failure`；
+> 失败后保留浏览器只换页面，补货按连续失败指数退避。两条预算可调：
+> `AVM_MINTER_RENDER_TIMEOUT_MS`（默认 45000）与 `AVM_MINTER_COLD_RENDER_TIMEOUT_MS`
+> （默认 120000）。`warmed`（**真的铸出过** token）与 `ready`（Chrome 就绪）分开报 ——
+> 只看 `ready` 会误判。**根治要靠热 profile**：新部署建议播种 /data 卷或保持实例常驻。
 
 **多 worker 是这里唯一的坑。** 上游闸门是进程内 `threading.Semaphore`，「全局只跑 2 个」依赖
 单进程：开 N 个 worker 会让实际并发变成 N×2，第 3 个起上游直接返回 `The queue is full`

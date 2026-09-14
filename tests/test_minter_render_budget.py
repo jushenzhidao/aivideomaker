@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""minter 的 **render 超时预算**门禁（报告 AVM12-MINT）。
+"""minter 的 **render 超时预算**门禁（报告 AVM12-MINT → E2E-AVM-004 复盘）。
 
-实测现象：冷 profile 起一次性 minter 实例，`/healthz` 10 秒即 `ready=true`，但
+历史观测：冷 profile 起一次性 minter 实例，`/healthz` 10 秒即 `ready=true`，但
 `POST /v1/turnstile/mint` 两次都返回 **503 + `{'why': 'TIMEOUT'}（耗时 46.01s）`**。
-根因不是守卫、不是网络、也不是新镜像的功能回归 —— 而是**冷启动**：
-`tools/turnstile_minter.py` 里页面内的 `setTimeout(..., 45000)` 是 45 秒超时，而项目自己在
-`Dockerfile.minter` 写着「首次 render 有 ~46 秒」⇒ **新部署的第一次铸造必然失败一次**。
 
-修法：预算可配（`MINT_TIMEOUT_MS` / `COLD_MINT_TIMEOUT_MS`），**首轮**用冷预算、
-之后回落常规值；且超时后用冷预算**重试一次**（那一轮之后页面已经热了）。
+⚠️ E2E-AVM-004 复盘：46.01s 是 **45s 预算的超时签名**（45s + ~1s 探针），不是一次
+成功测量 —— 曾据此把根因归为「冷启动 ≈46s、预算不够」并加码到 120s，结果 120s 下
+两次精确压线失败（121.01s），证明是**卡死**不是**慢**。预算加码只是把失败推迟。
+
+本轮仍保留的两条预算语义：常规 `MINT_TIMEOUT_MS`（默认 45000）与冷启动首轮
+`COLD_MINT_TIMEOUT_MS`（默认 120000，给慢路径留余量）；CLI 路径常规预算超时后
+用冷预算重试一次，服务路径首轮直接用冷预算。真正治卡死的是状态可观测与
+INTERACTIVE 快速失败（见 tests/test_turnstile_render_states.py）。
 
 运行：python3 tests/test_minter_render_budget.py
 """
@@ -29,7 +32,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import turnstile_minter as M  # noqa: E402
 import turnstile_service as S  # noqa: E402
 
-_BUDGET_RE = re.compile(r"why:'TIMEOUT'\}\), (\d+)\)")
+_BUDGET_RE = re.compile(r"setTimeout\(\(\) => fail\('TIMEOUT'\), (\d+)\)")
 
 
 def budgets_in(expression: str) -> int:
@@ -60,7 +63,7 @@ class TestBudgetIsConfigurable(unittest.TestCase):
         self.assertEqual(M.COLD_MINT_TIMEOUT_MS, 120000)
 
     def test_cold_budget_is_wider_than_the_normal_one(self):
-        """冷预算若不比常规宽，这条修复就是空的 —— 46s 的首次 render 照样会超时。"""
+        """冷预算若不比常规宽，给慢路径留余量这条语义就是空的。"""
         self.assertGreater(M.COLD_MINT_TIMEOUT_MS, M.MINT_TIMEOUT_MS)
 
     def test_the_budget_is_injected_into_the_render_script(self):
@@ -80,25 +83,26 @@ class TestBudgetIsConfigurable(unittest.TestCase):
 
 
 class TestTimeoutRetriesWithTheColdBudget(unittest.TestCase):
-    """★ 首轮 45s 超时不再等于"铸造失败"：页面已经热了，用冷预算再试一次。"""
+    """★ CLI 路径：常规预算超时后用冷预算再试一次；INTERACTIVE 不重试（等人点没意义）。"""
 
     def test_timeout_then_success_uses_both_budgets(self):
         bc = FakeCDP([{"ok": False, "why": "TIMEOUT"}, {"ok": True, "token": "tok-1"}])
-        tok, _ = M.mint_on(bc, "sess", 1, timeout_ms=M.MINT_TIMEOUT_MS)
+        tok, _, _val = M.mint_on(bc, "sess", 1, timeout_ms=M.MINT_TIMEOUT_MS)
         self.assertEqual(tok, "tok-1")
         self.assertEqual(bc.render_budgets(), [M.MINT_TIMEOUT_MS, M.COLD_MINT_TIMEOUT_MS])
 
     def test_non_timeout_failure_does_not_retry(self):
-        """`no turnstile api` / `ERR …` 这类失败重试没有意义，别白等一轮。"""
-        bc = FakeCDP([{"ok": False, "why": "ERR 110200"}])
-        tok, _ = M.mint_on(bc, "sess", 1, timeout_ms=M.MINT_TIMEOUT_MS)
-        self.assertIsNone(tok)
-        self.assertEqual(bc.render_budgets(), [M.MINT_TIMEOUT_MS])
+        """`no turnstile api` / `ERR …` / `INTERACTIVE` 这类失败重试没有意义，别白等一轮。"""
+        for why in ("ERR 110200", "INTERACTIVE"):
+            bc = FakeCDP([{"ok": False, "why": why}])
+            tok, _, _val = M.mint_on(bc, "sess", 1, timeout_ms=M.MINT_TIMEOUT_MS)
+            self.assertIsNone(tok)
+            self.assertEqual(bc.render_budgets(), [M.MINT_TIMEOUT_MS])
 
     def test_an_explicit_cold_budget_is_not_retried_again(self):
         """已经在用最宽预算了 ⇒ 不能再重试（否则一次真卡死会等两倍时间）。"""
         bc = FakeCDP([{"ok": False, "why": "TIMEOUT"}, {"ok": True, "token": "x"}])
-        tok, _ = M.mint_on(bc, "sess", 1, timeout_ms=M.COLD_MINT_TIMEOUT_MS)
+        tok, _, _val = M.mint_on(bc, "sess", 1, timeout_ms=M.COLD_MINT_TIMEOUT_MS)
         self.assertIsNone(tok)
         self.assertEqual(bc.render_budgets(), [M.COLD_MINT_TIMEOUT_MS])
 
@@ -114,9 +118,9 @@ class TestServiceUsesTheColdBudgetOnlyForTheFirstMint(unittest.TestCase):
         core = self._core()
         seen = []
 
-        def fake_mint_on(bc, sess, i, timeout_ms=None):
+        def fake_mint_on(bc, sess, i, timeout_ms=None, grace_ms=None):
             seen.append(timeout_ms)
-            return "tok", 0.01
+            return "tok", 0.01, {"ok": True, "token": "tok"}
 
         with mock.patch.object(S.M, "mint_on", fake_mint_on):
             core.mint()
@@ -130,7 +134,9 @@ class TestServiceUsesTheColdBudgetOnlyForTheFirstMint(unittest.TestCase):
 
     def test_a_failed_first_mint_does_not_mark_the_page_as_warmed(self):
         core = self._core()
-        with mock.patch.object(S.M, "mint_on", lambda *a, **k: (None, 0.01)):
+        fake = lambda *a, **k: (None, 0.01, {"ok": False, "why": "TIMEOUT", "state": {}})  # noqa: E731
+        with mock.patch.object(S.M, "mint_on", fake), \
+                mock.patch.object(S.M, "open_warm_page", lambda bc: ("tid2", "sess2")):
             with self.assertRaises(RuntimeError):
                 core.mint()
         self.assertFalse(core.warmed, "没铸出 token 就不能算热 —— 否则冷启动会被漏掉")

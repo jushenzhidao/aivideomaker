@@ -10,7 +10,14 @@
 
 ⇒ **headless 不可行，Xvfb 有头可行**。别再为省资源去试无头。
 
-**性能对照（同机同 Chrome，量“秒/个”）：**
+⚠️ **"冷启动 ≈46s" 已证伪**（E2E-AVM-004）：46s 是 45s 预算的**超时签名**
+（45s 预算 + ~1s 探针），不是一次成功测量 —— 全新 profile 的首铸在 120s 冷预算下
+同样不出 token（两次精确压线失败），是**卡死**不是**慢**（疑似 CF 对低信誉 profile
+下发交互式挑战等人操作）。本轮起 render 带**状态采样**（iframe / getResponse），
+挑战升级交互式时按宽限期**快速失败**（before-interactive-callback），分类与最后
+状态进 /healthz —— 不再让"等人点复选框"伪装成一行 TIMEOUT。
+
+**性能对照（同机同 Chrome，量"秒/个"）：**
 
 | 方案                                            | 秒/个 | 说明                                  |
 |-------------------------------------------------|-------|---------------------------------------|
@@ -29,8 +36,7 @@
 环境变量：`CDP_PORT` / `CHROME_PROFILE` / `CHROME_BIN` / `SITEKEY` / `ORIGIN` / `LIGHT_URL`
           / `N` / `HEADLESS` / `KEEP`
           / `MINT_TIMEOUT_MS`（常规 render 预算，默认 45000）/ `COLD_MINT_TIMEOUT_MS`
-            （**冷启动**首轮预算，默认 120000 —— 全新 profile 首次 render 实测 ≈46s，
-             45s 的常规预算会让"新部署的第一次铸造"必然失败一次）
+            （**冷启动**首轮预算，默认 120000）
 
 产出 /tmp/tokens.txt（一行一个 token），并打印每个 token 的铸造耗时。
 
@@ -208,45 +214,119 @@ class CDP:
 
 
 # ---- render 超时预算 --------------------------------------------------------
-# 🔴 45s 这条线是被**冷启动**踩中的，不是随便定的：全新 profile 的**首次** render 实测
-#    ≈46 秒（Dockerfile.minter 第 86 行自己就写着这个数），恰好越过 45s ⇒ **新部署的第一次
-#    铸造必然失败一次**。2026-09-14 报告 AVM12-MINT 实测：冷 profile 起一次性实例，
-#    `/healthz` 10 秒即 `ready=true`，而两次 `POST /v1/turnstile/mint` 都是
-#    **46.01s TIMEOUT / 503** —— 现象看起来像"这个镜像坏了"，实际只是冷启动。
-# 两条预算分开：常规 `MINT_TIMEOUT_MS`；**首次**（页面/画像还是冷的）用
-# `COLD_MINT_TIMEOUT_MS`，并在超时后**用冷预算重试一次**（那一轮之后挑战已明显变快）。
+# 两条预算分开：常规 `MINT_TIMEOUT_MS`；**首轮**（页面/画像还是冷的）用
+# `COLD_MINT_TIMEOUT_MS`。CLI 路径在常规预算超时后用冷预算重试一次；服务路径首轮
+# 直接就是冷预算（见 tools/turnstile_service.py 的 MintCore.mint）。
+#
+# 🔴 历史教训（别再改回去）：2026-09-14 曾把首铸失败归因为「冷启动 ≈46s、预算不够」并加码
+#    到 120s —— E2E-AVM-004 证伪：两次都精确 121.01s（探针 ~1s + 满预算 120s），render
+#    根本不会成功，只是**卡住**。"46s" 其实是 45s 预算的超时签名被当成了慢成功（循环引用：
+#    报告引 Dockerfile 注释，注释又源自 headless 实验的超时表）。加预算只是把失败推迟。
+#    真正的对策是**状态可观测**（MINT_JS_TMPL 的采样与 before-interactive-callback），
+#    以及失败后保留浏览器只换页面（服务层）。
 MINT_TIMEOUT_MS = int(os.environ.get("MINT_TIMEOUT_MS", "45000"))
 COLD_MINT_TIMEOUT_MS = int(os.environ.get("COLD_MINT_TIMEOUT_MS", "120000"))
+# 交互式宽限（毫秒）：挑战升级成"等人操作"后，给 CF 这么长时间自动收尾；过点即快速失败。
+# 刻意**不做成环境变量**：.env.example 与 compose 的透传有 tests/test_env_template.py 的
+# 双向门禁把关，新增 env 读入必须同步三处 —— 常量足够用，不值得为此动编排。
+INTERACTIVE_GRACE_MS = 10000
 
+# 求值结果里的页面内状态（超时/失败时随 val["state"] 返回，进 /healthz）：
+#   iframe      —— 挑战 iframe（challenges.cloudflare.com）有没有真正挂上来
+#   response    —— turnstile.getResponse() 是否已出 token
+#   interactive —— 是否进入过交互模式（要人点复选框）
+#   samples     —— 采样次数（>1 说明轮询真的在跑）
 MINT_JS_TMPL = """
 (async () => {
   if (typeof window.turnstile === 'undefined') return {ok:false, why:'no turnstile api'};
   return await new Promise((resolve) => {
-    const t = setTimeout(() => resolve({ok:false, why:'TIMEOUT'}), %d);
+    // 上一次失败留下的半成品 widget 必须清掉：失败不再重启浏览器 ⇒ 宿主 div 会累积。
+    document.querySelectorAll('[data-avm-ts-host]').forEach((n) => n.remove());
+    const state = {iframe: false, response: false, interactive: false, samples: 0};
+    let wid = null;
+    const snap = () => {
+      try {
+        state.iframe = !!document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+        try {
+          state.response = !!(wid !== null && window.turnstile.getResponse(wid));
+        } catch (e) { state.response = false; }
+      } catch (e) {}
+      state.samples++;
+    };
+    const done = (ok, payload) => {
+      clearInterval(iv); clearTimeout(t); if (g) clearTimeout(g);
+      resolve(Object.assign({ok: ok, state: state}, payload));
+    };
+    const fail = (why) => { snap(); done(false, {why: why}); };
+    const t = setTimeout(() => fail('TIMEOUT'), %d);
+    const iv = setInterval(snap, 3000);
+    let g = null;
+    snap();
     try {
       const host = document.createElement('div');
+      host.setAttribute('data-avm-ts-host', '1');
       host.style.cssText = 'position:fixed;left:10px;top:10px;width:300px;height:65px;z-index:99999;background:#fff';
       document.body.appendChild(host);
-      window.turnstile.render(host, {
+      wid = window.turnstile.render(host, {
         sitekey: %s,
-        callback: (tok) => { clearTimeout(t); resolve({ok:true, token:String(tok)}); },
-        'error-callback': (e) => { clearTimeout(t); resolve({ok:false, why:'ERR '+String(e)}); },
+        callback: (tok) => done(true, {token: String(tok)}),
+        'error-callback': (e) => fail('ERR ' + String(e)),
+        // 挑战升级成交互式（要人点）：无人值守环境里等满预算没有意义。低风险场景 CF
+        // 会自己勾掉，所以给一小段宽限；过点仍未完成就按 INTERACTIVE **快速失败**，
+        // 别让"等人点复选框"伪装成 TIMEOUT —— E2E-AVM-004 的 120s 黑等就是这么来的。
+        'before-interactive-callback': () => {
+          state.interactive = true;
+          if (!g) g = setTimeout(() => fail('INTERACTIVE'), %d);
+        },
       });
-    } catch (e) { clearTimeout(t); resolve({ok:false, why:'EX '+String(e)}); }
+    } catch (e) { fail('EX ' + String(e)); }
   });
 })()
 """
 
 
-def mint_js(timeout_ms: int) -> str:
-    """按给定预算生成 render 脚本（页面内的 `setTimeout` 是**唯一**的超时闸门）。"""
-    return MINT_JS_TMPL % (int(timeout_ms), json.dumps(SITEKEY))
+def mint_js(timeout_ms: int, grace_ms: int | None = None) -> str:
+    """按给定预算生成 render 脚本（页面内的 `setTimeout` 是**唯一**的总超时闸门）。
+
+    `grace_ms` 是交互式宽限：before-interactive-callback 触发后再等这么久，仍没出
+    token 就按 INTERACTIVE 快速失败（低风险场景 CF 会自己勾掉，所以留宽限而非立刻弃）。
+    """
+    if grace_ms is None:
+        grace_ms = INTERACTIVE_GRACE_MS
+    return MINT_JS_TMPL % (int(timeout_ms), json.dumps(SITEKEY), int(grace_ms))
 
 
 # 兼容旧用法（也供不方便传预算的调用点使用）
 MINT_JS = mint_js(MINT_TIMEOUT_MS)
 
 PROBE = "typeof window.turnstile + '|' + document.readyState + '|' + location.href"
+
+
+def failure_reason(val) -> str:
+    """把 render 的求值结果归类成稳定短标签（进日志 / /healthz / 调用方错误信息）。
+
+    分类意在对症下药：
+      ok          —— 成功（不该出现在失败路径）
+      timeout     —— 预算打满仍无回调（配合 val["state"] 判断停在哪个阶段）
+      interactive —— 挑战升级成交互式且宽限内没自动完成 ⇒ 等人点，重试无意义
+      error       —— CF 主动报错（error-callback），带原始错误码
+      exception   —— 页面内抛异常（多半是 api.js 行为变化）
+      no-result   —— CDP 求值没拿到值（连接/页面层面的问题）
+    """
+    if not isinstance(val, dict):
+        return "no-result"
+    if val.get("ok"):
+        return "ok"
+    why = str(val.get("why", ""))
+    if why == "TIMEOUT":
+        return "timeout"
+    if why.startswith("INTERACTIVE"):
+        return "interactive"
+    if why.startswith("ERR"):
+        return "error"
+    if why.startswith("EX"):
+        return "exception"
+    return "unknown:" + why
 
 
 def open_warm_page(bc):
@@ -261,46 +341,47 @@ def open_warm_page(bc):
     return tid, sess
 
 
-def mint_on(bc, sess, i, timeout_ms: int | None = None):
+def mint_on(bc, sess, i, timeout_ms: int | None = None, grace_ms: int | None = None):
     """在**已预热**的页面上 render 一次（热页面 ≈1.7s）。
 
-    `timeout_ms` 显式给预算；不给则用常规预算。**超时不算终局**：冷启动/挑战变慢时
-    用 `COLD_MINT_TIMEOUT_MS` 再试一次 —— 一次 45s 超时之后页面本身已经热了，
-    第二次通常几秒就出 token（这也是为什么"新部署第一次必失败"是**可修**的）。
+    `timeout_ms` 显式给预算；不给则用常规预算。返回 `(token, 耗时s, 原始求值结果)` ——
+    第三个值带着 `why` 分类与页面内 `state` 采样，调用方按需落账（服务层进 /healthz）。
+
+    **超时不算终局（仅常规预算路径）**：TIMEOUT 时用冷预算再试一次；
+    INTERACTIVE 不重试 —— 等人点的挑战，换预算没有意义。
     """
     budget = MINT_TIMEOUT_MS if timeout_ms is None else int(timeout_ms)
     t0 = time.time()
     ready = False
-    for _ in range(45):
+    for _ in range(90):
         v = val_of(bc.call("Runtime.evaluate", session=sess, returnByValue=True, expression=PROBE)) or ""
         if v.startswith("object"):
             ready = True
             break
-        time.sleep(1)
+        time.sleep(0.5)
     if not ready:
         v = val_of(bc.call("Runtime.evaluate", session=sess, returnByValue=True, expression=PROBE)) or ""
         print(f"  #{i} 页面未就绪：{str(v)[:120]}")
-        return None, time.time() - t0
+        return None, time.time() - t0, None
 
-    val = _render_once(bc, sess, budget)
+    val = _render_once(bc, sess, budget, grace_ms)
     if isinstance(val, dict) and not val.get("ok") and val.get("why") == "TIMEOUT" \
             and budget < COLD_MINT_TIMEOUT_MS:
-        # ★ 冷启动那条路：第一次超时不代表铸造能力坏了。用冷预算重试一次 ——
-        #   首次 render 的 ~46s 冷启动恰好越过 45s 线，正是报告 AVM12-MINT 的根因。
+        # ★ 冷预算重试（仅常规预算路径）：服务路径首轮已是冷预算，不会再进这里。
         print(f"  #{i} 首次 {budget}ms 超时 ⇒ 用冷启动预算 {COLD_MINT_TIMEOUT_MS}ms 重试一次")
-        val = _render_once(bc, sess, COLD_MINT_TIMEOUT_MS)
+        val = _render_once(bc, sess, COLD_MINT_TIMEOUT_MS, grace_ms)
 
     dt = time.time() - t0
     if isinstance(val, dict) and val.get("ok"):
         print(f"  #{i} token len={len(val['token'])} 铸造耗时={dt:.2f}s head={val['token'][:24]}...")
-        return val["token"], dt
-    print(f"  #{i} 失败：{val}（耗时 {dt:.2f}s）")
-    return None, dt
+        return val["token"], dt, val
+    print(f"  #{i} 失败[{failure_reason(val)}]：{val}（耗时 {dt:.2f}s）")
+    return None, dt, val
 
 
-def _render_once(bc, sess, timeout_ms: int):
+def _render_once(bc, sess, timeout_ms: int, grace_ms: int | None = None):
     """单次 render（不重试）。返回 JS 的求值结果。"""
-    return val_of(bc.call("Runtime.evaluate", session=sess, expression=mint_js(timeout_ms),
+    return val_of(bc.call("Runtime.evaluate", session=sess, expression=mint_js(timeout_ms, grace_ms),
                           awaitPromise=True, returnByValue=True))
 
 
@@ -308,7 +389,8 @@ def mint(bc, i):
     """兼容旧用法：单次铸造（内部开一个轻量页）。"""
     tid, sess = open_warm_page(bc)
     try:
-        return mint_on(bc, sess, i)
+        tok, dt, _val = mint_on(bc, sess, i)
+        return tok, dt
     finally:
         try:
             bc.call("Target.closeTarget", targetId=tid)
@@ -344,7 +426,7 @@ def mint_legacy_app_page(bc, i):
         if isinstance(val, dict) and val.get("ok"):
             print(f"  #{i} token len={len(val['token'])} 铸造耗时={dt:.1f}s head={val['token'][:24]}...")
             return val["token"], dt
-        print(f"  #{i} 失败：{val}（耗时 {dt:.1f}s）")
+        print(f"  #{i} 失败[{failure_reason(val)}]：{val}（耗时 {dt:.1f}s）")
         return None, dt
     finally:
         try:
@@ -369,7 +451,7 @@ def main():
         tid, sess = open_warm_page(bc)          # ★ 一个热页面反复用（默认轻量页）
         try:
             for i in range(1, N + 1):
-                tok, dt = mint_on(bc, sess, i)
+                tok, dt, _val = mint_on(bc, sess, i)
                 if tok:
                     tokens.append(tok)
                 times.append(dt)

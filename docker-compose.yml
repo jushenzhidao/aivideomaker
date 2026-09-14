@@ -43,8 +43,10 @@
 #   AVM_MINTER_TTL             铸出的 token 存活上限（秒），默认 120（CF 侧约 300s，按更短算）
 #   AVM_MINTER_RENDER_TIMEOUT_MS       render 常规预算（毫秒），默认 45000
 #   AVM_MINTER_COLD_RENDER_TIMEOUT_MS  render **冷启动首轮**预算（毫秒），默认 120000
-#                               —— 全新 profile 首次 render 实测 ≈46s，卡在常规 45s 之上；
-#                                  没有这一条时"新部署的第一次铸造"必然失败一次
+#                               —— E2E-AVM-004 复盘：冷 profile 首铸可能是**卡死**（120s 也不出），
+#                                  而非旧的「≈46s 慢成功」（那是 45s 超时签名的误读，已证伪）；
+#                                  COLD 预算只是给慢路径留余量，真正治卡死的是代码侧的
+#                                  before-interactive-callback 快速失败 + 页面内状态采样
 # ⚠️ 另有一个**由本文件派生**的注入项（不是用户变量）：`MINTER_ALLOW_INSECURE_RAW`
 #    = `${AVM_MINTER_ALLOW_INSECURE:-}`，只喂给 minter-preflight —— 有了它，前置校验才能
 #    区分「用户显式设了 ALLOW_INSECURE」与「取 compose 默认值」，归因才如实（报告 AVM12-PF-07）。
@@ -355,7 +357,7 @@ services:
       minter-preflight:
         condition: service_completed_successfully
     # ★ 必须用 **host 网络**：默认 bridge + NAT 会改写 TCP MSS/网络指纹 ⇒ CF 判定为机器人：
-    #   `turnstile.render()` 一律 46 秒超时（同机同 Chrome：宿主 3.7s ✅ / bridge 容器 46s ❌；实测）。
+    #   `turnstile.render()` 全部吃满 45s 预算超时、0 成功（同机同 Chrome：宿主 3.7s ✅ / bridge 容器 ❌；实测）。
     #   用 host 后容器内实测 2.3~3.5s/个，与宿主同量级。
     # ⚠️ 该修复**只在 Linux 原生 Docker 上成立**：macOS 的 Docker Desktop 里 host 网络
     #   实际是「VM 内 host」，流量仍经 VPNkit NAT 出去 —— 实测（arm64 原生 chromium +
@@ -383,11 +385,13 @@ services:
       # **开大没好处** —— 没被用掉的 token 会自然老死。
       POOL_TARGET: ${AVM_MINTER_POOL:-4}
       TOKEN_TTL_S: ${AVM_MINTER_TTL:-120}
-      # render 预算（毫秒）。**为什么要有两条**：全新 profile 的**首次** render 实测 ≈46s，
-      # 而常规预算是 45s ⇒ 不放宽的话「新部署的第一次铸造」**必然失败一次**，现象是
-      # `POST /v1/turnstile/mint` 返回 503 + `{'why': 'TIMEOUT'}（耗时 46.01s）`，而
-      # `/healthz` 早在 10 秒时就报了 `ready=true` —— 看起来像"镜像坏了"，其实只是冷启动
-      # （报告 AVM12-MINT 的根因）。首轮走 COLD，铸出过 token 之后回落到常规值。
+      # render 预算（毫秒）。**为什么要有两条**：常规 45s 预算下，冷 profile 的首次铸造
+      # 在新部署上从未成功过（现象 `POST /v1/turnstile/mint` 503 + TIMEOUT，而
+      # `/healthz` 早在 10 秒时就报了 `ready=true` —— 看起来像"镜像坏了"）。
+      # ⚠️ E2E-AVM-004 复盘：这**不是**「冷启动 ≈46s 慢成功」（旧说法已证伪 —— 120s 冷
+      # 预算同样两次精确压线失败，是卡死不是慢）；COLD 预算只是给慢路径留余量，真正治
+      # 卡死的是代码侧的 INTERACTIVE 快速失败 + 状态采样（进 /healthz 的 last_failure）。
+      # 首轮走 COLD，铸出过 token 之后回落到常规值。
       MINT_TIMEOUT_MS: ${AVM_MINTER_RENDER_TIMEOUT_MS:-45000}
       COLD_MINT_TIMEOUT_MS: ${AVM_MINTER_COLD_RENDER_TIMEOUT_MS:-120000}
     volumes:
