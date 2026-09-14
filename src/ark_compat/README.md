@@ -20,7 +20,7 @@
 | 预算保护 | 无（靠免费窗口兜底） |
 | **取消任务** | ❌ **没有端点**（跑着的照跑照扣，`DELETE` 只删本地记录） |
 | 验证码 | 动态闸门（按速率翻转，**不是账号属性**） |
-| 并发 | **上游只跑 2 个**，槽位占到底 |
+| 并发 | **按账号额度**：premium 2 / pro 4（`ai.queryUserPermission.maxQueueLength`）；`AVM_MAX_CONCURRENT=0` 即自动、读不到回落 2。槽位占到底 |
 | 媒体输入 | **必须转存到站点 CDN**（适配层已自动做） |
 | 幂等 | 无 |
 
@@ -254,7 +254,7 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
    `token: null` **静默拒掉（返回空串）**，适配层把它转成显式
    `429 RateLimitExceeded`。**这不是会话失效**。绕过方式：自带真 token
    （`extra_body.aivideomaker_captcha_token`），或等它衰减。
-3. **并发上限 2，且槽位占到底**（从创建一直到任务进入终态）。适配层有信号量闸门
+3. **并发上限按账号额度（premium 2 / pro 4；`AVM_MAX_CONCURRENT=0` 自动探测），且槽位占到底**（从创建一直到任务进入终态）。适配层有信号量闸门
    （`AVM_MAX_CONCURRENT`），超出会**排队等待**而不是直接失败。
 4. **媒体必须转存到站点 CDN。** 适配层自动做：外链图片 → 先下载再走预签名上传；
    data URI → 解码成字节上传；已在 `static*.img2video.ai` 上的原样放过。

@@ -24,6 +24,8 @@ import base64
 import re
 from typing import Any, Callable
 
+from loguru import logger
+
 from .minter import TokenMinter
 from .translate import normalize_web_task
 from .web_client import WebClient
@@ -121,6 +123,32 @@ class WebUpstream:
         return info
 
 
+def resolve_max_concurrent(settings, client) -> int:
+    """定提交闸门槽位。
+
+    `settings.max_concurrent > 0` ⇒ 用它（显式覆盖优先）。
+    `settings.max_concurrent == 0` ⇒ **按账号额度自动**：读
+    `ai.queryUserPermission.maxQueueLength`（premium 2 / pro 4）。
+    读不到（网络抖动 / 站点改字段）⇒ 回落到 `max_concurrent_fallback`，并留一条日志 ——
+    这里**不能**猜成"没限制"，那会把上游配额直接撞满。
+    """
+    if settings.max_concurrent > 0:
+        return settings.max_concurrent
+    try:
+        perm = client.get_permission() or {}
+        n = int(perm.get("maxQueueLength") or 0)
+        if n > 0:
+            logger.info(
+                "提交闸门槽位按账号额度自动定为 {}（planName={}）", n, perm.get("planName") or "?"
+            )
+            return n
+        logger.warning("账号额度读不到 maxQueueLength ⇒ 回落 {} 槽", settings.max_concurrent_fallback)
+    except Exception as e:  # noqa: BLE001 探测失败不该让建上游失败
+        logger.warning("账号额度探测失败（{}: {}）⇒ 回落 {} 槽",
+                       type(e).__name__, e, settings.max_concurrent_fallback)
+    return settings.max_concurrent_fallback
+
+
 def _build_web(
     settings,
     log: Callable[[str], None] | None = None,
@@ -149,7 +177,7 @@ def _build_web(
     )
     queue = WebSubmitQueue(
         client,
-        max_concurrent=settings.max_concurrent,
+        max_concurrent=resolve_max_concurrent(settings, client),
         poll_interval=settings.poll_interval,
         log=log,
     )

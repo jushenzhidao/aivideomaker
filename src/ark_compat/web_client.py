@@ -283,6 +283,16 @@ class WebClient:
         r = self.trpc("billing.subscription", None, meta=VOID_INPUT, timeout=self.probe_timeout)
         return r if isinstance(r, dict) else None
 
+    def get_permission(self) -> dict | None:
+        """账号权限/额度（`ai.queryUserPermission`，只读）。
+
+        返回 `{hasPermission, planName, maxQueueLength, ...}` —— 其中
+        **`maxQueueLength` 就是该账号的并发额度**（premium 2 / pro 4，站点原文同）。
+        用它来给提交闸门定槽位，而不是把并发写死在配置里。
+        """
+        r = self.trpc("ai.queryUserPermission", {}, timeout=self.probe_timeout)
+        return r if isinstance(r, dict) else None
+
     def needs_captcha(self) -> bool:
         """这个账号现在要不要过 Turnstile？
 

@@ -60,7 +60,12 @@ class Settings:
     passthrough_cookie: bool = False
     user_id: str = ""
     visitor_id: str = ""
+    # 提交闸门槽位。**0 = 按账号额度自动**（每次建上游时读
+    # `ai.queryUserPermission.maxQueueLength`：premium 2 / pro 4；读不到回落到 2）。
+    # 写死一个数会让「pro 账号被卡在 premium 的额度上」——实测踩过。
     max_concurrent: int = 2
+    # 自动探测失败时的回落值
+    max_concurrent_fallback: int = 2
     poll_interval: float = 10.0
     # 探测类**只读**请求的超时（秒）：出口代理的 TLS 握手实测抖到 10s+，
     # 一发卡住的探测会占满重试循环（默认 30s），所以探测单独用短超时。
