@@ -45,6 +45,13 @@ preflight 照样报 `[ok]`。容器里既没有 docker CLI，也看不见别的�
 ⇒ 下发交互式挑战 ⇒ **铸造恒失败**，而服务照常 ready、`/healthz` 一片正常。
 E2E-AVM-008 新增：minter 必须 `network_mode: host`（bridge 的 NAT 改写 TCP 指纹 ⇒
 CF 判机器人 ⇒ 铸造整体失效，实测同机同 Chrome 宿主 3.7s ✅ / bridge ❌）+ 路径提示与探针。
+
+E2E-AVM-012 新增：`AVM_MINTER_URL` 里的**端口**必须与 minter 的 `PORT` 一致 —— host 网络下
+它们是同一个数字（compose 的插值**不支持嵌套**，所以只能各写一遍 ⇒ 天然存在"改了端口忘了
+改地址"的静默分叉，症状是"服务全好、健康检查也绿，铸造却永远取不到 token"）。同轮还修掉了
+镜像 `HEALTHCHECK` 把 `127.0.0.1:8899` 写死导致的**假 unhealthy**：判据已收口到服务自身的
+`--selfcheck`（见 `Dockerfile.minter` / `turnstile_service.selfcheck()`），静态解析看不见
+镜像内部，故那一层由 `tests/test_minter_healthcheck_port.py` 钉住。
 """
 
 from __future__ import annotations
@@ -398,6 +405,25 @@ def _flag(raw: str) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+# `AVM_MINTER_URL` 的主机名落在这些值上 = "就是本机/宿主自身"。minter 走 host 网络 ⇒
+# 它监听的端口与 URL 里的端口**必须**是同一个数字。指向别的主机时本工具无从判定（那可能
+# 是另一台机器上的 minter），故跳过、不误报。
+SELF_HOSTS = frozenset({"host.docker.internal", "localhost", "127.0.0.1", "::1"})
+
+
+def split_netloc(url: str) -> tuple:
+    """`http://host:port/path` → `(host, port)`；取不到的部分返回空串（**不猜**）。"""
+    m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://([^/?#]+)", (url or "").strip())
+    if not m:
+        return "", ""
+    netloc = m.group(1).rsplit("@", 1)[-1]        # 去掉 user:pass@
+    if netloc.startswith("["):                    # IPv6 字面量 [::1]:8899
+        host, _, rest = netloc.partition("]")
+        return host.lstrip("["), rest.lstrip(":")   # 去掉方括号 ⇒ 可与 SELF_HOSTS 直接比对
+    host, sep, port = netloc.partition(":")
+    return host, port if sep else ""
+
+
 def check_resolved(services: dict) -> list[str]:
     """按**真实生效的值**复核接线。返回问题清单（空 = 通过）。"""
     problems: list[str] = []
@@ -416,6 +442,27 @@ def check_resolved(services: dict) -> list[str]:
     url = app.get("AVM_MINTER_URL", "")
     if not url.strip():
         problems.append(f"[接线] {APP}.AVM_MINTER_URL 解析后为空 ⇒ 铸造能力被静默关掉。")
+
+    # ★ 端口口径（E2E-AVM-012）：host 网络下 minter 就监听的宿主 `PORT`，而适配层通过
+    #   `AVM_MINTER_URL` 里的**同一个数字**去找它。compose 的插值**不支持嵌套**
+    #   （`${A:-${B:-x}}` 非法）⇒ 这个数字只能写两遍 ⇒ 存在"改了端口忘了改地址"的静默
+    #   分叉（症状与 E2E-AVM-008 同族：服务全好、健康检查也绿，铸造却永远取不到 token）。
+    port_raw = minter.get("PORT", "").strip()
+    if not port_raw.isdigit():
+        problems.append(
+            f"[接线] {MINTER}.PORT={port_raw!r} 不是整数 ⇒ 服务启动即 ValueError"
+            "（容器崩溃循环；镜像里那份默认值是 8899）。"
+        )
+    else:
+        host, url_port = split_netloc(url)
+        if host in SELF_HOSTS and url_port and url_port != port_raw:
+            problems.append(
+                f"[接线] **端口分叉**：{APP}.AVM_MINTER_URL 指向 :{url_port}，而 {MINTER} "
+                f"监听 :{port_raw}（host 网络 ⇒ 那也就是宿主端口）⇒ 运行时取不到 token"
+                "（「配了不生效」的形态）。两处必须同改，改完记得同步宿主防火墙规则；"
+                f"若你有意指向**另一台主机**上的 minter，请把那台的真实主机名写进地址"
+                f"（别用 `{host}`）—— 本项只在地址指向本机时才比对。"
+            )
 
     if app.get("ARK_HOST") != "0.0.0.0":
         problems.append(f"[接线] {APP}.ARK_HOST={app.get('ARK_HOST')!r} ⇒ 端口映射失效。")

@@ -224,6 +224,25 @@ docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_P
 > （铸造能力被**静默**关掉）与 minter 离开 host 网络（NAT 改写 TCP 指纹 ⇒ 铸造整体失效）
 > 这三类"配了不生效"。
 >
+> ✅ **健康检查跟随 `PORT`（不再有假 `unhealthy`）**：0.0.18 及以前，镜像的 `HEALTHCHECK`
+> 把地址写死成 `curl http://127.0.0.1:8899/healthz` —— 只要部署把端口挪走（node064 的
+> override 用的是 8895），服务好端端的、铸造照常，`docker ps` 却恒 `unhealthy`
+> （E2E-AVM-010 定位、E2E-AVM-012 仍未修）。现在它调服务自己的 `--selfcheck`，
+> **地址由服务进程从 `PORT` / `BIND_HOST` 推导**（exec 形态、不过 shell），判据与 `/healthz`
+> 同一处 ⇒ 挪端口、改绑定地址之后健康状态都仍然可信（状态语义没变：`ready=false`
+> 表示 Chrome 还在预热，**仍算健康**）。
+> 判活三条命令（host 网络 ⇒ 宿主端口就是容器端口）：
+>
+> ```bash
+> curl -s http://127.0.0.1:8899/healthz | python3 -m json.tool     # 挪过端口就把数字换掉
+> docker compose exec minter python3 /app/tools/turnstile_service.py --selfcheck
+> docker inspect --format '{{json .State.Health}}' avm-minter      # 健康检查的历史与原因
+> ```
+>
+> ⚠️ **挪端口要同改三处**：minter 的 `PORT`、适配层的 `AVM_MINTER_URL`（宿主侧地址）、
+> 宿主防火墙规则 —— 它们是**同一个数字**（compose 的插值不支持嵌套，只能各写一遍）。
+> `--resolve` 会比对前两者（指向本机时才比对），只改一边会被当场拦下。
+>
 > 🔴 **宿主防火墙：bridge 容器 → host 网络的 minter 是「出网到宿主」**（E2E-AVM-008 定案）：
 > minter 走 host 网络后"compose 内部访问"并不存在 —— ark-compat（桥接）访问 8899 受宿主
 > INPUT 链管辖。node064 的 `iptables -P INPUT DROP` 丢掉这条路 ⇒ 闸门一翻、3 条提交全部

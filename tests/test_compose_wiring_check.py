@@ -234,5 +234,73 @@ class TestComposeWiringCheck(unittest.TestCase):
         self.assertTrue(any("未证实" in p for p in problems))
 
 
+class TestPortCoherence(unittest.TestCase):
+    """`AVM_MINTER_URL` 里的端口 与 minter 的 `PORT` 必须一致（E2E-AVM-012）。
+
+    host 网络下 minter 监听的就是宿主 `PORT`，而适配层通过 URL 里的**同一个数字**去找它。
+    compose 的插值**不支持嵌套**（`${A:-${B:-x}}` 非法）⇒ 这个数字只能写两遍 ⇒
+    "改了端口忘了改地址"是完全静态的分叉（症状：服务全好、健康检查也绿，铸造却恒 429）。
+    """
+
+    def setUp(self):
+        self.tool = _load_tool()
+        self.base = {
+            "ark-compat": {"AVM_MINTER_URL": "http://host.docker.internal:8899",
+                           "ARK_HOST": "0.0.0.0", "AVM_MINTER_KEY": "k"},
+            "minter": {"MINTER_KEY": "k", "PORT": "8899", "BIND_HOST": "127.0.0.1",
+                       "TZ": "Asia/Shanghai"},
+        }
+
+    def _resolved(self, service: str, key: str, value: str) -> list:
+        svc = {k: dict(v) for k, v in self.base.items()}
+        svc[service][key] = value
+        return self.tool.check_resolved(svc)
+
+    # ---- 正向：真实 compose 的**默认值**也必须自洽（不需要 docker）----
+    def test_shipped_compose_default_url_port_matches_minter_port(self):
+        services = self.tool.parse_services(COMPOSE.read_text(encoding="utf-8"))
+        expr = services["ark-compat"]["AVM_MINTER_URL"]
+        parsed = self.tool.interp_default(expr)
+        self.assertIsNotNone(parsed, f"AVM_MINTER_URL 的写法变了：{expr!r}")
+        host, url_port = self.tool.split_netloc(parsed[1])
+        self.assertIn(host, self.tool.SELF_HOSTS, host)
+        self.assertEqual(url_port, services["minter"]["PORT"],
+                         f"compose 里 URL 默认端口 {url_port} 与 minter.PORT "
+                         f"{services['minter']['PORT']} 不一致（改了端口要两处同改）")
+
+    # ---- 解析后的值（部署机上那份 override 才是分叉的高发地）----
+    def test_aligned_ports_pass(self):
+        self.assertEqual(self.tool.check_resolved(self.base), [])
+
+    def test_catches_url_port_diverging_from_minter_port(self):
+        problems = self._resolved("ark-compat", "AVM_MINTER_URL",
+                                  "http://host.docker.internal:8895")
+        self.assertTrue(any("端口分叉" in p for p in problems), problems)
+
+    def test_catches_a_non_integer_minter_port(self):
+        """空/非整数的 PORT ⇒ `int("")` 直接抛错，容器崩溃循环。"""
+        problems = self._resolved("minter", "PORT", "")
+        self.assertTrue(any("不是整数" in p for p in problems), problems)
+
+    def test_does_not_flag_a_deliberately_remote_minter(self):
+        """★ 反证：指向**另一台主机**是合法的（那台机器上的 minter），本项必须闭嘴。
+
+        本工具的判据只在"地址指向本机"时才成立 —— 误报会让人开始忽略这个门禁，
+        与假 unhealthy 是同一种伤害。
+        """
+        self.assertEqual(self._resolved("ark-compat", "AVM_MINTER_URL",
+                                        "http://10.0.0.5:8895"), [])
+
+    def test_skips_when_the_url_has_no_port(self):
+        self.assertEqual(self._resolved("ark-compat", "AVM_MINTER_URL",
+                                        "https://minter.example.com"), [])
+
+    def test_split_netloc_handles_ipv6_and_credentials(self):
+        self.assertEqual(self.tool.split_netloc("http://user:pw@h:8895/x"), ("h", "8895"))
+        self.assertEqual(self.tool.split_netloc("http://[::1]:8895"), ("::1", "8895"))
+        self.assertEqual(self.tool.split_netloc("http://h"), ("h", ""))
+        self.assertEqual(self.tool.split_netloc("not-a-url"), ("", ""))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -110,10 +110,29 @@ COPY tools/turnstile_minter.py tools/turnstile_service.py /app/tools/
 #      （AVM16-SEED-HOT：整卷播种后 3 连败全 interactive，CF 的信任不落在 profile 里）。
 #      —— 别再据此把 /data 卷当成解药；要的是 `TZ` 在场。播种的唯一价值是省掉预热时间。
 VOLUME ["/data"]
+# ⚠️ `EXPOSE` 只是**文档性**信息（host 网络下它不产生任何端口映射，本项目 minter 就走
+#    host 网络）；实际监听端口由运行时的 `PORT` 决定（默认与这里一致）。
 EXPOSE 8899
 
 # start-period 给足：首次冷启动 + 池子补满约 1 分钟
+#
+# 🔴 **不要把地址/端口写死在健康检查里**（E2E-AVM-012 定案）。这里曾是
+#      CMD curl -fsS "http://127.0.0.1:8899/healthz"
+#    而 `PORT`（以及 `BIND_HOST`）是**部署可覆盖**的运行时旋钮：node064 的 compose
+#    override 只挪了端口（8895）⇒ 服务好端端的、铸造照常、`/healthz:8895` 一片正常，
+#    `docker ps` 却恒 `unhealthy`（E2E-AVM-010 定位、0.0.18 仍在）。
+#    假警报比"没有健康检查"更糟：它会训练人忽略健康状态，也会让
+#    `depends_on: condition: service_healthy` 一类编排直接卡住。
+#    同一个写死还会在 `AVM_MINTER_BIND_HOST=172.17.0.1`（文档里的"开放但不挂公网"写法）
+#    下 100% 误报 —— 那时容器里根本没有套接字监听回环。
+#
+# ✅ 现在调**服务自己的**自检，且用 **exec 形态**（不过 shell ⇒ 没有任何插值可言）：
+#    端口与地址由服务进程自己从 PORT / BIND_HOST 读，镜像侧不再重复一份数字。
+#    `tools/turnstile_service.py --selfcheck` 与 `/healthz` **是同一处判据**
+#    （HTTP 200 且报文含 ready 键）；`ready=false`（Chrome 还在预热）依旧算健康，
+#    与原判据等价 —— 这次只修"打到哪个地址"，不改健康语义。
+#    排查用：`docker inspect --format '{{json .State.Health}}' avm-minter`
 HEALTHCHECK --interval=30s --timeout=5s --start-period=150s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:8899/healthz" >/dev/null || exit 1
+    CMD ["python3", "/app/tools/turnstile_service.py", "--selfcheck"]
 
 CMD ["python3", "/app/tools/turnstile_service.py"]

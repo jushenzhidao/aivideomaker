@@ -13,6 +13,11 @@ API（默认 127.0.0.1:8899）：
                                     → {"token": "...", "source": "pool|live", "age_ms": 1200}
   POST /v1/turnstile/mint?n=4       取 n 个 → {"tokens": [...], "sources": [...]}
 
+CLI：`python3 turnstile_service.py --selfcheck` —— 容器 `HEALTHCHECK` 用它：打一次
+      **本进程实际监听**的那个 `/healthz`。镜像里曾把地址写死（`http://127.0.0.1:8899`），
+      而 `PORT` / `BIND_HOST` 都是部署可覆盖的旋钮 ⇒ 端口挪到 8895 之后服务好端端的、
+      `docker ps` 却一直 `unhealthy`（E2E-AVM-012 定案）。地址与端口只此一处来源。
+
 鉴权（**fail-closed**）：设了 `MINTER_KEY` 就要求 `X-Minter-Key` 头；
 **非回环绑定 + 未设 key ⇒ 启动即拒**（退出码 2），不再只告警后继续服务 ——
 本服务产出的 token 能直接过掉上游风控闸门，暴露到公网等于免费分发过闸能力。
@@ -36,6 +41,7 @@ import random
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -327,6 +333,76 @@ def health() -> dict:
         }
 
 
+# ------------------------------------------------------------------ 自检 --
+#
+# ★ 健康检查必须问**本进程实际监听**的那个地址（E2E-AVM-012 定案）。
+#   镜像里曾把它写死成 `curl http://127.0.0.1:8899/healthz`，而 `PORT` / `BIND_HOST`
+#   都是部署可覆盖的旋钮 —— node064 用 override 把端口挪到 8895 之后：服务好端端的、
+#   铸造照常、`/healthz:8895` 一片正常，`docker ps` 却恒 `unhealthy`。
+#   假警报比"没有健康检查"更糟：它会训练人忽略健康状态，也会卡住
+#   `depends_on: condition: service_healthy` 这类编排（整个栈起不来）。
+#   所以判据收口到一处：地址由 `PORT` / `BIND_HOST` 推导，镜像侧只调用 `--selfcheck`。
+
+_HEALTH_WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", ""})
+
+
+def health_host() -> str:
+    """自检该往**哪个地址**打 —— 口径与绑定一致，通配地址换成回环。
+
+    为什么不干脆写死 127.0.0.1：`BIND_HOST` 是可配的，文档里就有
+    `AVM_MINTER_BIND_HOST=172.17.0.1`（"开放但不挂公网"的收窄写法）—— 收到具体地址时
+    容器里**没有**套接字监听回环，写死回环的自检会 100% 假 unhealthy。
+    这与端口是同一族的错：把"部署可改的东西"写死在镜像里。
+    """
+    host = BIND_HOST.strip()
+    if host in LOOPBACK_HOSTS or host in _HEALTH_WILDCARD_HOSTS:
+        return "127.0.0.1"        # 绑通配地址时，回环一定也通
+    return host
+
+
+def health_url(port: int | None = None) -> str:
+    """健康端点完整 URL。端口只有一个来源：本模块启动时定下的 `PORT`。"""
+    return f"http://{health_host()}:{PORT if port is None else port}/healthz"
+
+
+def selfcheck(timeout: float = 3.0) -> tuple[bool, str]:
+    """打一次自己的 `/healthz`，返回 `(是否健康, 说明)`。给容器 `HEALTHCHECK` 用。
+
+    判据刻意与镜像里原来那份**等价**：HTTP 200。**不**要求 `ready=true` —— `ready` 是
+    "Chrome/页面就绪"，冷启动那一两分钟它本来就该是 false（见 `health()` 的注释）；把
+    "铸造就绪"当存活判据会让容器在整个预热期被反复重启（`start-period` 也就白设了）。
+
+    两条防御都保留（都不是理论风险，本项目各踩过一次）：
+      * `ProxyHandler({})` —— 环境里的 `HTTP_PROXY` 会把**回环**地址也拐走，返回的是代理
+        网关的错误体而不是 connection refused（极误导）；
+      * 报文必须含 `ready` 键 —— 挡下"打到别的服务/网关却拿到 200"的情形。
+
+    超时 3s < 镜像 `HEALTHCHECK --timeout=5s`：留出打印原因的时间（被 Docker 掐掉的话，
+    健康日志里只剩一行空白，等于没有诊断信息）。
+    """
+    url = health_url()
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout) as resp:
+            raw = resp.read() or b""
+    except Exception as e:  # noqa: BLE001  自检只关心"通不通"
+        return False, f"连不上 {url} —— {type(e).__name__}: {str(e)[:160]}"
+    try:
+        body = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        body = None
+    if not isinstance(body, dict) or "ready" not in body:
+        return False, f"{url} 有响应但不是本服务的 /healthz（缺 ready 字段）：{raw[:80]!r}"
+    return True, f"ok {url}（ready={body.get('ready')}）"
+
+
+def _cli_selfcheck() -> int:
+    ok, why = selfcheck()
+    print(("[ok] " if ok else "[fail] ") + why,
+          file=sys.stdout if ok else sys.stderr, flush=True)
+    return 0 if ok else 1
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -404,4 +480,9 @@ def main():
 
 
 if __name__ == "__main__":
+    # 容器 HEALTHCHECK 走这一支（Dockerfile.minter 的 CMD 是 **exec 形态**，不过 shell ⇒
+    # 没有任何插值可言）：端口与地址由本进程自己从 PORT / BIND_HOST 读，镜像里不再重复
+    # 写一遍数字 —— 那正是 E2E-AVM-012 那个假 unhealthy 的成因。
+    if "--selfcheck" in sys.argv[1:]:
+        raise SystemExit(_cli_selfcheck())
     main()
