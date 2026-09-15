@@ -298,7 +298,7 @@ def _passthrough_cookie_of(request: Request) -> str:
 def _upstream_and_credential_for(request: Request):
     """取本次请求要用的 web 上游，以及**本次请求的凭据原文**。
 
-    - **透传模式**（`AVM_PASSTHROUGH_COOKIE=1`）：调用方的 Bearer 就是网页会话 cookie，
+    - **透传模式**（`AVM_AUTH=passthrough`）：调用方的 Bearer 就是网页会话 cookie，
       按凭据指纹建/复用客户端 —— 每个调用方用自己的账号与免费窗口。
       返回 `(upstream, cookie)`；cookie 只用于创建时的凭据绑定（见 create_task）。
     - 否则用本进程持有的那份（`AVM_COOKIE`），返回 `(upstream, "")` ——

@@ -300,7 +300,7 @@ class TestHttpLayer(unittest.TestCase):
 
 
 class TestHttpGate(unittest.TestCase):
-    """设了 AVM_GATE_KEY 时，未授权请求必须被挡在翻译之前。"""
+    """设了闸门（`AVM_AUTH=key:<密钥>`）时，未授权请求必须被挡在翻译之前。"""
 
     @classmethod
     def setUpClass(cls):

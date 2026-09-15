@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """透传鉴权：调用方的 `Authorization: Bearer` 就是**上游凭据本身**。
 
-本文件测 web 线的透传开关（`AVM_PASSTHROUGH_COOKIE=1`）：调用方带自己的网页
+本文件测 web 线的透传模式（`AVM_AUTH=passthrough`）：调用方带自己的网页
 会话 cookie，本进程不再需要 `AVM_COOKIE`。
 
 纪律（与 test_ark_compat.py 一致）：

@@ -278,17 +278,42 @@ class TestWiring(unittest.TestCase):
         self.assertIn("AVM_AUTH: ${AVM_AUTH:-}", text)
 
     def test_docs_do_not_teach_the_deprecated_switches(self):
-        """文档（README / 包 README）里不该再有"照着配就用旧变量"的指令。
+        """文档（README / 模板 / **代码内 docstring**）里不该再有"照着配就用旧变量"。
 
-        只查**赋值形态**（`AVM_GATE_KEY=` / `AVM_PASSTHROUGH_COOKIE=1`），
-        因为解释迁移时提到的名字是必要的。
+        判据刻意做**窄**：只认**指令形态**（行首的 `NAME=` 或 `export NAME=`）。
+        为什么不用"全文出现即失败"：解释迁移时必然要提到旧名字、还要说明"旧代码只认
+        1/true/yes"，全文搜会把那些必要说明一起误伤，结果只能靠加白名单绕过 —— 那比没有门禁更糟。
+
+        ⚠️ 已知覆盖边界（**别高估它**）：句子中间的提及、以及 `（`NAME=1`）` 这类括号引用
+        不在判据内。本轮就有一处这样的漏改（`app.py` 某函数 docstring 里的括号引用），
+        是靠**人工全仓 grep** 才抓到的，不是靠这条门禁。回归到"照抄即用"形态（README 里写
+        一行 `export AVM_GATE_KEY=…`）才会被它拦下。
         """
-        for rel in ("README.md", "src/ark_compat/README.md"):
-            text = (ROOT / rel).read_text(encoding="utf-8")
-            with self.subTest(file=rel):
-                for legacy, bad in (("AVM_GATE_KEY", "AVM_GATE_KEY="),
-                                    ("AVM_PASSTHROUGH_COOKIE", "AVM_PASSTHROUGH_COOKIE=")):
-                    self.assertNotIn(bad, text, f"{rel} 里还在教 {legacy} 的赋值写法")
+        import ast
+        import re
+
+        pattern = re.compile(
+            r"^\s*(?:export\s+)?(?:AVM_GATE_KEY|AVM_PASSTHROUGH_COOKIE)=", re.M)
+
+        # 每项是 (标签, 待检查正文)
+        targets = [(rel, (ROOT / rel).read_text(encoding="utf-8"))
+                   for rel in ("README.md", "src/ark_compat/README.md", ".env.example")]
+        # 代码内文档同样会被人"照着做"：把全部 docstring 抠出来一并扫（AST 提取 ⇒
+        # 不会把 `#` 注释里那些必要的说明误判成指令）。
+        holders = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        for py in sorted((ROOT / "src").rglob("*.py")):
+            for node in ast.walk(ast.parse(py.read_text(encoding="utf-8"))):
+                if not isinstance(node, holders):      # get_docstring 只认这四类节点
+                    continue
+                doc = ast.get_docstring(node, clean=False)
+                if doc:
+                    rel = py.relative_to(ROOT)
+                    targets.append((f"{rel}::{getattr(node, 'name', '<module>')}", doc))
+
+        for label, body in targets:
+            with self.subTest(target=label):
+                self.assertIsNone(pattern.search(body),
+                                  f"{label} 里还在教废弃变量的赋值写法")
 
 
 if __name__ == "__main__":
