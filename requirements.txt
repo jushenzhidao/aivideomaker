@@ -33,6 +33,12 @@ loguru>=0.7
 #    警告后继续起服务 ⇒ **每个请求的自动 span 静默消失**（容器日志里每人 2 行，看不出后果）。
 #    2026-09-14 报告 AVM12-OPEN-LOGFIRE 实测发现：`logfire>=3.0` 不带 extra 时，
 #    `requirements.txt` 里搜 `logfire[fastapi]` 是 0 命中，而追踪链路上少了一层。
-logfire[fastapi]>=3.0
+# 🔴 2026-09-16：**同一类坑在 httpx 那层又来了一次** —— `observability.py` 里
+#    `logfire.instrument_httpx()` 需要 `[httpx]` extra（`opentelemetry-instrumentation-httpx`），
+#    缺了它同样是"抛 RuntimeError → 被 try/except 吞掉"⇒ **上游调用没有子 span**
+#    （"网关慢还是上游慢"就分不出来，而容器日志里一样看不出后果）。
+#    CI 是干净环境，由 `test_poll_suppression.py` **裸调** `instrument_httpx` 才炸出来（4 个 error）；
+#    本机恰好装着 ⇒ 本地全绿、CI 红，正是项目里记过多次的那一类。
+logfire[fastapi,httpx]>=3.0
 
 # 测试（TestClient 依赖 httpx，已在上面）

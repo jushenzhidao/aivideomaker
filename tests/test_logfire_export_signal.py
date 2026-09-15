@@ -14,6 +14,7 @@
 
 import os
 import pathlib
+import re
 import sys
 import unittest
 from importlib.metadata import PackageNotFoundError, metadata
@@ -157,9 +158,19 @@ class TestFastapiInstrumentationIsDeclared(unittest.TestCase):
 
     def test_requirements_declare_the_fastapi_extra(self):
         lines = self._requirement_lines()
-        self.assertTrue(
-            any(ln.startswith("logfire[fastapi]") for ln in lines),
-            f"requirements.txt 里没有 logfire[fastapi] extra：{lines}",
+        # ⚠️ 判据必须是"extra **集合**里含 fastapi"，不是前缀精确匹配 `logfire[fastapi]` ——
+        #    2026-09-16 把声明扩成 `logfire[fastapi,httpx]`（补上 httpx 那层同样的坑）时，
+        #    前缀写法当场变红。**门禁不该锁死书写形式，只该锁死"这个 extra 到底有没有"**。
+        #    另：`tests/test_logfire_extras_declared.py` 已把这条推广成**机械发现**
+        #    （扫源码里所有 `logfire.instrument_*`，逐个要求 extra 已声明且本机可 import）。
+        declared: set = set()
+        for ln in lines:
+            m = re.match(r"logfire\[([^\]]+)\]", ln)
+            if m:
+                declared |= {e.strip() for e in m.group(1).split(",") if e.strip()}
+        self.assertIn(
+            "fastapi", declared,
+            f"requirements.txt 的 logfire[...] 里没有 fastapi extra（声明到的是 {sorted(declared)}）",
         )
         self.assertFalse(
             any(ln.startswith("logfire>=") for ln in lines),
