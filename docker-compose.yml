@@ -25,7 +25,10 @@
 # 🔓 **铸造服务默认开放：不需要 `AVM_MINTER_KEY`**（2026-09-14 用户口径）。
 # 代价必须知道：minter 走 host 网络 ⇒ 8899 就是**宿主端口**，无凭据即"谁连得上谁就能领
 # token"（等于把过闸能力分发出去，也会让账号更快撞风控）。敞开不等于必须挂公网 —— 两条收口路：
-#   ① 限绑定地址：`AVM_MINTER_BIND_HOST=127.0.0.1`（需 ark-compat 也走 host 网络）或内网地址；
+#   ① 限绑定地址：`AVM_MINTER_BIND_HOST=<内网地址>`（🔴 **不是 127.0.0.1** —— 那只在
+#      **ark-compat 也走 host 网络**时成立，而本文件里它是桥接的 ⇒ 回环绑定会让适配层
+#      **永远取不到 token**，且症状是"minter 照常铸造、/healthz 全绿、served 恒 0"。
+#      这条已固化进 `tools/compose_wiring_check.py`，静态档与 `--resolve` 都会拦）；
 #   ② 配 key 并关掉开放模式：`AVM_MINTER_KEY=<随机串>` + `AVM_MINTER_ALLOW_INSECURE=0`
 #      —— 此时前置校验恢复"缺 key 就让 `up` 直接失败"（fail-closed 机制仍在，只是默认不启用）。
 #
@@ -429,8 +432,19 @@ services:
       MINTER_KEY: ${AVM_MINTER_KEY:-}
       # 默认 1 = 开放（见上）。要恢复 fail-closed：置 0 并配 MINTER_KEY。
       MINTER_ALLOW_INSECURE: ${AVM_MINTER_ALLOW_INSECURE:-1}
-      # 绑定地址，默认与镜像一致（0.0.0.0 = 开箱即用）。"开放但不挂公网"就收到回环/内网地址，
-      # 例如 AVM_MINTER_BIND_HOST=172.17.0.1（docker0 网关，桥接网络里的 ark-compat 可达）。
+      # 绑定地址，默认与镜像一致（0.0.0.0 = 开箱即用）。"开放但不挂公网"就收到内网地址。
+      # 🔴 **别写 127.0.0.1**（2026-09-15 实测）：minter 走 host 网络 ⇒ 桥接的 ark-compat
+      #    访问它是**出网到宿主**，打的是宿主在**本项目网络**上的那个地址（`host.docker.internal`
+      #    → 网关，见 `docker network inspect aivideomaker_default`）；而回环套接字只收目的
+      #    地址为 127.0.0.1/::1 的包 ⇒ connection refused。且症状误导性极强：**minter 照常
+      #    铸造**（补货与谁在取无关）、`/healthz` 全绿、池子满着，只有 `served` 恒为 0。
+      #    ⇒ 回环绑定只在 **ark-compat 也走 host 网络**时才成立（文件头那句括号里的前提），
+      #      而默认 compose 里它是桥接的。要收窄就二选一：
+      #        ① 删掉本项（回落 0.0.0.0）+ 宿主防火墙只放容器网段：
+      #           `ufw allow proto tcp from 172.16.0.0/12 to any port 8899`
+      #        ② 绑**本项目网络的网关地址**（上面那条 inspect 的结果；⚠️ **不是** 172.17.0.1
+      #           —— 那是 docker0 的，本项目用 user-defined 网络，网关通常落在 172.18.0.0/16）
+      #    本项已固化进 `tools/compose_wiring_check.py`（静态档 + `--resolve` 都会拦）。
       BIND_HOST: ${AVM_MINTER_BIND_HOST:-0.0.0.0}
       # 池子水位与 token 存活上限（秒）。
       # ⚠️ POOL_TARGET 是**每个铸造器实例**的池子，不是账号维度（token 绑 sitekey+域名，

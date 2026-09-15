@@ -57,6 +57,19 @@ E2E-AVM-012 新增：`AVM_MINTER_URL` 里的**端口**必须与 minter 的 `PORT
 本工具在 `--resolve` 时**复用 `ark_compat.settings` 的判据**，把两类"容器启动即被拒"的配置
 提前到部署前报出来：取值非法（裸密钥、`key:` 空密钥），以及已废弃的
 `AVM_GATE_KEY` / `AVM_PASSTHROUGH_COOKIE` 仍"有行为"。
+
+2026-09-15 新增（`loopback_bind_conflict`，静态档 + 解析档共用同一判据）：minter 的
+`BIND_HOST` 被收窄到**回环**、而 ark-compat 不是 host 网络 ⇒ **适配层永远取不到 token**。
+这条以前两档都报 `[ok]`，只有 `--probe` 看得见 —— 而"照注释把铸造服务收到本机"是个很自然
+的动作：compose 文件头就写着 `AVM_MINTER_BIND_HOST=127.0.0.1`，只是括号里那个前提
+（"需 ark-compat 也走 host 网络"）在默认 compose 里**不成立**（ark-compat 有 `ports:`
+映射与 `extra_hosts`，是桥接的）。注释即契约 —— 于是把契约搬进判据。
+
+**判据的适用域 = Linux 原生 Docker**（本仓库的生产形态：Linux 服务器是一等公民，
+compose 里的 `minter` 服务真的在跑）。判据成立的理由是 Linux 的网络语义：`host-gateway`
+= **桥接网段的网关地址**，桥接容器打它属于跨命名空间流量，回环套接字收不到。
+macOS 开发机按 compose 的建议**宿主直跑 minter、只起适配层**（不起 compose 的 `minter` 服务）
+—— 那种形态不在本判据的适用范围内；**不为此放宽判据**（放宽的代价是这条真缺陷重新变成静默）。
 """
 
 from __future__ import annotations
@@ -272,6 +285,20 @@ def check_static(services: dict) -> list[str]:
             "TCP 指纹，CF 判机器人 ⇒ 铸造整体失效（实测同机同 Chrome：宿主 3.7s ✅ / "
             "bridge ❌）。必须保留 `network_mode: host`。"
         )
+
+    # ⑦ 回环绑定 × 桥接适配层（2026-09-15 定案）：`BIND_HOST` 收窄到回环在 host 网络下
+    #    = **适配层永远取不到 token**（见 loopback_bind_conflict 的推导）。这里只看
+    #    **表达式里能确定的那个值**（字面量，或 `:-` 给的默认值 —— .env 留空时生效的就是它）；
+    #    `.env` 里写进去的值由 `--resolve` 档按真实值复核。两档共用同一个判据函数。
+    bind_expr = minter.get("BIND_HOST", "")
+    if "${" not in bind_expr:
+        bind_static = bind_expr.strip()          # 写死的字面量
+    else:
+        parsed = interp_default(bind_expr)
+        bind_static = (parsed[1] or "").strip() if parsed else ""
+    conflict = loopback_bind_conflict(bind_static, app.get("network_mode", ""))
+    if conflict:
+        problems.append(conflict)
     return problems
 
 
@@ -386,6 +413,10 @@ def probe_minter(compose: Path, url: str) -> list[str]:
 def resolved_services(compose: Path) -> dict:
     """`docker compose config --format json` → `{服务: {env 键: 真实值}}`。
 
+    额外塞进一个小写键 `"network_mode"`（env 键全是大写，不会撞名；口径与
+    `parse_services` 一致）—— 回环绑定那条判据必须知道两侧**各自在哪个网络栈**里，
+    只看 env 是判不出来的。
+
     `config` **不联网、不拉镜像**，纯本地插值。缺 docker / 解析失败一律抛错（调用方判失败）：
     显式要了 `--resolve` 却把"没跑成"当成"没问题"，正是这类前置检查最典型的自我欺骗。
     """
@@ -401,7 +432,10 @@ def resolved_services(compose: Path) -> dict:
         env = svc.get("environment") or {}
         if isinstance(env, list):   # `- KEY=value` 形态
             env = dict(x.split("=", 1) for x in env if "=" in x)
-        services[name] = {str(k): ("" if v is None else str(v)) for k, v in env.items()}
+        resolved = {str(k): ("" if v is None else str(v)) for k, v in env.items()}
+        # None / 缺席 ⇒ 该服务在默认桥接网络上（"没设"与"设成空"在这里同义，都不是 host）
+        resolved["network_mode"] = str(svc.get("network_mode") or "")
+        services[name] = resolved
     return services
 
 
@@ -440,6 +474,50 @@ def auth_problems(app_env: dict) -> list:
 # 它监听的端口与 URL 里的端口**必须**是同一个数字。指向别的主机时本工具无从判定（那可能
 # 是另一台机器上的 minter），故跳过、不误报。
 SELF_HOSTS = frozenset({"host.docker.internal", "localhost", "127.0.0.1", "::1"})
+
+# **与 `tools/turnstile_service.LOOPBACK_HOSTS` 同口径**（有测试钉住两者相等，别各写一份）。
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def loopback_bind_conflict(bind_host: str, app_network_mode: str) -> str | None:
+    """minter 收窄到**回环** ＋ ark-compat 不是 host 网络 ⇒ 适配层永远取不到 token。
+
+    为什么这一定是错的（而不是"更安全的写法"）：minter 走 host 网络时，桥接的 ark-compat
+    访问它属于**出网到宿主**，打的是宿主在**桥接网段**上的那个地址（`host.docker.internal`
+    解析到该网络的网关，例如 172.18.0.1）。而回环套接字只接收目的地址是 127.0.0.1/::1 的
+    包 —— 内核对目的地址为网关 IP 的连接**不会**投给它，桥接容器拿到的是 connection refused。
+    ⇒ 症状与 E2E-AVM-008 同族、且更难查：**minter 照常铸造**（补货是自驱动的，与谁在取无关）、
+    `/healthz` 全绿、`pool` 满着，只有"取 token"这一步永远失败（`served` 恒 0），
+    闸门一翻就是 429「configured but unavailable」。
+
+    出处：compose 文件头自己写着「限绑定地址：`AVM_MINTER_BIND_HOST=127.0.0.1`（**需
+    ark-compat 也走 host 网络**）或内网地址」—— 那句的**前提条件在默认 compose 里并不成立**
+    （ark-compat 是桥接的）。注释里有这条依赖，判据里原先没有 ⇒ 照注释顺手抄了地址的部署会
+    静默取不到 token。这里把它钉住。
+
+    两条出路：① 删掉 `AVM_MINTER_BIND_HOST`（回落 0.0.0.0）并用宿主防火墙只放给容器网段
+    （`ufw allow proto tcp from 172.16.0.0/12 to any port 8899`）；② 真要收窄到具体地址，
+    就得绑**该 compose 网络的网关**（先用 `docker network inspect <项目>_default` 确认，
+    别盲抄注释里的 172.17.0.1 —— 那是 docker0 的，本项目在 user-defined 网络上）。
+    """
+    host = str(bind_host or "").strip().lower()
+    if host not in LOOPBACK_HOSTS:
+        return None
+    if str(app_network_mode or "").strip() == "host":
+        return None            # 同在宿主网络栈 ⇒ 打 127.0.0.1 就是打到它，这条成立
+    return (
+        f"[接线] {MINTER}.BIND_HOST={bind_host!r} 是**回环地址**，而 {APP} 不是 host 网络"
+        f"（network_mode={app_network_mode!r}）⇒ 适配层**永远取不到 token**：桥接容器访问 "
+        "host 网络的 minter 是出网到宿主，打的是宿主在桥接网段上的地址（host.docker.internal "
+        "→ 该网络的网关），而回环套接字只收目的地址为 127.0.0.1/::1 的包 ⇒ connection refused。"
+        "症状具有强迷惑性：minter 照常铸造、/healthz 全绿、池子是满的，只有 `served` 恒为 0，"
+        "闸门一翻就 429「configured but unavailable」。"
+        "两条出路：① 删掉 AVM_MINTER_BIND_HOST（回落 0.0.0.0）并用宿主防火墙把该端口只放给"
+        "容器网段（`ufw allow proto tcp from 172.16.0.0/12 to any port 8899`）；"
+        "② 确要收窄就绑**本项目 compose 网络的网关地址**（`docker network inspect "
+        "aivideomaker_default` 确认，别用 127.0.0.1，也别盲抄 172.17.0.1），或让 ark-compat "
+        "也走 host 网络（那要连端口映射与 extra_hosts 一起重排）。"
+    )
 
 
 def split_netloc(url: str) -> tuple:
@@ -494,6 +572,15 @@ def check_resolved(services: dict) -> list[str]:
                 f"若你有意指向**另一台主机**上的 minter，请把那台的真实主机名写进地址"
                 f"（别用 `{host}`）—— 本项只在地址指向本机时才比对。"
             )
+
+    # ★ 回环绑定 × 桥接适配层（2026-09-15 定案）：`AVM_MINTER_BIND_HOST=127.0.0.1` 这类
+    #   "把铸造服务收到本机"的写法，只在 **ark-compat 也走 host 网络**时才成立 ——
+    #   compose 文件头那句注释写明了这个前提，而**默认 compose 里 ark-compat 是桥接的**
+    #   （它有 `ports:` 映射 + `extra_hosts`）。⇒ 照注释顺手抄了这个地址的部署，
+    #   静态档与解析档原先**都报 [ok]**（这条判据当时不存在），只有 `--probe` 才看得见。
+    conflict = loopback_bind_conflict(minter.get("BIND_HOST", ""), app.get("network_mode", ""))
+    if conflict:
+        problems.append(conflict)
 
     if app.get("ARK_HOST") != "0.0.0.0":
         problems.append(f"[接线] {APP}.ARK_HOST={app.get('ARK_HOST')!r} ⇒ 端口映射失效。")
@@ -596,11 +683,16 @@ def main(argv: list[str]) -> int:
         print(f"[fatal] compose 接线校验未通过（{len(problems)} 项）：", file=sys.stderr)
         for p in problems:
             print("  - " + p, file=sys.stderr)
-        print(
-            "\n  修法：两侧的 key 都写成同一个变量的插值（`${AVM_MINTER_KEY:-}`），"
-            "别在任何一侧写死字面量。细节见 docker-compose.yml 的 minter 段注释。",
-            file=sys.stderr,
-        )
+        # 这条兜底修法**只在真的存在"两侧不同源"那类问题时才打**（2026-09-15）。原来是无条件
+        # 打，于是新增的 BIND_HOST / TZ / 端口类问题后面会跟上一句与它无关的
+        # "改回 ${AVM_MINTER_KEY:-}" —— 归因不实会把运维引去查一个没坏的地方（P-07 那类
+        # "归因必须逐条对得上真实原因"的错，本项目已经修过两次）。每条问题自己已经带了修法。
+        if any("MINTER_KEY" in p for p in problems):
+            print(
+                "\n  修法：两侧的 key 都写成同一个变量的插值（`${AVM_MINTER_KEY:-}`），"
+                "别在任何一侧写死字面量。细节见 docker-compose.yml 的 minter 段注释。",
+                file=sys.stderr,
+            )
         return 2
 
     modes = ["静态"]

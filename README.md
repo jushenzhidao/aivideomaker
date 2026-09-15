@@ -62,7 +62,7 @@ aivideomaker/
 ├── tests/                             Python 单测（380+ 项，零消耗、零外发）
 ├── tools/                             运维与验证工具（零第三方依赖）
 │   ├── egress_audit.py                全量单测 + 零外发审计 + **零跳过**（CI 的测试门禁）
-│   ├── compose_wiring_check.py        编排接线校验（两侧 key 必须同源；`--resolve` 比对真实值）
+│   ├── compose_wiring_check.py        编排接线校验（key 必须同源、回环绑定×桥接会被拦；`--resolve` 比对真实值）
 │   ├── turnstile_service.py           Turnstile 铸造**服务**（常驻，镜像是 Dockerfile.minter）
 │   └── turnstile_minter.py            铸造核心（Xvfb 有头 Chrome + 原生 CDP）
 ├── docs/
@@ -153,6 +153,10 @@ r = client.content_generation.tasks.create(
 Seedance 2.5「全能参考」上限为**图 4 / 视频 1 / 音频 2**，超限条目会被截断并在响应的
 `unsupported` 中留痕。
 
+接口文档：服务起来后 `/docs`（Swagger UI）、`/redoc`（ReDoc）、`/openapi.json`（OpenAPI 3.1
+schema）。⚠️ 三者**不受** `AVM_AUTH` 保护（闸门模式下也无需凭据），且页面资源由**浏览器**
+从 CDN 取 —— 服务端返回 200 也可能白屏。详见 [`src/ark_compat/README.md`](src/ark_compat/README.md)。
+
 测试：`python3 -m unittest discover -s tests`（380+ 项，零消耗、零外发）。
 零外发可复验：`python3 tools/egress_audit.py`（有非回环出站、**或有用例被跳过**，都以非 0 退出
 —— 进 CI 的门禁**被跳过 ≠ 通过**，实测有一条编排门禁因此长期没跑过）。
@@ -225,8 +229,14 @@ docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_P
 > ```
 >
 > 顺手还会拦下 `ARK_HOST` 被绑回环（端口映射会失效）、`AVM_MINTER_URL` 丢掉 `:-` 默认值
-> （铸造能力被**静默**关掉）与 minter 离开 host 网络（NAT 改写 TCP 指纹 ⇒ 铸造整体失效）
-> 这三类"配了不生效"。
+> （铸造能力被**静默**关掉）、minter 离开 host 网络（NAT 改写 TCP 指纹 ⇒ 铸造整体失效），
+> 以及 minter 的 `AVM_MINTER_BIND_HOST` 被收窄到 **回环**而 ark-compat 仍是桥接
+> （两者不在同一网络栈 ⇒ **适配层永远取不到 token**；回环绑定只在 ark-compat 也走
+> host 网络时才成立，而默认 compose 里它是桥接的）—— 这几类"配了不生效"。
+> 后一类尤其像"更安全的写法"：minter 照常铸造、`/healthz` 全绿、池子满着，只有
+> `served` 恒为 0，闸门一翻才是 429。要收窄就绑**本项目 compose 网络的网关地址**
+> （`docker network inspect aivideomaker_default` 确认），或用宿主防火墙把该端口
+> 只放给容器网段。
 >
 > ✅ **健康检查跟随 `PORT`（不再有假 `unhealthy`）**：0.0.18 及以前，镜像的 `HEALTHCHECK`
 > 把地址写死成 `curl http://127.0.0.1:8899/healthz` —— 只要部署把端口挪走（node064 的
@@ -279,9 +289,12 @@ docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_P
 
 **多 worker 是这里唯一的坑。** 上游闸门是进程内 `threading.Semaphore`，「全局只跑 2 个」依赖
 单进程：开 N 个 worker 会让实际并发变成 N×2，第 3 个起上游直接返回 `The queue is full`
-（并更易触发验证码闸门）。安全做法是让 `AVM_WORKERS ≤ AVM_MAX_CONCURRENT`，
-`src/gunicorn_conf.py` 会把全局额度按 worker 数**向下分摊**并打印实际全局值
-（`2 ÷ 2` ⇒ 每 worker 1、全局仍是 2）。
+（并更易触发验证码闸门）。安全做法是让 worker 数不超过上游额度，两条路都已在
+`src/gunicorn_conf.py` 收口：`AVM_MAX_CONCURRENT` 取**数字**时要求
+`AVM_WORKERS ≤ AVM_MAX_CONCURRENT`，按 worker 数**向下分摊**并打印实际全局值
+（`2 ÷ 2` ⇒ 每 worker 1、全局仍是 2）；取 **0（自动，模板与 compose 的默认）**时
+master 下发除数为 worker 数，由 worker 内探测到的账号额度按 ÷N 分摊
+（每账号全局仍恰好等于它的 `maxQueueLength`，pro 的 4 不会被缩成 2）。
 
 其余两个必须成对看的参数：
 

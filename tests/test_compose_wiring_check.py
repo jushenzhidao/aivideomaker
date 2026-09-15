@@ -247,7 +247,7 @@ class TestPortCoherence(unittest.TestCase):
         self.base = {
             "ark-compat": {"AVM_MINTER_URL": "http://host.docker.internal:8899",
                            "ARK_HOST": "0.0.0.0", "AVM_MINTER_KEY": "k"},
-            "minter": {"MINTER_KEY": "k", "PORT": "8899", "BIND_HOST": "127.0.0.1",
+            "minter": {"MINTER_KEY": "k", "PORT": "8899", "BIND_HOST": "0.0.0.0",   # 桥接适配层 ⇒ 不能收窄到回环（见 loopback_bind_conflict）
                        "TZ": "Asia/Shanghai"},
         }
 
@@ -300,6 +300,105 @@ class TestPortCoherence(unittest.TestCase):
         self.assertEqual(self.tool.split_netloc("http://[::1]:8895"), ("::1", "8895"))
         self.assertEqual(self.tool.split_netloc("http://h"), ("h", ""))
         self.assertEqual(self.tool.split_netloc("not-a-url"), ("", ""))
+
+
+class TestLoopbackBindVersusBridgedApp(unittest.TestCase):
+    """minter 收窄到**回环** × ark-compat **桥接** ⇒ 适配层永远取不到 token（2026-09-15 定案）。
+
+    为什么单列一类：这个组合在**静态档与解析档原先都报 `[ok]`**（判据当时根本不存在），
+    而它极容易被顺手写出来 —— compose 文件头自己就示例了
+    `AVM_MINTER_BIND_HOST=127.0.0.1`，只是括号里那句前提（"**需 ark-compat 也走 host 网络**"）
+    在默认 compose 里不成立（ark-compat 有 `ports:` 映射与 `extra_hosts`，是桥接的）。
+    症状尤其难查：minter **照常铸造**（补货是自驱动的，与谁在取无关）、`/healthz` 全绿、
+    池子满着，只有 `served` 恒为 0 —— 闸门一翻才是 429「configured but unavailable」。
+    """
+
+    def setUp(self):
+        self.tool = _load_tool()
+        self.compose = COMPOSE.read_text(encoding="utf-8")
+
+    def _problems(self, text: str) -> list:
+        return self.tool.check_static(self.tool.parse_services(text))
+
+    def _resolved(self, bind_host: str, app_network_mode: str) -> list:
+        """造一份"解析后"的输入：两侧网络栈由调用方指定，其余都用合法值。"""
+        return self.tool.check_resolved({
+            "ark-compat": {"AVM_MINTER_URL": "http://host.docker.internal:8899",
+                           "ARK_HOST": "0.0.0.0", "AVM_MINTER_KEY": "k",
+                           "network_mode": app_network_mode},
+            "minter": {"MINTER_KEY": "k", "PORT": "8899", "BIND_HOST": bind_host,
+                       "TZ": "Asia/Shanghai", "network_mode": "host"},
+        })
+
+    # ---- 判据本身 --------------------------------------------------------
+    def test_loopback_set_matches_the_real_guard(self):
+        """★ 别各写一份回环名单：与 `turnstile_service.LOOPBACK_HOSTS` 必须同集合。
+
+        （判据分叉过一次的教训在本仓库不止一条；两处名单漂移时，这边放行的配置在
+        真实守卫那里是"非回环"、于是行为完全对不上。）
+        """
+        spec = importlib.util.spec_from_file_location(
+            "turnstile_service_ro", ROOT / "tools" / "turnstile_service.py")
+        svc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(svc)
+        self.assertEqual(set(self.tool.LOOPBACK_HOSTS), set(svc.LOOPBACK_HOSTS))
+
+    def test_predicate_matrix(self):
+        conflict = self.tool.loopback_bind_conflict
+        for host in ("127.0.0.1", "::1", "localhost", " 127.0.0.1 "):
+            with self.subTest(bind=host):
+                self.assertTrue(conflict(host, ""), host)
+                self.assertTrue(conflict(host, "bridge"), host)
+        # 两侧同在宿主网络栈 ⇒ 打 127.0.0.1 就是打到它，这条**成立**，不能误报
+        self.assertIsNone(conflict("127.0.0.1", "host"))
+        # 通配地址 / 具体地址都不是回环 ⇒ 本项闭嘴（"具体地址对不对"只能由 --probe 实测）
+        self.assertIsNone(conflict("0.0.0.0", ""))
+        self.assertIsNone(conflict("172.18.0.1", ""))
+        self.assertIsNone(conflict("", ""))
+
+    # ---- 静态档：只看得见"表达式里能确定的那个值"（字面量或 `:-` 的默认值）----
+    def test_real_compose_passes(self):
+        """真实 compose 的默认值是 0.0.0.0 ⇒ 静态档必须通过（门禁不能写成永远红）。"""
+        self.assertEqual(self._problems(self.compose), [])
+
+    def test_catches_a_hardcoded_loopback_bind(self):
+        mut = _mutate(self.compose, "minter",
+                      "      BIND_HOST: ${AVM_MINTER_BIND_HOST:-0.0.0.0}\n",
+                      "      BIND_HOST: 127.0.0.1\n")
+        problems = self._problems(mut)
+        self.assertTrue(any("回环地址" in p for p in problems), problems)
+
+    def test_catches_a_loopback_default(self):
+        """★ 最像"合理写法"的一种：默认值被改成回环 —— .env 一留空就静默取不到 token。"""
+        mut = _mutate(self.compose, "minter",
+                      "      BIND_HOST: ${AVM_MINTER_BIND_HOST:-0.0.0.0}",
+                      "      BIND_HOST: ${AVM_MINTER_BIND_HOST:-127.0.0.1}")
+        self.assertTrue(any("回环地址" in p for p in self._problems(mut)))
+
+    def test_no_conflict_when_the_app_is_also_on_host_network(self):
+        """两侧都走 host 网络 ⇒ 回环绑定成立，必须放行（否则门禁会误报**正确**的配置，
+        而误报的代价是这个门禁从此被人忽略）。"""
+        mut = _mutate(self.compose, "ark-compat",
+                      "    container_name: ark-compat\n",
+                      "    container_name: ark-compat\n    network_mode: host\n")
+        mut = _mutate(mut, "minter",
+                      "      BIND_HOST: ${AVM_MINTER_BIND_HOST:-0.0.0.0}\n",
+                      "      BIND_HOST: 127.0.0.1\n")
+        self.assertEqual(self._problems(mut), [])
+
+    # ---- 解析档：`.env` 里真正写进去的值（分叉的高发地）----
+    def test_resolved_catches_loopback_with_bridged_app(self):
+        """★ 本轮真实触发的那个配置：`.env` 里 `AVM_MINTER_BIND_HOST=127.0.0.1`，
+        ark-compat 没有 network_mode（= 桥接）。"""
+        problems = self._resolved("127.0.0.1", "")
+        self.assertTrue(any("回环地址" in p for p in problems), problems)
+        self.assertTrue(any("served" in p for p in problems), "报错要给症状：%s" % problems)
+
+    def test_resolved_passes_loopback_when_app_is_host_networked(self):
+        self.assertEqual(self._resolved("127.0.0.1", "host"), [])
+
+    def test_resolved_passes_a_wildcard_bind(self):
+        self.assertEqual(self._resolved("0.0.0.0", ""), [])
 
 
 class TestAuthSingleVariable(unittest.TestCase):
@@ -356,7 +455,7 @@ class TestAuthSingleVariable(unittest.TestCase):
             "ark-compat": {"AVM_MINTER_URL": "http://host.docker.internal:8899",
                            "ARK_HOST": "0.0.0.0", "AVM_MINTER_KEY": "k",
                            "AVM_GATE_KEY": "sk-old"},
-            "minter": {"MINTER_KEY": "k", "PORT": "8899", "BIND_HOST": "127.0.0.1",
+            "minter": {"MINTER_KEY": "k", "PORT": "8899", "BIND_HOST": "0.0.0.0",   # 桥接适配层 ⇒ 不能收窄到回环（见 loopback_bind_conflict）
                        "TZ": "Asia/Shanghai"},
         }
         problems = self.tool.check_resolved(svc)
