@@ -183,6 +183,19 @@ class Settings:
     # 探测类**只读**请求的超时（秒）：出口代理的 TLS 握手实测抖到 10s+，
     # 一发卡住的探测会占满重试循环（默认 30s），所以探测单独用短超时。
     probe_timeout: float = 8.0
+    # 「参考文件链接」的**单项**网络预算（秒，`AVM_MEDIA_FETCH_TIMEOUT`）。
+    # 🔴 它与**调用方的超时**直接竞争：调大 ⇒ 调用方先超时，而我们还在跑并接着把任务
+    # 提交出去（那一步计费）。所以宁可快失败、给出点名步骤的错误。
+    # 2026-09-16 由 20 调到 30（= WebClient 的默认请求超时）：给慢链路留出与其它上游调用
+    # 同等的余量。**前提是调用方超时不少于 180 秒**（30 + 提交/排队）。
+    # ⚠️ 此处刻意不写「≥ 数字s」那种形式：它会撞上计费文案门禁当"免费窗口上界"的锚点
+    #    （`tests/test_docs_billing_sync.py` 的锚点要求 `≥` 后面紧跟数字与 `s`）而报红。
+    #    措辞别扭是有原因的，别改回去 —— 连解释里也不能出现那个形式（本次已踩）。
+    media_fetch_timeout: float = 30.0
+    # **整个转存阶段**的总预算（秒，`AVM_MEDIA_REHOST_BUDGET`）：一次创建最多 7 个媒体项
+    # （图 4 / 视频 1 / 音频 2）且串行转存，没有总闸就是"单项超时 × 项数"。
+    # 2026-09-16 由 90 调到 120 = **图 4 × 单项 30s**（最常见的"多图带链接"档位）。
+    media_rehost_budget: float = 120.0
     # 号池上报是否带**账号身份（邮箱）**。默认关：遥测里放 PII 要显式点头。
     account_report_identity: bool = False
     # ---- Turnstile token 铸造服务（见 tools/turnstile_service.py）----
@@ -272,6 +285,8 @@ class Settings:
             concurrency_divisor=max(1, int(env.get("AVM_CONCURRENCY_DIVISOR") or 1)),
             poll_interval=float(env.get("AVM_POLL_SECONDS") or 10),
             probe_timeout=float(env.get("AVM_PROBE_TIMEOUT") or 8),
+            media_fetch_timeout=float(env.get("AVM_MEDIA_FETCH_TIMEOUT") or 30),
+            media_rehost_budget=float(env.get("AVM_MEDIA_REHOST_BUDGET") or 120),
             minter_url=(env.get("AVM_MINTER_URL") or "").strip(),
             minter_key=(env.get("AVM_MINTER_KEY") or "").strip(),
             minter_timeout=float(env.get("AVM_MINTER_TIMEOUT") or 25),

@@ -68,6 +68,40 @@ def parse_sse(text: str) -> dict | None:
     return None
 
 
+class MediaFetchBudget:
+    """**整个转存阶段**共享的总预算（秒）。
+
+    为什么必须有一个"总"预算：一次 `POST /tasks` 里最多有 7 个媒体项要转存
+    （图 4 / 视频 1 / 音频 2），而转存是**串行**的。每项各自有超时（下载 / 预签名 /
+    PUT），但**没有总闸**时最坏情况是 7 × 单项链路的超时之和 —— 这几分钟全部发生在
+    调用方**同步等待**的那一个请求里。后果不只是"调用方超时"：它还可能在超时之后
+    继续跑完，**并把任务提交出去（那一步是计费的）**。
+
+    有了总预算，走不完就直接 504 并**点名是哪一步、哪一项、已用多少秒**。
+    """
+
+    def __init__(self, seconds: float):
+        self.seconds = max(1.0, float(seconds))
+        self.deadline = time.perf_counter() + self.seconds
+
+    def remaining(self) -> float:
+        return self.deadline - time.perf_counter()
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0
+
+    def elapsed(self) -> float:
+        return self.seconds - self.remaining()
+
+    def exhausted_error(self, step: str = "转存") -> WebApiError:
+        return WebApiError(
+            step,
+            f"总预算 {self.seconds:.0f}s 已耗尽（已用 {self.elapsed():.1f}s）—— 参考文件太多或"
+            f"太慢；可调大 AVM_MEDIA_REHOST_BUDGET，或把链接换成更快/更小的直链",
+            http_status=504,
+        )
+
+
 class WebClient:
     """网页端会话客户端。`cookie` 至少要有 `auth_session`。"""
 
@@ -85,6 +119,10 @@ class WebClient:
         # 实测抖到 10s+，一发卡住的探测会把闸门重试循环占满一整个默认 30s。
         probe_timeout: float = 8.0,
         probe_retries: int = 2,
+        # **单个参考文件**的网络预算（秒）：下载用户给的链接时用。
+        # 🔴 这个值与"调用方的超时"直接竞争 —— 见 `_fetch_media` 的说明：调大了会把
+        # 调用方的超时甩在后面（它超时了我们还接着提交，那一步是计费的）。
+        media_fetch_timeout: float = 20.0,
         # 铸造服务客户端（可选）。闸门开着且调用方没带 token 时用它取一个；
         # 没配 / 取不到 ⇒ 如实抛 CaptchaRequiredError（绝不静默提交）。
         minter: object | None = None,
@@ -105,6 +143,8 @@ class WebClient:
         self.visitor_id = visitor_id or os.environ.get("AVM_VISITOR_ID") or DEFAULT_VISITOR_ID
         self.probe_timeout = float(probe_timeout)
         self.probe_retries = max(0, int(probe_retries))
+        self.timeout = max(1.0, float(timeout))
+        self.media_fetch_timeout = max(1.0, float(media_fetch_timeout))
         self.minter = minter
         self._http = httpx.Client(
             base_url=self.base_url,
@@ -194,7 +234,12 @@ class WebClient:
                     error=f"{type(e).__name__}: {e}",
                     duration_ms=(time.perf_counter() - started) * 1000,
                 )
-                raise WebApiError(procedure, f"{type(e).__name__}: {e}") from None
+                raise WebApiError(
+                    procedure,
+                    f"{type(e).__name__}: {e}",
+                    # 传输层异常类名交给上层：对外脱敏后仍要能说清"是超时还是连不上"
+                    transport=type(e).__name__,
+                ) from None
         else:  # pragma: no cover —— 循环要么 break 要么 raise
             raise WebApiError(procedure, "transport error (no attempt completed)")
 
@@ -581,7 +626,91 @@ class WebClient:
 
     # -------------------------------------------------------------- upload ----
 
-    def upload_file(self, source: bytes | str, *, name: str | None = None, permanent: bool = False) -> dict:
+    # 站点前端的**分类型**上传上限（`{image:10, audio:15, video:50}` MB，见
+    # `docs/web-reverse/captured/js` 里的 `let m={image:10,audio:15,video:50}`）。
+    # 精确上限仍以预签名返回的 `maxBytes` 为准；这里只用来**在下载时**挡住过大的链接 ——
+    # 否则一个 2GB 的链接会先被完整读进内存，然后才被 `maxBytes` 拒掉。
+    MEDIA_HARD_MAX_BYTES = 50 * 1024 * 1024
+    # 单项网络超时的上限（秒）。**没有下限夹取** —— 下限会把运维显式配的小值
+    # （或测试用的极小预算）悄悄改掉，那种"配了不生效"正是本项目最忌讳的形状。
+    MAX_STEP_TIMEOUT = 300.0
+
+    def _step_timeout(self, want: float, budget) -> float:
+        """单项网络超时 = min(想要的, 总预算剩余)。总预算已耗尽 ⇒ 立刻 504。"""
+        if budget is not None and budget.expired():
+            raise budget.exhausted_error()
+        want = max(0.1, min(self.MAX_STEP_TIMEOUT, float(want)))
+        if budget is None:
+            return want
+        return max(0.1, min(want, budget.remaining()))
+
+    def _fetch_media(self, url: str, *, budget=None) -> bytes:
+        """把调用方给的**文件链接**取回内存：流式 + 硬字节上限 + 总时长预算。
+
+        🔴 为什么不能沿用 `self._http.get(url)`（旧写法）：
+
+          · 旧写法只设了 `timeout=60.0`，那是 httpx 的**单次读写**超时 —— 一个"稳定地慢"
+            （每 50 秒吐几个字节）的链接能一直拖着，而调用方的超时早就到了：**调用方看到
+            "超时"，我们却还在跑，甚至接着把任务提交出去 —— 那一步是要计费的**。
+          · 没有任何字节上限 ⇒ 链接指向多大就缓冲多大。
+
+        改成流式读之后：**块间**受超时保护、**整体**受 `media_fetch_timeout` 保护、
+        **总量**受 `MEDIA_HARD_MAX_BYTES` 保护；超时/超量都给出**点名步骤**的错误。
+        """
+        started = time.perf_counter()
+        per_step = self._step_timeout(self.media_fetch_timeout, budget)
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            with self._http.stream("GET", url, timeout=per_step) as r:
+                if r.status_code >= 400:
+                    raise WebApiError(
+                        "download",
+                        f"{r.status_code} for {url[:120]}（参考文件链接不可用）",
+                        http_status=r.status_code,
+                    )
+                declared = int(r.headers.get("content-length") or 0)
+                if declared > self.MEDIA_HARD_MAX_BYTES:
+                    raise ParamError(
+                        f"参考文件过大：链接声明 {declared} 字节，超过本站上限 "
+                        f"{self.MEDIA_HARD_MAX_BYTES} 字节（{self.MEDIA_HARD_MAX_BYTES // 1048576}MB）",
+                        "input_reference",
+                    )
+                for chunk in r.iter_bytes(65536):
+                    total += len(chunk)
+                    if total > self.MEDIA_HARD_MAX_BYTES:
+                        raise ParamError(
+                            f"参考文件过大：已读 {total} 字节，超过本站上限 "
+                            f"{self.MEDIA_HARD_MAX_BYTES} 字节"
+                            f"（{self.MEDIA_HARD_MAX_BYTES // 1048576}MB）",
+                            "input_reference",
+                        )
+                    chunks.append(chunk)
+                    if time.perf_counter() - started > per_step:
+                        raise WebApiError(
+                            "download",
+                            f"取参考文件超过 {per_step:.0f}s 预算（已用 "
+                            f"{time.perf_counter() - started:.1f}s，已读 {total} 字节）: "
+                            f"{url[:120]}",
+                            http_status=504,
+                        )
+        except httpx.HTTPError as e:
+            raise WebApiError(
+                "download",
+                f"{type(e).__name__}: 取参考文件失败（耗时 "
+                f"{time.perf_counter() - started:.1f}s）: {url[:120]} — {e}",
+                http_status=504 if isinstance(e, httpx.TimeoutException) else 0,
+            ) from None
+        return b"".join(chunks)
+
+    def upload_file(
+        self,
+        source: bytes | str,
+        *,
+        name: str | None = None,
+        permanent: bool = False,
+        budget=None,
+    ) -> dict:
         """把媒体转存到站点自己的 CDN，返回 `publicUrl` 等元信息。
 
         为什么必须转存：`ai.minimaxH3` 会拒绝 Content-Type 不在白名单里的外链
@@ -589,15 +718,29 @@ class WebClient:
         （注意路由名是**复数** `uploads`）拿到的 `static.img2video.ai` 地址一定被接受。
 
         预签名 URL 只有 **60 秒**有效期 —— 拿到就传，别缓存。
+
+        `budget`：**整个转存阶段共享**的总预算（见 `MediaFetchBudget`）。一次
+        `POST /tasks` 里可能有多达 7 个媒体项（图 4 / 视频 1 / 音频 2）要串行转存，
+        没有总预算的话最坏情况会把调用方的超时远远甩在后面。
         """
         if isinstance(source, (bytes, bytearray)):
             buf = bytes(source)
+            # 🔴 字节路径也要过**同一道**上限：`/v1/videos` 的 multipart 文件部件与
+            #    `input-reference-format: b64` 都是走这条进来的 —— 站点对"单件媒体"的上限
+            #    与入口无关，早点拒（400，说清上限）比"传上去再被 maxBytes 拒"好。
+            if len(buf) > self.MEDIA_HARD_MAX_BYTES:
+                raise ParamError(
+                    f"参考文件过大：{len(buf)} 字节，超过单件上限 "
+                    f"{self.MEDIA_HARD_MAX_BYTES} 字节"
+                    f"（{self.MEDIA_HARD_MAX_BYTES // 1048576}MB）",
+                    "input_reference",
+                )
             base = re.sub(r"\.[^.]+$", "", name or "file")
         elif isinstance(source, str) and re.match(r"^https?://", source, re.I):
             started = time.perf_counter()
             try:
-                r = self._http.get(source, timeout=60.0)
-            except httpx.HTTPError as e:
+                buf = self._fetch_media(source, budget=budget)
+            except Exception as e:
                 note_upstream(
                     "download",
                     upstream="web",
@@ -627,6 +770,7 @@ class WebClient:
             "uploads.getPresignedUrl",
             {"fileName": file_name, "contentType": info["content_type"], "fileSize": len(buf), "permanent": permanent},
             method="POST",
+            timeout=self._step_timeout(self.timeout, budget),
         ) or {}
 
         max_bytes = pre.get("maxBytes")
@@ -641,18 +785,28 @@ class WebClient:
         if not upload_url:
             raise WebApiError("uploads.getPresignedUrl", f"no uploadUrl in response: {json.dumps(pre)[:200]}")
 
-        put_view = {"url": upload_url, "fileSize": len(buf), "contentType": info["content_type"]}
+        # 🔴 PUT 的请求头**只补预签名没给的**：站点自己的实现是
+        #    `fetch(v, {method:"PUT", headers: g, body: d})`（见 captured/js），即**原样**
+        #    用返回的 headers。对预签名 URL 来说，多带未签名头是 403（签名失配）的风险；
+        #    而站点既然已在 headers 里给了 Content-Type，我们再覆盖一遍毫无收益。
+        #    Content-Length 由 httpx 依 `content=` 自己算，不必也不该手写。
+        put_headers = dict(pre.get("headers") or {})
+        put_headers.setdefault("Content-Type", info["content_type"])
+        # 上传预算按体积给（约 2s/MB + 30s 底），再与总预算取小：10MB ⇒ 50s，50MB ⇒ 130s
+        put_budget_s = 30.0 + len(buf) / (1024 * 1024) * 2.0
+        put_view = {
+            "url": upload_url,
+            "fileSize": len(buf),
+            "contentType": info["content_type"],
+            "header_keys": sorted(put_headers),
+        }
         started = time.perf_counter()
         try:
             put = self._http.put(
                 upload_url,
-                headers={
-                    **(pre.get("headers") or {}),
-                    "Content-Type": info["content_type"],
-                    "Content-Length": str(len(buf)),
-                },
+                headers=put_headers,
                 content=buf,
-                timeout=120.0,
+                timeout=self._step_timeout(put_budget_s, budget),
             )
         except httpx.HTTPError as e:
             note_upstream(
@@ -663,7 +817,12 @@ class WebClient:
                 error=f"{type(e).__name__}: {e}",
                 duration_ms=(time.perf_counter() - started) * 1000,
             )
-            raise WebApiError("uploads.PUT", f"{type(e).__name__}: {e}") from None
+            raise WebApiError(
+                "uploads.PUT",
+                f"{type(e).__name__}: 转存 {len(buf)} 字节失败（耗时 "
+                f"{time.perf_counter() - started:.1f}s）— {e}",
+                http_status=504 if isinstance(e, httpx.TimeoutException) else 0,
+            ) from None
         note_upstream(
             "uploads.PUT",
             upstream="web",

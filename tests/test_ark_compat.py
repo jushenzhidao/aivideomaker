@@ -90,6 +90,36 @@ class TestSnapDuration(unittest.TestCase):
 
 
 class TestTranslateCreate(unittest.TestCase):
+    def test_prompt_enrichment_defaults_on(self):
+        """🔴 用户口径（2026-09-16）：「默认 `promptEnrichment:true` 开启提示词增强」。
+
+        与站点自己前端发的请求一致（它发的就是 `promptEnrichment:true`）。
+        """
+        plan = T.translate_create(body())
+        self.assertIs(plan["web_params"]["promptEnrichment"], True)
+
+    def test_prompt_enrichment_can_be_turned_off(self):
+        """默认开 ≠ 不能关：`extra_body.aivideomaker_prompt_enrichment=false`。"""
+        plan = T.translate_create(
+            body(extra_body={"aivideomaker_prompt_enrichment": False})
+        )
+        self.assertIs(plan["web_params"]["promptEnrichment"], False)
+
+    def test_prompt_enrichment_accepts_string_literals(self):
+        """表单 / curl 场景会写成字符串 ⇒ 认 `true`/`false`（大小写不敏感）与 0/1。"""
+        for raw, expect in (("true", True), ("FALSE", False), ("0", False), ("1", True)):
+            plan = T.translate_create(body(extra_body={"aivideomaker_prompt_enrichment": raw}))
+            self.assertIs(plan["web_params"]["promptEnrichment"], expect, f"raw={raw!r}")
+
+    def test_prompt_enrichment_invalid_value_warns_and_keeps_the_default(self):
+        """认不出的值**不猜**：保持默认开 + **告警**（与 `aivideomaker_tier` 同形：不静默）。"""
+        plan = T.translate_create(body(extra_body={"aivideomaker_prompt_enrichment": "maybe"}))
+        self.assertIs(plan["web_params"]["promptEnrichment"], True, "认不出就按默认开")
+        self.assertTrue(
+            any("aivideomaker_prompt_enrichment" in w for w in plan["warnings"]),
+            f"被忽略的覆盖必须留痕：{plan['warnings']}",
+        )
+
     def test_minimal_request(self):
         plan = T.translate_create(body())
         self.assertEqual(plan["web_params"]["content"], "a red balloon")

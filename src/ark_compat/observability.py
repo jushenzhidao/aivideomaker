@@ -478,11 +478,27 @@ def logfire_exporting() -> bool:
 # 会把请求延迟和"我们向上游发请求的频次"一起抬上去 —— 而频次恰恰是站点风控
 # （Turnstile 闸门）的触发维度之一。宁可每 N 分钟统一采一次。
 
-_GAUGES: dict = {}
+_METRICS: dict = {}
+
+
+def _metric(kind: str, name: str, *, unit: str = "", description: str = ""):
+    """懒建并缓存指标对象（gauge / counter / histogram 共用一份缓存）。
+
+    每次 `logfire.metric_*()` 都新建会让 SDK 侧重复注册同名仪表；而 logfire
+    没装配时提前建也不合适（对象会绑在当时的全局 provider 上）。
+    """
+    key = (kind, name)
+    m = _METRICS.get(key)
+    if m is None:
+        import logfire
+
+        m = getattr(logfire, f"metric_{kind}")(name, unit=unit, description=description)
+        _METRICS[key] = m
+    return m
 
 
 def _gauge(name: str, *, unit: str, description: str):
-    """懒建并缓存指标对象。
+    return _metric("gauge", name, unit=unit, description=description)
 
 
 def count_poll(*, upstream: str, status: str, reported: bool, cached: bool = False,

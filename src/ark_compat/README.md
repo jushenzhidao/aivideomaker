@@ -225,10 +225,33 @@ Seedance」的两份 OpenAPI（[创建](https://oneapis.apifox.cn/369966278e0) /
 
 请求字段映射：`model` 原样保留（`_480p/_720p/_1080p` 后缀决定分辨率档位）；
 `prompt` → 提示词；`seconds` → 时长；`size` → 宽高比（`keep_ratio`/`adaptive`
-上游语义相同 = 跟随输入图，映射会留痕）；`input_reference` → 参考图（≤4 张，
-超限截断照旧留痕）；`first_frame_image` / `last_frame_image` → 首/尾帧。
+上游语义相同 = 跟随输入图，映射会留痕）；`first_frame_image` / `last_frame_image` → 首/尾帧
+（**只收单值**：给成数组一律 400 —— 参考素材静默丢失是本项目的红线）；
+`input_reference` → **参考图列表**（≤4 张，超限截断并**点名丢掉哪一张**），三种形态都收：
+
+  - JSON body 给数组：`"input_reference": ["https://…", "https://…"]`
+  - 表单**重复部件**：`--form input_reference=@a.png`（**文件流**）或
+    `--form input_reference=<URL>`；**两者可混用**，按出现顺序排
+  - 表单里把数组写成字符串：`--form 'input_reference=["u1","u2"]'` ⇒ 会**摊平 + 留痕**
+    ⚠️ 2026-09-15 修：以前它会变成一个**垃圾 URL**（既不是 URL 也不是 data URI）且**完全
+    静默**，一路撑到转存阶段才炸；看着像数组但不是合法 JSON ⇒ 直接 400
+🔴 **`input_reference` 与帧字段互斥**（"首帧/首尾帧" vs "参考素材"是上游的两种模式）⇒ 混用
+   由 `translate_create` 前置 **400**，报文写明原因。
+🔴 调用方带的**渠道选择头**（如 `x-base-url: volc`）本服务无法满足 —— 本服务只有**一条**
+   web 逆向线、不按 base_url 路由。**不路由，但必须留痕**（进 `warnings` → trace + 日志）：
+   静默按 web 线服务等于**悄悄换掉上游**（免费窗口 vs 按量、排队、质量都不同）。
+   OpenAI 面的响应体只有四个字段，所以这条提示只在 trace 里可见 —— 刻意不为一句提示破坏契约。
 表单（multipart / urlencoded，Chatfire 的 curl 形态）与 JSON（OpenAI SDK 形态）
 都收；表单文件部件按 magic bytes 定 MIME 转内联，真实提交时照常转存站点 CDN。
+🔴 **表单上传的两道体积闸**（2026-09-15 补）：**单件 50MB**（与
+`WebClient.MEDIA_HARD_MAX_BYTES` 同值，由门禁钉住）与**整个请求体 128MB**
+（= 站点合法的最坏组合：图 4×10 + 视频 50 + 音频 2×15 = 120MB，加一点余量）。
+超限一律 **400**，且报文里**点名**是"单件上限"还是"请求体"（两条闸各测各的，否则删一条
+靠另一条兜住也会绿）。为什么必须有：`.form()` 会把 >1MB 的部件**落盘**、`read()` 再**整个**
+读进内存、然后 base64（+33%）—— 没有闸时一个超大件就是"先写满磁盘 → 吃掉几倍内存 →
+最后才被站点 `maxBytes` 拒掉"。
+⚠️ 这是「**整包读入**」而不是「流式上传」：请求体先落进内存/临时文件、再包成 data URI，
+  交给转存管线；真要流式得等上游支持分片（见 `OPEN-DECISIONS`）。所以入口体积闸是必需的。
 status 词表：`queued` / `in_progress` / `completed` / `failed`；`progress` 只在
 终态成功时是 100（上游没有可读百分比，不编造中间值）；`video_url` 仅 `completed`
 且有产出时给值。鉴权、计费口径、dry-run、凭据绑定与方舟线**完全一致**
@@ -305,6 +328,27 @@ AVM_TASK_STORE=memory      # 显式开发/测试开关：重启即丢
 | `omni_reference_task_type` | `reference`/`auto` 放行；`edit`/`extend` 上游无此能力 → **真实提交 400**（dry-run 仍可校验） |
 | `output_format` | `mp4` 放行；`mov` 上游只出 mp4，带显式告警 |
 | `generate_audio` | 站点**没有这个开关** —— 记录并回显，同时说明音画由上游决定 |
+
+### 适配层的扩展开关（`extra_body.aivideomaker_*`）
+
+Ark SDK 把未建模字段塞进 `extra_body`；这些是**本适配层自己的旋钮**（顶层同名字段也认）：
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `aivideomaker_dry_run` | `false` | 零成本校验，不提交（见「零成本校验」） |
+| `aivideomaker_tier` | `turbo` | `turbo`/`base`；决定计费口径（见「计费」） |
+| `aivideomaker_prefer_free` | `false` | 越线时把时长拉回免费区（见「计费」） |
+| `aivideomaker_captcha_token` | — | BYO 真 Turnstile token（闸门开着时用） |
+| **`aivideomaker_prompt_enrichment`** | **`true`** | 站点侧的**提示词增强**。**默认开**（2026-09-16 用户口径），与站点自己前端发的请求一致；传 `false` 关闭 |
+
+- `prompt_enrichment`：值**认不出就不猜** —— 保持默认开 + 写进 `warnings`（与 `aivideomaker_tier`
+  同形：不静默）。接受 JSON 布尔与字符串 `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`（大小写不敏感）。
+- ⚠️ **OpenAI 兼容面（`/v1/videos`）没有这个开关**：那条契约的字段集是固定的
+  （`model`/`prompt`/`seconds`/`size`/`input_reference`/`first_frame_image`/`last_frame_image`，
+  多一个字段会被当成"未知字段"忽略并告警）⇒ 该面上**只能**用默认值（开）。
+- 门禁：`tests/test_ark_compat.py::TestTranslateCreate`（默认/关闭/字面量/非法值留痕 4 条）
+  + `tests/test_web_upstream.py`（**真客户端发出去的 body** 里确实是那个值 —— 默认开的那条
+  端到端用例证明了"单看 web_params 不够"）。
 
 ### 参考素材：按上游上限截断，且截断必留痕
 
@@ -411,6 +455,21 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
    data URI → 解码成字节上传；已在 `static*.img2video.ai` 上的原样放过。
    站点只收自己 CDN 的地址，外链会因 Content-Type 白名单被拒。
 
+   🔴 **取"参考文件链接"有两道闸，缺一它会变成"调用方超时 + 我们照扣费"**（2026-09-15 修）：
+   - **单项预算** `AVM_MEDIA_FETCH_TIMEOUT`（默认 **30s**，2026-09-16 由 20 上调）+ **硬字节上限 50MB**：链接是**流式**读的
+     （块间受超时保护、整体受预算保护、总量受上限保护），超了给 **`504`** 并在报文里点名
+     `download` 与**具体 URL**；声明超限/实际超限给 **`400`**。
+   - **总闸** `AVM_MEDIA_REHOST_BUDGET`（默认 **120s** = 图 4 × 单项 30s，2026-09-16 由 90 上调）：一次创建最多 7 个媒体项
+     （图 4 / 视频 1 / 音频 2）且**串行**转存，没有总闸时最坏耗时是"单项超时 × 项数" ——
+     而这几分钟全部发生在调用方**同步等待**的那一个请求里。最坏的后果不是"调用方超时"，
+     而是**它超时之后我们继续跑完并把任务提交出去（那一步计费）**。有了总闸：走不完就 504，
+     且**绝不**继续提交（门禁 `tests/test_media_fetch_budget.py` 专门断言这一点）。
+   - 预签名 PUT **只补预签名没给的请求头**，且不手写 `Content-Length`：站点自己的实现是
+     `fetch(uploadUrl, {method:"PUT", headers, body})`（见 `docs/web-reverse/captured/js`），
+     即**原样**用返回的 headers —— 对预签名 URL 多带未签名头是 403（签名失配）的风险。
+   - 埋点（见下"可观测性"）：`download` / `uploads.getPresignedUrl` / `uploads.PUT` 三条记录
+     都挂在 `ark.create.submit` 的 `upstream_calls` 上。
+
 ## 可观测性
 
 - **loguru** 是唯一日志出口，每条带 `request_id`（同时回显在响应头 `x-request-id`）。
@@ -464,6 +523,15 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
   - `ark.create.submit` —— `ark_id` / `upstream` / `ark_model` /
     `resolution` / `duration` / `billed` / `warning_count` / `warnings` /
     **`upstream_task_id`** / `request`（调用方发来的 Ark 请求原文）/ **`upstream_calls`**
+
+    ★ **上传链路也在 `upstream_calls` 里**（"文件上传有做埋点吗"的答案，2026-09-15）：
+    外链/内联素材的每一步都留痕，**成功失败都有**（失败那条带 `status="error"` + 原始错误）：
+      - `download` —— 拉取调用方给的链接：`request.url` + 字节数 + 耗时
+      - `uploads.getPresignedUrl` —— tRPC 预签名：`fileName` / `contentType` / `fileSize`
+      - `uploads.PUT` —— 转存到站点 CDN：`publicUrl` / 状态码 / 字节数 / 用了哪些请求头
+    它们**不是独立 span**，共用 `ark.create.submit` 那一条 —— 一次创建的因果链在一个地方读完。
+    ⚠️ 这条分支曾**零测试覆盖**（app 层用例把整个 `WebClient` 换成替身、真客户端用例只传
+    bytes）⇒ 现在由 `tests/test_media_fetch_budget.py` 钉住（含 9 条变异自证）。
   - `ark.create.dry_run` —— 同上（除 taskId）：零成本校验路径也要能在 trace 里复盘
   - `ark.task.fetch` —— `ark_id` / `upstream` / **`upstream_task_id`** / **`status`** /
     **`paid`**（出片后对账的两项关键；`paid` 才是"这次花没花钱"的判据，不是 `credits`）/
@@ -646,4 +714,51 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 | web | `NOT_FOUND` | `TaskNotFound` | 404 |
 | 本地 | 上游未配置 | `UpstreamUnavailable` | 503 |
 | 本地 | 参数不合法 / 上游不具备该能力 | `InvalidParameter` | 400 |
+| 本地 | 参考文件链接超单项预算或总预算 | `UpstreamError` | **504** |
 | 任一 | 网络 / 上游 5xx | `NETWORK_ERROR` / `UpstreamError` | 502 |
+
+🔴 **`code` 是白名单，不是上游码的透传**：`trpc` 会把**站点自己的**错误码（上游信封里的
+`data.code`）一起带进来，那是上游的内部词表 ⇒ 认不出一律落到 `UpstreamError`。
+只有 `NOT_FOUND` 这类**语义已确认**的才映射（`_web_code_for`）。
+
+### 上游错误的**对外脱敏**（2026-09-15 定；用户口径："客户端侧上游错误脱敏、参考火山
+seedance 报错形态；logfire 侧全部上报上游"）
+
+上游错误的原文里塞满了**实现细节**，而它以前会**原样进客户端报文**：
+
+- 站点内部 procedure 名（`ai.minimaxH3` / `model.needsCaptcha`）
+- 铸造服务主机与端口（`host.docker.internal:8899`）
+- **运维口令**（`ufw allow proto tcp from 172.16.0.0/12 to any port 8899`）
+- 内部 runbook 编号（`E2E-AVM-008`）与工具路径（`tools/compose_wiring_check.py`）
+- 上游返回的原始报文
+
+现在的形状**照官方「公共错误码」表**：`code` / `message` / `param` / `type`，且
+
+- `message` 是**通用描述句** + 结尾的 **`Request ID: {id}`**（官方每条 message 都这么写）；
+  正文里不出现任何内部标识。ID 与响应头 `x-request-id` 同源 —— **脱敏之后它是调用方
+  唯一的抓手**：报障时报它，运维能在 trace 里捞到全量原文。
+- `Request ID` 的拼接**只有一处**（`_with_request_id`）。两处各拼一遍时，其中一处会变成
+  死代码、门禁也就证伪不了它（变异自证实测踩到）。
+- 我们**自己**的报文（参数校验 / 能力不支持 / 任务不存在）**不脱敏** —— 它不含上游实现
+  细节、对调用方有用（"哪个值错了"要说得出），只补 Request ID。
+- 🔴 **按阶段区分**（2026-09-16 用户口径：**超时多发生在传图片 / 传 URL 这条路上**）：
+  procedure 翻成**阶段说法** —— `fetching a reference file you supplied` /
+  `preparing the reference upload` / `uploading a reference file to the upstream`。
+  **"调用方自己的素材慢"与"上游自己慢"必须分得开**：一句笼统的"上游没响应"会把责任指错
+  方向，调用方也拿不到"换更快/更小的直链"这个行动项。procedure 原名一律不出现。
+  同理，传输层超时（`ReadTimeout`…）会被识别成"did not respond in time（可重试）"——
+  这类词是通用 HTTP 客户端词汇、不含内部标识，属于**必须留给调用方的事实**。
+
+**两个通道**（与既有纪律一致：证据换通道，不是消失）：
+
+| | 客户端看到 | trace / 日志 |
+|---|---|---|
+| message | 通用描述句 + Request ID | `error` = **全量原文**（含 procedure 名、ufw 口令、runbook 编号） |
+| 归因 | — | `captcha_gate` / `minter_unreachable` / `minter_last_error` |
+| 上游原文 | — | `upstream_calls`（请求/响应逐字） |
+| 调用方实际收到的那句 | — | `client_message`（出口回归只能靠它复盘） |
+
+门禁：`tests/test_upstream_error_redaction.py` —— 出口**黑名单扫描**（任何内部标识出现即红）
++ "trace 仍全量"的**对偶断言** + 官方四键形状；含 6 条变异自证全红。
+⚠️ 能过黑名单**不代表**过审：新增内部标识（新主机名、新 runbook 编号）要把它加进
+`INTERNAL_TOKENS`，否则门禁不认识它。

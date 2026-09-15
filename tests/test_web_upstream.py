@@ -17,6 +17,7 @@ import struct
 import sys
 import threading
 import time
+import json
 import unittest
 from pathlib import Path
 
@@ -29,7 +30,9 @@ from ark_compat.app import TASKS_PATH, create_app  # noqa: E402
 from ark_compat.errors import CaptchaRequiredError, ParamError, WebApiError  # noqa: E402
 from ark_compat.settings import Settings  # noqa: E402
 from ark_compat.sniff import image_dimensions, sniff_file  # noqa: E402
-from ark_compat.translate import normalize_web_task  # noqa: E402
+from ark_compat.translate import normalize_web_task, translate_create  # noqa: E402
+# 两个字段集都**硬编码**在 test_ark_task_schema 里（与实现的白名单解耦，门禁才可证伪）
+from test_ark_task_schema import ARK_BODY_FIELDS, OFFICIAL_TASK_FIELDS  # noqa: E402
 from ark_compat.upstreams import WebUpstream  # noqa: E402
 from ark_compat.web_client import WebClient, parse_sse  # noqa: E402
 from ark_compat.web_queue import WebSubmitQueue  # noqa: E402
@@ -391,7 +394,10 @@ class FakeWebClient:
             self._events[task_id] = threading.Event()
         return task_id
 
-    def upload_file(self, source, name=None, permanent=False):
+    def upload_file(self, source, name=None, permanent=False, budget=None):
+        # ⚠️ `budget` 必须跟着真签名走：转存阶段现在有一个**跨媒体项的总预算**
+        #    （`MediaFetchBudget`），调用处是关键字传参 —— 替身不收它就直接 TypeError
+        #    （实测：一次改动让 3 条转存用例同时挂）。同类坑见下面 `wait_for_task` 的 `on_poll`。
         self.uploaded.append(source if isinstance(source, str) else f"<{len(source)} bytes>")
         return {"publicUrl": f"https://static.img2video.ai/rehost-{len(self.uploaded)}.png", "kind": "image"}
 
@@ -572,6 +578,30 @@ class TestWebAppLayer(unittest.TestCase):
         }
         self.client = TestClient(self.app)
 
+    def test_prompt_enrichment_is_on_by_default_end_to_end(self):
+        """接线：默认开要真的出现在**发给站点的载荷**里（"实现了" != "接线了"）。
+
+        ⚠️ 必须用**真客户端**：`translate_create` 给的是 `web_params`，而 `WebClient.create`
+        会用自己的字段表**重建** body（那句 `bool(params.get("promptEnrichment"))`）——
+        用 `FakeWebClient`（整个 client 被替换）的用例**照不到这一层**（变异自证实测踩到）。
+        """
+        site = FakeSite()
+        site.set("ai.minimaxH3", "t1")
+        client = make_client(site)
+        client.create(translate_create(ark_body())["web_params"])
+        sent = json.loads(site.calls("ai.minimaxH3")[0].url.params["input"])["0"]["json"]
+        self.assertIs(sent["promptEnrichment"], True)
+
+    def test_prompt_enrichment_off_reaches_the_site_body_too(self):
+        """对偶：关掉时站点侧也必须收到 false（别只测默认那条）。"""
+        site = FakeSite()
+        site.set("ai.minimaxH3", "t1")
+        client = make_client(site)
+        plan = translate_create(ark_body(extra_body={"aivideomaker_prompt_enrichment": False}))
+        client.create(plan["web_params"])
+        sent = json.loads(site.calls("ai.minimaxH3")[0].url.params["input"])["0"]["json"]
+        self.assertIs(sent["promptEnrichment"], False)
+
     def test_dry_run_reports_the_web_billing_line(self):
         r = self.client.post(TASKS_PATH, json=ark_body(extra_body={"aivideomaker_dry_run": True}))
         self.assertEqual(r.status_code, 200)
@@ -610,15 +640,17 @@ class TestWebAppLayer(unittest.TestCase):
         self.assertEqual(j["id"], tid)
         self.assertEqual(j["status"], "succeeded")
         self.assertEqual(j["content"]["video_url"], "https://cdn/a.mp4")
-        self.assertEqual(j["resolution"], "480p")
-        self.assertEqual(j["requested"]["model"], "doubao-seedance-2-5-260628")
+        self.assertEqual(j["duration"], 5, "站点记录里的字符串 \"5\" 必须归一成整数")
+        self.assertNotIn("model", j, "2026-09-15 第二轮口径：响应体不要 model")
+        self.assertNotIn("resolution", j, "2026-09-15 第二轮口径：响应体不要 resolution")
 
-    def test_task_view_exposes_the_upstream_model_next_to_the_requested_one(self):
-        """★ 报告 AVM12-OPEN-UPSTREAM：请求值与**上游实际执行**的模型都要能读到。
+    def test_get_task_body_is_the_narrowed_whitelist(self):
+        """★ 响应体 = 官方 schema 的**真子集**：只要必要字段，且只要**真有值**的字段。
 
-        实测背景：三次真实提交请求的都是 `doubao-seedance-2-5-260628`，成片 URL 里却是
-        `minimax_h3`（web 线只有 `ai.minimaxH3` 一条 tRPC 程序）。此前 `model` 被覆盖成
-        请求值、嵌套的原始记录又被 `upstream`（上游种类）覆盖 ⇒ 事实在最后一跳消失。
+        官方 SDK（Java/Go）对 unknown field 是**报错**而非忽略 ⇒ 多一个键就等于把
+        "能跑的客户端"变成"报错的客户端"；而给一个编出来的值（`seed:-1` /
+        `framespersecond:24` / `usage.completion_tokens:0`…）比不给更糟 ——
+        调用方会把它当成事实。
         """
         tid = self.client.post(TASKS_PATH, json=ark_body()).json()["id"]
         j = self.client.get(f"{TASKS_PATH}/{tid}").json()

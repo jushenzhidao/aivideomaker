@@ -18,13 +18,27 @@ class ParamError(Exception):
 
 
 class WebApiError(Exception):
-    """web 逆向线（tRPC over /api）返回的错误。"""
+    """web 逆向线（tRPC over /api）返回的错误。
 
-    def __init__(self, procedure: str, message: str, code: str | None = None, http_status: int = 0):
+    `transport`：**传输层**异常类名（`ReadTimeout` / `ConnectError` / …），只在"根本没拿到
+    响应"时填。它的用途是让**对外脱敏**后的报文仍能区分"超时（可重试）"与"连不上" ——
+    这类事实调用方需要，而且不含任何内部标识（见 `app._upstream_client_message`）。
+    """
+
+    def __init__(
+        self,
+        procedure: str,
+        message: str,
+        code: str | None = None,
+        http_status: int = 0,
+        *,
+        transport: str = "",
+    ):
         super().__init__(f"{procedure}: {message}")
         self.procedure = procedure
         self.code = code or "TRPC_ERROR"
         self.http_status = http_status
+        self.transport = transport
 
 
 class CaptchaRequiredError(WebApiError):

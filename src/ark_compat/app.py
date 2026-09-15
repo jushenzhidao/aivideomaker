@@ -100,6 +100,69 @@ from .upstreams import build_upstreams, build_web_for_cookie
 
 TASKS_PATH = "/api/v3/contents/generations/tasks"
 
+# ---- `/v1/videos` 表单上传的两道体积闸 --------------------------------------
+#
+# 🔴 `.form()` 会把 >1MB 的部件**落盘**，`read()` 再**整个**读进内存，然后 base64（+33%）。
+# 没有任何闸时，一个 1GB 的文件部件 = "先写满磁盘 → 再吃掉几倍内存 → 最后才被站点的
+# `maxBytes` 拒掉"。下线上传都撞上过 maxBytes，说明这条路上确实有大件在跑。
+#
+# 单件上限与 `WebClient.MEDIA_HARD_MAX_BYTES` **同值**（站点分类型上限里的最大者，
+# 见 `docs/web-reverse/captured/js` 的 `{image:10,audio:15,video:50}`）。两处同值由门禁
+# 钉住（`tests/test_media_fetch_budget.py`）—— 改一处必须改另一处，否则这里会悄悄放行更大的件。
+_FORM_PART_MAX_BYTES = 50 * 1024 * 1024
+# 请求体上限 = 站点**合法的最坏组合**（图 4×10MB + 视频 50MB + 音频 2×15MB = 120MB）+ 余量。
+# 合法请求永远超不过它；而它能在 `.form()` **落盘之前**挡住一个巨大的件（真正的第一道闸）。
+_FORMS_MAX_BODY_BYTES = 128 * 1024 * 1024
+
+
+async def _read_upload(part, *, limit: int | None = None) -> bytes:
+    """把表单里的文件部件**有界**地读进内存。
+
+    刻意**不**用 `part.read()`（一次读空）：没有 `Content-Length` 的 chunked 上传只能靠
+    "边读边判"兜底，否则一个超大部件会把进程内存吃干。超限时给 **400** 并说清上限与
+    已读字节 —— 调用方能据此直接定位到"哪个素材太大了"。
+    """
+    cap = _FORM_PART_MAX_BYTES if limit is None else int(limit)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await part.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > cap:
+            raise ParamError(
+                f"上传的参考素材过大：已读 {total} 字节，超过单件上限 {cap} 字节"
+                f"（{cap // 1048576}MB）—— 请压小后再传，或改用链接（URL 由适配层按预算流式取回）。",
+                "input_reference",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+# ---- 调用方带的「渠道/上游选择」头：无法满足时必须**留痕** ----------------------
+#
+# 🔴 这类头表达的是"请走 XX 线"，而本服务**只有一条** web 逆向线。静默按 web 线服务等于
+# **悄悄换掉上游** —— 计费口径（免费窗口 vs 按量）、排队、产出质量都不同，调用方却以为
+# 自己要到了那条线。留痕走 warnings（与"未知字段被忽略"同一条通道）：OpenAI 面的响应体
+# 只有四个字段，所以它只在 trace（`ark.create.submit` 的 `warnings`）与日志里可见 ——
+# 这是刻意的，不为了一句提示去破坏四字段契约。
+_CHANNEL_HEADERS = ("x-base-url",)
+
+
+def _channel_header_notes(request) -> list[str]:
+    """调用方声明了、而本服务无法满足的上游选择头 → 说明（进 warnings）。"""
+    notes = []
+    for name in _CHANNEL_HEADERS:
+        value = (request.headers.get(name) or "").strip()
+        if value:
+            notes.append(
+                f'header "{name}: {value}" was ignored — this service only serves the "web" '
+                f"upstream and does not route by base_url"
+            )
+    return notes
+
+
 # 透传模式下缓存"调用方凭据 -> 上游"。上限只是防止无界增长。
 _PASSTHROUGH_CACHE_MAX = 64
 # 每个凭据要养一个轮询线程，不能无限开
@@ -116,16 +179,46 @@ class ArkError(Exception):
         self.param = param
 
 
-def _ark_envelope(status: int, code: str, message: str, param: str = "") -> JSONResponse:
+def _with_request_id(message: str, request_id: str) -> str:
+    """让 message 以 `Request ID: {id}` 结尾 —— **全服务唯一负责这件事的地方**。
+
+    官方「公共错误码」表里每条 message 都以它结尾。两个作用：① 与官方形态一致；
+    ② **脱敏之后调用方仍有唯一抓手** —— 报障时报这个 ID，运维能在 trace 里捞到全量上游原文
+    （见 `_upstream_client_message`）。幂等：已经有就不再拼（防两处各拼一遍）。
+    """
+    if not request_id or "Request ID:" in message:
+        return message
+    return f"{message} Request ID: {request_id}"
+
+
+def _ark_envelope(
+    status: int, code: str, message: str, param: str = "", *, request_id: str = ""
+) -> JSONResponse:
+    """对外错误信封（官方形状：`code` / `message` / `param` / `type`）。"""
     return JSONResponse(
         status_code=status,
-        content={"error": {"code": code, "message": message, "param": param, "type": "InvalidRequest"}},
+        content={
+            "error": {
+                "code": code,
+                "message": _with_request_id(message, request_id),
+                "param": param,
+                "type": "InvalidRequest",
+            }
+        },
     )
+
+
+def _rid_of(request) -> str:
+    """本次请求的 id（中间件在 `request.state` 上绑的，与响应头 `x-request-id` 同源）。"""
+    return str(getattr(request.state, "request_id", "") or "")
 
 
 # ------------------------------------------------------------ 错误映射 ----
 
-_WEB_HTTP = (400, 401, 403, 404, 429)
+# 上游能直接对应的状态码白名单。**504 是我们自己产生的**（取"参考文件链接"或整个转存
+# 阶段超过预算，见 `web_client._fetch_media` / `MediaFetchBudget`）—— 不放进来的话会被
+# 压成 502，调用方就分不清"上游坏了"与"你给的链接太慢/太大"。
+_WEB_HTTP = (400, 401, 403, 404, 429, 504)
 
 
 def _web_http_for(e: WebApiError) -> int:
@@ -137,11 +230,93 @@ def _web_http_for(e: WebApiError) -> int:
 
 
 def _web_code_for(e: WebApiError) -> str:
+    """内部错误码 → **对外**错误码：**白名单**，认不出的一律 `UpstreamError`。
+
+    🔴 不许把 `e.code` 原样透传：`trpc` 会把**站点自己的**错误码（上游信封里的
+    `data.code`）带进来，那是上游的内部词表 —— 出现在我们的 `code` 字段里就是泄漏
+    （也是把"实现细节"写进了对外契约）。只有 `NOT_FOUND` 这类**我们已确认语义**的才映射。
+    """
     return {
         "CAPTCHA_REQUIRED": "RateLimitExceeded",
         "QUEUE_TIMEOUT": "TaskQueueFull",
         "NOT_FOUND": "TaskNotFound",
-    }.get(e.code, "UpstreamError" if e.code in (None, "TRPC_ERROR") else e.code)
+    }.get(e.code, "UpstreamError")
+
+
+# ---- 上游错误的**对外脱敏**（`WebApiError` → 客户端只看到类别级事实）------------
+#
+# 🔴 为什么必须做：上游错误原文里塞满了**内部/实现标识**，而它会原样进客户端报文：
+#   · 站点内部 procedure 名 `ai.minimaxH3` / `model.needsCaptcha` / `uploads.PUT`
+#   · 铸造服务主机与端口 `host.docker.internal:8899`
+#   · **运维口令**（`ufw allow proto tcp from 172.16.0.0/12 to any port 8899`）
+#   · 内部 runbook 编号（`E2E-AVM-008`）与工具路径（`tools/compose_wiring_check.py`）
+#   · 上游返回的原始报文（`{status}: {text[:300]}`）
+# 这些是白送的攻击面与实现细节，调用方拿到也办不了事。
+#
+# 官方方舟的错误报文正是范例（见官方「公共错误码」表）：**通用描述句 + `Request ID: {id}`**，
+# 正文里没有任何上游/实现标识。本服务照这个形态出对外报文。
+#
+# 🔴 两个通道（与既有纪律一致：**证据换通道，不是消失**）：
+#   · 对外：类别级事实 + Request ID
+#   · 对内：**全量**原文（`ark.*` span 的 `error` / `upstream_calls` 属性 + 本地日志）——
+#     用户口径「logfire 侧全部上报上游」就是在说这件事：脱敏只作用于出口。
+# 「失败在**哪一阶段**」对调用方是**可行动的**（"你给的链接慢" vs "上游自己慢"），
+# 而 procedure 名是内部标识 ⇒ 翻成阶段说法，原文一律不出现。
+# ⚠️ 用户口径（2026-09-16）：超时**多发生在传图片/传 URL 这条路上** —— 那时快慢取决于
+# 调用方自己的素材，用一句笼统的"上游没响应"会把责任指错方向。
+_PHASE_BY_PROCEDURE = {
+    "download": "fetching a reference file you supplied",
+    "uploads.getPresignedUrl": "preparing the reference upload",
+    "uploads.PUT": "uploading a reference file to the upstream",
+}
+
+
+def _upstream_client_message(e: WebApiError) -> str:
+    """把上游错误翻成**对外可用**的一句话：不出现任何内部标识。
+
+    ⚠️ 这里**不拼 Request ID** —— 那件事只由 `_with_request_id` 负责（信封层统一加），
+    两处各拼一遍的话，其中一处会变成死代码，而门禁也就证伪不了它（变异自证实测踩到）。
+    """
+    timed_out = (
+        e.http_status == 504
+        or e.transport.endswith("Timeout")
+        or e.transport == "TimeoutException"
+    )
+    phase = _PHASE_BY_PROCEDURE.get(e.procedure)
+    if phase:
+        # 参考素材那三步：**调用方能自己修**（换更快/更小的直链），所以要说清是哪一步
+        why = (
+            f"{phase} did not finish within the configured budget — a faster or smaller file "
+            f"may help"
+            if timed_out
+            else f"{phase} failed"
+        )
+    elif e.code == "CAPTCHA_REQUIRED":
+        why = (
+            "the upstream currently requires a fresh captcha token for this account (a dynamic, "
+            "velocity-based gate, not an account property); supply one via "
+            "extra_body.aivideomaker_captcha_token, wait for the gate to decay, or spread your "
+            "submissions out"
+        )
+    elif e.code == "QUEUE_TIMEOUT":
+        why = (
+            "the upstream concurrency limit is saturated and no slot was freed within the wait "
+            "budget; retry later or lower your concurrency"
+        )
+    elif e.code == "NOT_FOUND":
+        why = "the upstream has no record of this task"
+    elif timed_out:
+        why = "the upstream did not respond in time (a retry may succeed)"
+    elif e.http_status == 429:
+        why = "the upstream rate-limited this request"
+    elif e.transport:
+        why = "the upstream is unreachable"
+    elif 400 <= e.http_status < 500:
+        why = "the upstream rejected this request"
+    else:
+        why = "the upstream call failed"
+    tail = f" (HTTP {e.http_status})" if e.http_status else ""
+    return f"The request failed because {why}{tail}."
 
 
 def _bearer(request: Request) -> str:
@@ -693,6 +868,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.middleware("http")
     async def request_context(request: Request, call_next):
         rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        # 绑到 `request.state`：异常处理器要用它给对外报文补 `Request ID: …`（脱敏之后，
+        # 这个 ID 是调用方**唯一**的排障抓手 —— 见 `_upstream_client_message`）。
+        request.state.request_id = rid
         # 探活请求：本地照打日志，但**不上报 Logfire**（`observability.keep_off_logfire`
         # 按这个 extra 键判定）。与 `instrument_fastapi` 的 span 排除**同源** ——
         # 两边都从 `is_probe_path()` 派生，改一处不会漏另一处。
@@ -726,17 +904,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(ArkError)
     async def _on_ark_error(request: Request, exc: ArkError):
-        return _ark_envelope(exc.status, exc.code, str(exc), exc.param)
+        # 这是我们**自己**的报文（参数校验 / 能力不支持 / 任务不存在…）：它不含上游实现细节，
+        # 对调用方是有用的，直接给；只补 Request ID。
+        return _ark_envelope(exc.status, exc.code, str(exc), exc.param, request_id=_rid_of(request))
 
     @app.exception_handler(ParamError)
     async def _on_param_error(request: Request, exc: ParamError):
         logger.info("参数不合法：{}", exc)
-        return _ark_envelope(400, "InvalidParameter", str(exc), exc.param)
+        return _ark_envelope(
+            400, "InvalidParameter", str(exc), exc.param, request_id=_rid_of(request)
+        )
 
     @app.exception_handler(WebApiError)
     async def _on_web_error(request: Request, exc: WebApiError):
+        # 🔴 这里**必须**脱敏：`str(exc)` 里带站点 procedure 名、minter 主机、运维口令、
+        #    runbook 编号（见 `_upstream_client_message` 的说明）。全量原文留在**日志与
+        #    trace** 里（用户口径：logfire 侧全部上报上游）。
         logger.warning("web 上游错误 code={} status={} — {}", exc.code, exc.http_status, exc)
-        return _ark_envelope(_web_http_for(exc), _web_code_for(exc), str(exc))
+        rid = _rid_of(request)
+        return _ark_envelope(
+            _web_http_for(exc),
+            _web_code_for(exc),
+            _upstream_client_message(exc),
+            request_id=rid,
+        )
 
     # ---------------------------------------------------------------- routes --
 
@@ -827,6 +1018,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         eff, warns = billing_view(plan)
         if extra_warnings:
             warns = [*warns, *extra_warnings]
+        # 「渠道选择头」两条入口都要留痕（它是请求级事实，不是 OpenAI 面的特性）
+        warns = [*warns, *_channel_header_notes(request)]
         plan = {**plan, "effective": eff, "warnings": warns}
 
         if _is_dry_run(request, body):
@@ -882,6 +1075,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except BaseException as e:
                 # 失败路径最需要证据：上游到底回了什么，只有这次采集里有
                 sp.set_attribute("error", describe_error(e))
+                # ★ 对外脱敏之后，"**调用方实际收到了什么**"必须自己也留一份 —— 否则事后
+                #   无法核对"有没有把内部标识漏出出口"（出口回归只能靠这条属性复盘）。
+                if isinstance(e, WebApiError):
+                    sp.set_attribute(
+                        "client_message",
+                        # 存**调用方实际收到的那一整句**（含 Request ID）—— 出口回归全靠它
+                        _with_request_id(_upstream_client_message(e), _rid_of(request)),
+                    )
                 # ★ 429 归因必须是**结构化属性**（E2E-AVM-008）：node064 那 3 条 429 的
                 #   根因（宿主防火墙丢包）当初只能靠去 minter 上手查 served 才排除——
                 #   归因文本躺在 error 散文里，Logfire 里没法过滤聚合。
@@ -995,10 +1196,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         表单里的文件部件（UploadFile）读成字节、按 **magic bytes** 定 MIME 包成
         data URI —— 这是进程内转换、零网络；真实提交时由既有转存管线上传到
         站点 CDN，dry-run 依旧零副作用。
+
+        🔴 **两道体积闸**（2026-09-15 补）：`.form()` 会把 >1MB 的部件落盘、`read()` 再整个
+        读进内存、然后 base64（+33%）⇒ 没有闸时一个超大件是"先写满磁盘 → 吃掉几倍内存 →
+        最后才被站点 `maxBytes` 拒掉"。顺序是：
+          ① **解析之前**看请求声明的 `Content-Length`（这才是真正防落盘的那道）；
+          ② 读部件时**边读边判**（chunked 上传没有 Content-Length，只能靠它兜底）。
         """
         ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
         if ctype == "application/json":
             return await _json_body(request)
+        declared = int(request.headers.get("content-length") or 0)
+        if declared > _FORMS_MAX_BODY_BYTES:
+            raise ParamError(
+                f"上传的请求体过大：声明 {declared} 字节，超过上限 {_FORMS_MAX_BODY_BYTES} 字节"
+                f"（{_FORMS_MAX_BODY_BYTES // 1048576}MB）—— 参考素材请压小后再传，"
+                f"或改用链接（URL 由适配层按预算流式取回）。",
+                "input_reference",
+            )
         form = await request.form()
         fields: dict = {}
         for key in form.keys():
@@ -1006,8 +1221,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for v in form.getlist(key):
                 if str(v) == "":
                     continue  # curl 里的 --form 'input_reference=""' = 未提供
-                if hasattr(v, "read"):  # UploadFile：文件部件 → data URI
-                    buf = await v.read()
+                if hasattr(v, "read"):  # UploadFile：文件部件 → 有界读 → data URI
+                    buf = await _read_upload(v)
                     with suppress(Exception):  # 及时关闭，别留 SpooledTemporaryFile 告警
                         await v.close()
                     sniffed = sniff_file(buf)
@@ -1087,7 +1302,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             with span(
                 "ark.task.fetch",
                 upstream=upstream.kind,
-                ark_id=entry["id"],
+                ark_id=ark_id,
                 upstream_task_id=entry["taskId"],
                 cached=cached,
                 # ★ 跃迁信息：读 trace 的人不必再靠"跟上一行对比"来推断状态变没变。

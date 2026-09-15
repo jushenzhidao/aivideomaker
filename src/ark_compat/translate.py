@@ -212,6 +212,24 @@ def _pick(body: Mapping[str, Any], extra: Mapping[str, Any], key: str) -> Any:
     return v
 
 
+def _as_bool(value: Any) -> bool | None:
+    """把"看起来是布尔"的输入归一；**认不出返回 None（不猜）**。
+
+    请求体里的布尔写法比 env 花（JSON `true` / 字符串 `"true"` / `1`），所以这里收宽一点；
+    但收不宽的一律返回 None，由调用方告警 —— "配了不生效还不说话"是本项目最忌讳的形状。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    return None
+
+
 def translate_create(body: Mapping[str, Any]) -> dict:
     """Ark 创建任务请求体 → 完整翻译结果（纯函数，不联网）。
 
@@ -397,6 +415,10 @@ def translate_create(body: Mapping[str, Any]) -> dict:
         "duration": duration,
         "resolution": resolution,
         "tier": "turbo",
+        # 站点侧的"提示词增强"。**默认开**（用户 2026-09-16 口径：「默认 promptEnrichment:true
+        # 开启提示词增强」），与站点自己前端发的请求一致（它发的是 `promptEnrichment:true`）。
+        # 关掉：`extra_body.aivideomaker_prompt_enrichment = false`（见下）。
+        "promptEnrichment": True,
     }
     if aspect:
         params["aspectRatio"] = aspect
@@ -416,6 +438,19 @@ def translate_create(body: Mapping[str, Any]) -> dict:
         params["tier"] = override
     elif override:
         warnings.append(f'extra_body.aivideomaker_tier="{override}" ignored (expected turbo|base)')
+
+    # `promptEnrichment` 的显式覆盖（默认开，见上面 web_params 里那条）。
+    # 认不出的值**不猜**：保持默认开 + 告警 —— 与 `aivideomaker_tier` 同形（不静默）。
+    enrich = extra.get("aivideomaker_prompt_enrichment")
+    if enrich is not None and enrich != "":
+        flag = _as_bool(enrich)
+        if flag is None:
+            warnings.append(
+                f'extra_body.aivideomaker_prompt_enrichment="{enrich}" ignored '
+                f"(expected true|false); the default (true) applies"
+            )
+        else:
+            params["promptEnrichment"] = flag
 
     # 计费口径**不在这里定死**，由 billing_view() 统一渲染（见下），这里只给默认值。
     return {

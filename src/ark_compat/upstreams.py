@@ -30,7 +30,7 @@ from loguru import logger
 
 from .minter import TokenMinter
 from .translate import normalize_web_task
-from .web_client import WebClient
+from .web_client import MediaFetchBudget, WebClient
 from .web_queue import WebSubmitQueue
 
 _DATA_URI_RE = re.compile(r"^data:([^;,]+);base64,(.*)$", re.S)
@@ -53,43 +53,49 @@ class WebUpstream:
 
     kind = "web"
 
-    def __init__(self, client: WebClient, queue: WebSubmitQueue):
+    def __init__(self, client: WebClient, queue: WebSubmitQueue, *, media_rehost_budget: float = 90.0):
         self.client = client
         self.queue = queue
+        # 整个转存阶段的总预算（秒）。见 `MediaFetchBudget`：没有它，最多 7 个媒体项
+        # 串行转存的最坏耗时会把调用方的超时甩在后面，而我们还接着把任务提交出去。
+        self.media_rehost_budget = max(1.0, float(media_rehost_budget))
 
     def create(self, plan: dict) -> str:
-        params = self._rehost(dict(plan["web_params"]))
+        budget = MediaFetchBudget(self.media_rehost_budget)
+        params = self._rehost(dict(plan["web_params"]), budget)
         return self.queue.submit(params, token=plan.get("captcha_token"))
 
     # ---- 媒体转存 ----------------------------------------------------------
 
-    def _rehost(self, params: dict) -> dict:
+    def _rehost(self, params: dict, budget) -> dict:
         """把外链 / 内联 data URI 媒体转存到**站点自己的 CDN**。
 
         站点只收自己 CDN 的地址：外链会按 Content-Type 白名单被拒
         （实测过一个 `.jpg` 外链返回非标准 MIME `image/jpg`，字节其实是 PNG）。
         已经是 `static*.img2video.ai` 的地址原样放过，不重复上传。
+
+        ⚠️ 这里是**串行**的，最多 7 项（图 4 / 视频 1 / 音频 2）⇒ 由 `budget` 兜住总时长。
         """
         for key in ("imageUrl", "lastFrameUrl", "referenceVideoUrl"):
-            params[key] = self._upload_one(params.get(key))
+            params[key] = self._upload_one(params.get(key), budget)
         for key in ("referenceImageUrls", "referenceAudioUrls"):
             vals = params.get(key)
             if isinstance(vals, list) and vals:
-                params[key] = [self._upload_one(v) for v in vals]
+                params[key] = [self._upload_one(v, budget) for v in vals]
         return params
 
-    def _upload_one(self, value):
+    def _upload_one(self, value, budget=None):
         if not isinstance(value, str) or not value:
             return value
         if _SITE_CDN_RE.match(value):
             return value  # 已经在站点 CDN 上
         data = _decode_data_uri(value)
         if data:
-            return self.client.upload_file(data["buf"], name="inline")["publicUrl"]
+            return self.client.upload_file(data["buf"], name="inline", budget=budget)["publicUrl"]
         if value.startswith("data:"):
             return value  # 解不开的 data URI 原样透传，让上游给出更明确的报错
         if re.match(r"^https?://", value, re.I):
-            return self.client.upload_file(value)["publicUrl"]
+            return self.client.upload_file(value, budget=budget)["publicUrl"]
         return value
 
     def get_task(self, task_id: str) -> dict:
@@ -171,6 +177,8 @@ def _build_web(
         visitor_id=settings.visitor_id,
         trust_env=settings.trust_env,
         probe_timeout=settings.probe_timeout,
+        # 取"参考文件链接"的单项预算：调大了就是把调用方的超时甩在后面（见 _fetch_media）
+        media_fetch_timeout=settings.media_fetch_timeout,
         # 闸门开着时会自动去铸造服务取 token（未配置则为 None ⇒ 行为不变）
         minter=TokenMinter(settings.minter_url, settings.minter_key, settings.minter_timeout),
     )
@@ -180,7 +188,7 @@ def _build_web(
         poll_interval=settings.poll_interval,
         log=log,
     )
-    return WebUpstream(client, queue)
+    return WebUpstream(client, queue, media_rehost_budget=settings.media_rehost_budget)
 
 
 def build_upstreams(settings, log: Callable[[str], None] | None = None) -> dict[str, Any]:

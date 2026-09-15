@@ -38,6 +38,7 @@ class WebSubmitQueue:
         poll_interval: float = 10.0,
         watch_timeout: float = 3600.0,
         acquire_timeout: float = 600.0,
+        upstream: str = "web",
         log: Callable[[str], None] | None = None,
     ):
         self.client = client
@@ -45,6 +46,9 @@ class WebSubmitQueue:
         self.poll_interval = poll_interval
         self.watch_timeout = watch_timeout
         self.acquire_timeout = acquire_timeout
+        # 上报用的上游名（本闸门目前只服务 web 线；留成参数是为了**不编**这个标签，
+        # 将来若有第二条线复用，指标不会把两个上游混成一个）
+        self._upstream = upstream
         self._log = log or (lambda _m: None)
 
         self._sem = threading.Semaphore(self.max_concurrent)

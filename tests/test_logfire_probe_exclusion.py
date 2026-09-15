@@ -143,7 +143,7 @@ class TestPatternSemantics(unittest.TestCase):
         excluded = excluded_for(None)
         self.assertTrue(excluded.url_disabled(f"{HOST}/healthz"))
         self.assertFalse(
-            self._excluded().url_disabled("http://host/healthz?deep=1"),
+            excluded.url_disabled(f"{HOST}/healthz?deep=1"),
             "带 query 的串根本不会出现在判定入口；若它能命中，说明上游改成匹配完整 URL 了",
         )
 
@@ -184,7 +184,7 @@ class TestPathSemantics(unittest.TestCase):
 
 
 class TestDerivedPredicatesAgree(unittest.TestCase):
-    """第 2 层：两个派生口（span 侧正则 / 日志侧谓词）必须给同一答案。"""
+    """第 3 层之二：两个派生口（span 侧正则 / 日志侧谓词）必须给同一答案。"""
 
     def tearDown(self):
         O.set_probe_paths(None)
@@ -304,8 +304,8 @@ class TestWiring(unittest.TestCase):
         self.assertIs(seen["capture_headers"], False, "抓头必须仍然关着（凭证头不入 trace）")
         self.assertIs(seen["app"], app)
 
-    def test_installed_middleware_carries_our_exclusions(self):
-        """第 3 层之二：**装好的** ASGI 中间件里的排除串就是我们的。
+    def test_installed_middleware_carries_the_configured_paths(self):
+        """装好的 ASGI 中间件里携带的是**当前生效表**（不是写死在代码里的那份）。
 
         只验"我们传了个 kwarg"不够 —— 中间那一跳（logfire → otel instrumentor → 中间件）
         任何一处把参数丢掉，请求就照旧成 span。
@@ -320,8 +320,7 @@ class TestWiring(unittest.TestCase):
         )
         app = create_app(web_settings(logfire_excluded_paths=("/healthzz", "/internal/")))
         O.instrument_fastapi(app)
-        stack = app.build_middleware_stack()
-        mw = _find_otel_middleware(stack)
+        mw = _find_otel_middleware(app.build_middleware_stack())
         self.assertIsNotNone(
             mw,
             "建好的中间件栈里没有带 `excluded_urls` 的中间件：上游换了挂载方式，本测试要跟着改",
@@ -348,15 +347,20 @@ class TestRealAppSpans(unittest.TestCase):
             ),
             additional_span_processors=[SimpleSpanProcessor(self.exporter)],
         )
-        app = create_app(web_settings())
-        # 生产路径就是这一句（`create_app` 里 logfire_ok 时调的同一个函数）
+        # 生产的装配顺序就是这两句：create_app 内 setup_observability 解析生效表 →
+        # instrument_fastapi 读同一张表
+        app = create_app(settings)
         O.instrument_fastapi(app)
-        self.client = TestClient(app)
+        return TestClient(app)
+
+    def setUp(self):
+        self.client = self._client(web_settings())
 
     def tearDown(self):
         logfire.force_flush()
+        O.set_probe_paths(None)  # 别把自定义表漏给后面的用例
 
-    def topics(self) -> list:
+    def targets(self) -> list:
         """本轮请求产生的 span 的 `http.target`（ASGI span 带这个属性）。"""
         logfire.force_flush()
         return [s["attributes"].get("http.target") for s in self.exporter.exported_spans_as_dict()]

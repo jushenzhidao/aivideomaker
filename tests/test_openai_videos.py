@@ -13,6 +13,7 @@ import struct
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -65,7 +66,9 @@ class FakeClient:
         self.created_params.append(dict(params))
         return "t1"
 
-    def upload_file(self, source, name=None, permanent=False):
+    def upload_file(self, source, name=None, permanent=False, budget=None):
+        # `budget` 是转存阶段新增的**跨媒体项总预算**（MediaFetchBudget），调用处按关键字传
+        # ⇒ 替身必须收，否则 TypeError（同类坑：真签名变了、替身没跟着变）。
         self.uploaded.append(source if isinstance(source, str) else f"<{len(source)} bytes>")
         return {"publicUrl": f"https://static.img2video.ai/rehost-{len(self.uploaded)}.png", "kind": "image"}
 
@@ -180,6 +183,41 @@ class TestArkBodyFromOpenai(unittest.TestCase):
             {"model": "m", "prompt": "p", "input_reference": "", "first_frame_image": ""}
         )
         self.assertEqual(len(body["content"]), 1)
+
+    def test_input_reference_json_string_array_is_parsed(self):
+        """🔴 表单里"数组写成了字符串"（`--form 'input_reference=["u1","u2"]'`）必须被解析。
+
+        原样透传会变成 `referenceImageUrls` 里的**一个垃圾项**（既不是 URL 也不是 data URI），
+        一路静默到转存阶段才炸 —— 调用方完全看不出是自己把数组写成了字符串
+        （实测：旧行为下 `warnings` 里一个字都没有）。
+        """
+        body, notes = ark_body_from_openai(
+            {"model": "m", "prompt": "p",
+             "input_reference": '["https://x/a.png","https://x/b.png"]'}
+        )
+        urls = [c["image_url"]["url"] for c in body["content"] if c.get("type") == "image_url"]
+        self.assertEqual(urls, ["https://x/a.png", "https://x/b.png"])
+        self.assertTrue(any("JSON string" in n for n in notes), f"摊平必须留痕：{notes}")
+
+    def test_input_reference_broken_json_string_is_rejected(self):
+        """看着像数组但不是合法 JSON ⇒ **明确拒**（不许当成一个 URL 用）。"""
+        with self.assertRaises(ParamError) as ctx:
+            ark_body_from_openai(
+                {"model": "m", "prompt": "p", "input_reference": '["https://x/a.png"'}
+            )
+        self.assertIn("合法 JSON", str(ctx.exception))
+
+    def test_frame_field_given_a_list_is_rejected_not_silently_dropped(self):
+        """🔴 帧字段给成数组 ⇒ **明确拒**，不许**静默丢素材**（本项目红线之一）。
+
+        实测过旧行为：`first_frame_image: ["https://x/f.png"]` → 图片项 0 个、`notes` 为空，
+        调用方看到的是"提交成功、只是没有首帧"。参考素材静默丢失比直接报错糟得多。
+        """
+        with self.assertRaises(ParamError) as ctx:
+            ark_body_from_openai(
+                {"model": "m", "prompt": "p", "first_frame_image": ["https://x/f.png"]}
+            )
+        self.assertIn("不接受数组", str(ctx.exception))
 
     def test_first_and_last_frame(self):
         body, _ = ark_body_from_openai(
@@ -336,6 +374,140 @@ class TestOpenaiHttpLayer(unittest.TestCase):
         self.assertTrue(self.fake.uploaded[0].startswith("<"), "文件应被解成字节再上传")
         self.assertTrue(
             self.fake.created_params[0]["imageUrl"].startswith("https://static.img2video.ai/")
+        )
+
+    def test_oversize_part_is_rejected_at_ingest_without_uploading(self):
+        """★ 文件部件有**单件上限**：超了在读的时候就拒（400），一个字节都不上传。
+
+        为什么这道闸必须有：`.form()` 会把 >1MB 的部件**落盘**、`read()` 再**整个**读进内存、
+        然后 base64（+33%）⇒ 没有闸时一个超大件是"先写满磁盘 → 吃掉几倍内存 → 最后才被站点
+        `maxBytes` 拒掉"。断言三件事：状态码、**消息点名上限**、以及"既没转存也没提交"。
+        """
+        from ark_compat import app as app_module
+
+        big = png_bytes() + b"x" * 8192
+        with mock.patch.object(app_module, "_FORM_PART_MAX_BYTES", 4096):
+            r = self.client.post(
+                OPENAI_VIDEOS_PATH,
+                data={"model": "doubao-seedance-1-0-lite_480p", "prompt": "p"},
+                files={"first_frame_image": ("a.png", big, "image/png")},
+            )
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("单件上限", r.text)
+        self.assertEqual(self.fake.uploaded, [], "超限的件绝不许被转存")
+        self.assertEqual(self.fake.created_params, [], "更不许把任务提交出去（那一步计费）")
+
+    def test_oversize_body_is_rejected_from_content_length(self):
+        """另一道闸在**解析之前**：光靠 `Content-Length` 就拒掉，连落盘都不做。
+
+        ⚠️ 报文用词必须与"单件上限"**不同**（这里是"请求体"），断言各查各的词 —— 否则
+        删掉其中一条、靠另一条兜住也会绿（这是变异自证里踩过的典型假绿）。
+        """
+        from ark_compat import app as app_module
+
+        with mock.patch.object(app_module, "_FORMS_MAX_BODY_BYTES", 1024):
+            r = self.client.post(
+                OPENAI_VIDEOS_PATH,
+                data={"model": "doubao-seedance-1-0-lite_480p", "prompt": "p"},
+                files={"first_frame_image": ("a.png", png_bytes() + b"y" * 4096, "image/png")},
+            )
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("请求体", r.text)
+        self.assertEqual(self.fake.uploaded, [])
+
+    def test_a_normal_file_upload_passes_both_gates(self):
+        """对照组：正常大小的文件必须照旧走通（否则上面两条只是"什么都过不去"）。"""
+        r = self.client.post(
+            OPENAI_VIDEOS_PATH,
+            data={"model": "doubao-seedance-1-0-lite_480p", "prompt": "p"},
+            files={"first_frame_image": ("a.png", png_bytes(), "image/png")},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(self.fake.uploaded), 1)
+        self.assertTrue(self.fake.created_params[0]["imageUrl"].startswith("https://static.img2video.ai/"))
+
+    def test_form_json_string_array_is_flattened_per_element(self):
+        """★ 表单路径的"数组写成字符串"必须**按元素**救援（不是只看顶层）。
+
+        🔴 实测踩到：`input_reference` 在表单里**天生是一个列表**（重复部件），所以"数组写成
+        字符串"落在**元素**上 —— 只救顶层时，form 路径照样把整串当成一个垃圾 URL 静默带走，
+        而直接调翻译层的单测却是绿的。这条就是那个盲区的守门。
+        """
+        r = self.client.post(
+            OPENAI_VIDEOS_PATH,
+            data={"model": "doubao-seedance-1-0-lite-i2v-250428", "prompt": "p",
+                  "seconds": "5", "size": "adaptive",
+                  "input_reference": '["https://x/a.png","https://x/b.png"]'},
+            headers={"Authorization": "Bearer x", "x-avm-dry-run": "1"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(
+            r.json()["web_params"]["referenceImageUrls"], ["https://x/a.png", "https://x/b.png"],
+            "必须摊平成两项（原样透传会变成一个垃圾 URL）",
+        )
+        self.assertTrue(any("JSON string" in w for w in r.json()["warnings"]), "摊平必须留痕")
+
+    def test_form_frame_field_json_array_is_rejected(self):
+        """帧字段拿到数组 ⇒ 400（不许静默丢素材）。"""
+        r = self.client.post(
+            OPENAI_VIDEOS_PATH,
+            data={"model": "m", "prompt": "p", "first_frame_image": '["https://x/f.png"]'},
+            headers={"Authorization": "Bearer x", "x-avm-dry-run": "1"},
+        )
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("不接受数组", r.text)
+
+    def test_repeated_file_streams_mix_with_urls_and_respect_the_cap(self):
+        """`input_reference` 是列表：**文件流**、URL、两者混合都收；超 4 张截断且**留痕**。"""
+        files = [("input_reference", (f"r{i}.png", png_bytes(), "image/png")) for i in range(2)]
+        files.append(("input_reference", ("", "https://files.test/u.png")))
+        r = self.client.post(
+            OPENAI_VIDEOS_PATH,
+            data={"model": "m", "prompt": "p"},
+            files=files,
+            headers={"Authorization": "Bearer x", "x-avm-dry-run": "1"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        refs = r.json()["web_params"]["referenceImageUrls"]
+        self.assertEqual(len(refs), 3)
+        self.assertEqual(sum(1 for x in refs if str(x).startswith("data:")), 2, "文件流成 data URI")
+        self.assertEqual(refs[-1], "https://files.test/u.png", "URL 原样保留")
+
+        many = [("input_reference", (f"r{i}.png", png_bytes(), "image/png")) for i in range(3)]
+        many += [("input_reference", ("", f"https://files.test/{n}.png")) for n in ("u", "v")]
+        r2 = self.client.post(
+            OPENAI_VIDEOS_PATH, data={"model": "m", "prompt": "p"}, files=many,
+            headers={"Authorization": "Bearer x", "x-avm-dry-run": "1"},
+        )
+        self.assertEqual(len(r2.json()["web_params"]["referenceImageUrls"]), 4, "上限 4 张")
+        self.assertTrue(
+            any("at most 4" in w for w in r2.json()["warnings"]),
+            "截断必须留痕（参考素材不能静默丢）",
+        )
+
+    def test_ignored_channel_header_is_warned(self):
+        """🔴 `x-base-url` 这类"渠道选择"头本服务无法满足 ⇒ 必须**留痕**，不许静默。
+
+        它表达的是"请走 XX 线"，而本服务只有 web 逆向线 —— 静默服务等于**悄悄换掉上游**
+        （计费口径 / 排队 / 质量都不同）。留痕走 warnings（与"未知字段被忽略"同一通道）。
+        """
+        r = self.client.post(
+            OPENAI_VIDEOS_PATH,
+            data={"model": "m", "prompt": "p"},
+            headers={"Authorization": "Bearer x", "x-avm-dry-run": "1", "x-base-url": "volc"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        warns = r.json()["warnings"]
+        self.assertTrue(any("x-base-url" in w and "volc" in w for w in warns), f"没留痕：{warns}")
+
+        r2 = self.client.post(
+            OPENAI_VIDEOS_PATH,
+            data={"model": "m", "prompt": "p"},
+            headers={"Authorization": "Bearer x", "x-avm-dry-run": "1"},
+        )
+        self.assertFalse(
+            [w for w in r2.json()["warnings"] if "x-base-url" in w],
+            "对照：没带这个头时不许凭空产生该告警（否则告警会被当噪声忽略）",
         )
 
     def test_dry_run_creates_nothing(self):
