@@ -583,8 +583,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title=settings.service_title,
         description="把 aivideomaker 包装成火山方舟 Seedance 协议形状（上游：网页端内部接口）。",
         version=__version__,
-        docs_url=None,
-        redoc_url=None,
+        # 交互式文档**保持开启**（此前的 `docs_url=None, redoc_url=None` 已移除）：
+        # 本兼容层字段映射细节多（content 元素、ratio / resolution 取值域、`@图像n`
+        # 引用规则），无 UI 时只能靠读 README。回归断言见
+        # `tests/test_api_docs_enabled.py`。
+        # 🔴 两者走 FastAPI 默认 ⇒ **不带** `require_bearer`（鉴权是逐路由 Depends，
+        #    不是全局中间件）⇒ 与 `/openapi.json` 同级的**公开**端点，别当受保护资源。
+        # 🔴 Swagger UI 的 JS/CSS 由浏览器从 CDN（cdn.jsdelivr.net）取：服务端一切正常时
+        #    页面仍可能白屏——服务端日志**看不出**这个问题，别误判成路由没生效。
     )
     app.state.settings = settings
     app.state.upstreams = build_upstreams(settings, log=lambda m: logger.warning(m))

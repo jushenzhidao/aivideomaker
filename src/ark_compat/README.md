@@ -153,6 +153,28 @@ credential 管**上游解析**，两者用途不同、互不替代。
 | GET | `/v1/videos/{id}` | 查询（OpenAI v1/videos 形状） |
 | GET | `/healthz` | 存活 + 上游可用性与计费口径；`?deep=1` 额外查上游 |
 
+### 交互式文档
+
+| 路径 | 说明 |
+|---|---|
+| `/docs` | Swagger UI（可点 Authorize 填 Bearer，直接试发请求） |
+| `/redoc` | ReDoc（只读、按标签分组，适合通读字段域） |
+| `/openapi.json` | OpenAPI 3.1 schema 本体 |
+
+> 历史：`app.py` 里曾长期是 `docs_url=None, redoc_url=None`（从首次提交 `c9777e2` 起，
+> 且没留理由），所以 `/docs` 一直是 **404** —— 而"服务没坏、是文档被关掉"这件事从外部
+> 看不出来（`/openapi.json` 反而活着）。现已恢复，并由
+> [`tests/test_api_docs_enabled.py`](../../tests/test_api_docs_enabled.py) 钉住。
+
+🔴 这三条是**公开**端点：本服务的鉴权是**逐路由** `Depends(require_bearer)`，作用不到
+FastAPI 自动注册的文档路由上 —— 即使在闸门模式（`AVM_AUTH=key:…`）下也**不需要**凭据。
+要保护它们得额外加中间件，别误以为"挂了闸门就顺带挡住了文档"。
+
+🔴 页面里的 JS/CSS 由**浏览器**从 `cdn.jsdelivr.net` 取（ReDoc 还额外拉 Google Fonts 字体）。
+服务端一切正常、`/docs` 明明返回 200，浏览器到不了该 CDN 时**照样白屏**，
+而**日志里没有任何线索** —— 别据此判成"路由没生效"或"服务坏了"。要彻底消除这个外部
+依赖只能自托管静态资源。
+
 ## OpenAI `/v1/videos` 兼容面
 
 把同一套管线再包一层 OpenAI Videos 形状，对齐 Chatfire「OpenaiVideos格式 /
