@@ -149,7 +149,34 @@ credential 管**上游解析**，两者用途不同、互不替代。
 | POST | `/api/v3/contents/generations/tasks` | 创建任务（透传下把凭据绑定到这条任务上） |
 | GET | `/api/v3/contents/generations/tasks` | 列表（**仅本凭据创建过的**；透传下必须带凭据，否则 401） |
 | GET | `/api/v3/contents/generations/tasks/{id}` | 查询（实时回上游取；透传下**可不带凭据**，按创建时绑定的凭据取；TTL 缓存节流见下） |
+| POST | `/v1/videos` | 创建任务（**OpenAI v1/videos 形状**，见下节） |
+| GET | `/v1/videos/{id}` | 查询（OpenAI v1/videos 形状） |
 | GET | `/healthz` | 存活 + 上游可用性与计费口径；`?deep=1` 额外查上游 |
+
+## OpenAI `/v1/videos` 兼容面
+
+把同一套管线再包一层 OpenAI Videos 形状，对齐 Chatfire「OpenaiVideos格式 /
+Seedance」的两份 OpenAPI（[创建](https://oneapis.apifox.cn/369966278e0) /
+[查询](https://oneapis.apifox.cn/369966279e0)）—— **响应只含契约声明的字段**，
+调用方按 Chatfire 文档写的解析代码原样可用：
+
+| 调用 | 响应（恰好这些字段） |
+|---|---|
+| `POST /v1/videos` | `{"id", "object": "video", "status": "queued", "created_at"}` |
+| `GET /v1/videos/{id}` | `{"id", "object": "video", "status", "progress", "video_url", "created_at"}` |
+
+请求字段映射：`model` 原样保留（`_480p/_720p/_1080p` 后缀决定分辨率档位）；
+`prompt` → 提示词；`seconds` → 时长；`size` → 宽高比（`keep_ratio`/`adaptive`
+上游语义相同 = 跟随输入图，映射会留痕）；`input_reference` → 参考图（≤4 张，
+超限截断照旧留痕）；`first_frame_image` / `last_frame_image` → 首/尾帧。
+表单（multipart / urlencoded，Chatfire 的 curl 形态）与 JSON（OpenAI SDK 形态）
+都收；表单文件部件按 magic bytes 定 MIME 转内联，真实提交时照常转存站点 CDN。
+status 词表：`queued` / `in_progress` / `completed` / `failed`；`progress` 只在
+终态成功时是 100（上游没有可读百分比，不编造中间值）；`video_url` 仅 `completed`
+且有产出时给值。鉴权、计费口径、dry-run、凭据绑定与方舟线**完全一致**
+（`X-Avm-Dry-Run: 1` 照常可用）。
+
+⚠️ 刻意没有 `DELETE /v1/videos/{id}`：站点没有取消端点，理由同上。
 
 ⚠️ **刻意没有 `DELETE /tasks/{id}`**（2026-09-15 定）：站点没有取消端点，"删本地记录"
 只会制造"任务没了"的错觉（跑着的照跑照扣）。对外接口面只有**创建 + 查询**，
@@ -428,6 +455,7 @@ src/
 └── ark_compat/
     ├── __init__.py          包说明、版本、服务名（改名只改这里）
     ├── translate.py         纯函数翻译层（Ark ↔ 站点接口）+ 计费口径渲染
+    ├── openai_videos.py     OpenAI /v1/videos 兼容面的纯翻译（OpenAI 形 ↔ Ark 形）
     ├── upstreams.py         上游统一接口 + 媒体转存 + 上游工厂
     ├── web_client.py        网页端客户端（tRPC / 上传 / SSE）
     ├── web_queue.py         并发闸门（信号量 + 终态释放）
@@ -449,6 +477,7 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 ├── test_free_window.py      免费窗口（常量 ↔ billing_note）
 ├── test_docs_billing_sync.py 文档里的免费秒数必须跟着 FREE_MAX_DURATION 走
 ├── test_seedance25_omni.py  Seedance 2.5 全能参考（截断、专属字段、前置拒绝；零外发）
+├── test_openai_videos.py    OpenAI /v1/videos 兼容面（Chatfire 契约六字段；零外发）
 ├── test_trace_contract.py   trace 属性契约（内存 exporter 捞 span 断言 + 凭证红线）
 ├── test_passthrough_cookie.py 透传（多租户隔离、缓存淘汰、闸门互斥）
 ├── test_task_store.py       任务持久化（跨实例可读 = 重启不丢）

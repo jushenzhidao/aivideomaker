@@ -2,10 +2,15 @@
 
 路由（与 Ark 原生一致，**只保留创建 + 查询**）：
 
-    POST   /api/v3/contents/generations/tasks          创建任务
+    POST   /api/v3/contents/generations/tasks          创建任务（火山方舟形状）
     GET    /api/v3/contents/generations/tasks          列表（本进程内）
     GET    /api/v3/contents/generations/tasks/{id}     查询
+    POST   /v1/videos                                  创建任务（OpenAI v1/videos 形状）
+    GET    /v1/videos/{id}                             查询（OpenAI v1/videos 形状）
     GET    /healthz                                    存活 + 上游体检
+
+两条对外形状（方舟 / OpenAI）共用同一条提交与查询管线 —— 翻译层只换"外壳"，
+计费口径、dry-run、凭据绑定、租户隔离在两条线上行为完全一致。
 
 把火山官方 SDK 的 base_url 指向本服务即可直接使用。
 
@@ -53,6 +58,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -82,6 +88,8 @@ from .observability import (
     upstream_exchanges,
 )
 from .settings import Settings
+from .openai_videos import OPENAI_VIDEOS_PATH, ark_body_from_openai, openai_task_view
+from .sniff import sniff_file
 from .store import build_task_store
 from .translate import billing_note, billing_view, translate_create
 from .upstreams import build_upstreams, build_web_for_cookie
@@ -714,15 +722,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     info["upstream_error"] = str(e)
         return info
 
-    @app.post(TASKS_PATH)
-    async def create_task(request: Request, _: str = Depends(require_bearer)):
-        body = await _json_body(request)
+    async def _submit_ark(
+        request: Request,
+        body: dict,
+        *,
+        extra_warnings: list[str] | None = None,
+        response_shape: str = "ark",
+    ) -> dict:
+        """创建任务的**共享管线** —— 方舟与 OpenAI 两条入口只在外壳上不同，
+        计费口径、dry-run、前置拒绝、凭据绑定、任务落库全在这里走一遍。
+
+        `extra_warnings`：入口层自己的"映射说明"（如 keep_ratio→adaptive），
+        必须并进 warnings —— 映射不静默。
+        `response_shape`：ark → `{"id"}`（旧契约，测试锁死）；openai → Chatfire
+        契约四字段 `{id, object, status, created_at}`，一个不多一个不少。
+        """
         # 先解析上游：透传模式下这一步同时完成鉴权 —— 未授权的请求
         # 不该先拿到"参数不合法"这种更像配置问题的错误。
         upstream, credential = _upstream_and_credential_for(request)
 
         plan = translate_create(body)
         eff, warns = billing_view(plan)
+        if extra_warnings:
+            warns = [*warns, *extra_warnings]
         plan = {**plan, "effective": eff, "warnings": warns}
 
         if _is_dry_run(request, body):
@@ -821,7 +843,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             task_id,
             eff["billed"],
         )
+        if response_shape == "openai":
+            # Chatfire 创建响应契约：恰好四个字段。id 形态本就是 `cgt-*`，与示例一致。
+            return {
+                "id": entry["id"],
+                "object": "video",
+                "status": "queued",
+                "created_at": int(entry["createdAtMs"]) // 1000,
+            }
         return {"id": entry["id"]}
+
+    @app.post(TASKS_PATH)
+    async def create_task(request: Request, _: str = Depends(require_bearer)):
+        body = await _json_body(request)
+        return await _submit_ark(request, body)
 
     @app.get(TASKS_PATH)
     async def list_tasks(
@@ -864,6 +899,66 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise ArkError(404, "TaskNotFound", f"task {task_id} not found")
         # 透传下调用方可以不带凭据 —— 按创建时绑定的凭据回上游取（E2E-AVM-011）
         return await _task_view(request, entry, _upstream_for_task(request, entry))
+
+    # ---------------------------------------------- OpenAI /v1/videos 兼容面 ----
+    #
+    # 契约：Chatfire「OpenaiVideos格式 / Seedance」两份 OpenAPI（369966278 创建 /
+    # 369966279 查询）—— "务必一样"：响应只含契约声明的字段。
+    # 表单与 JSON 都收：Chatfire 的 curl 用 multipart 表单，OpenAI 官方 SDK 用
+    # JSON；两种形态等价，进同一条 _submit_ark 管线。
+
+    async def _openai_fields(request: Request) -> dict:
+        """收 OpenAI 创建请求的字段：JSON body 或 multipart/urlencoded 表单。
+
+        表单里的文件部件（UploadFile）读成字节、按 **magic bytes** 定 MIME 包成
+        data URI —— 这是进程内转换、零网络；真实提交时由既有转存管线上传到
+        站点 CDN，dry-run 依旧零副作用。
+        """
+        ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if ctype == "application/json":
+            return await _json_body(request)
+        form = await request.form()
+        fields: dict = {}
+        for key in form.keys():
+            converted: list = []
+            for v in form.getlist(key):
+                if str(v) == "":
+                    continue  # curl 里的 --form 'input_reference=""' = 未提供
+                if hasattr(v, "read"):  # UploadFile：文件部件 → data URI
+                    buf = await v.read()
+                    with suppress(Exception):  # 及时关闭，别留 SpooledTemporaryFile 告警
+                        await v.close()
+                    sniffed = sniff_file(buf)
+                    mime = (
+                        sniffed["content_type"]
+                        if sniffed["kind"] != "unknown"
+                        else (v.content_type or "image/png")
+                    )
+                    converted.append(f"data:{mime};base64," + base64.b64encode(buf).decode())
+                else:
+                    converted.append(str(v))
+            if not converted:
+                continue
+            # input_reference 是数组字段：重复出现即为多张参考图
+            fields[key] = converted if key == "input_reference" else converted[0]
+        return fields
+
+    @app.post(OPENAI_VIDEOS_PATH)
+    async def create_video(request: Request, _: str = Depends(require_bearer)):
+        fields = await _openai_fields(request)
+        body, notes = ark_body_from_openai(
+            fields, reference_format=request.headers.get("input-reference-format") or ""
+        )
+        return await _submit_ark(request, body, extra_warnings=notes, response_shape="openai")
+
+    @app.get(OPENAI_VIDEOS_PATH + "/{video_id}")
+    async def get_video(video_id: str, request: Request, _: str = Depends(require_bearer)):
+        entry = request.app.state.tasks.get(video_id)
+        if not _visible(request, entry):
+            raise ArkError(404, "TaskNotFound", f"task {video_id} not found")
+        # 凭据绑定与方舟线完全一致：透传下可不带凭据，按创建时绑定的那份取
+        view = await _task_view(request, entry, _upstream_for_task(request, entry))
+        return openai_task_view(view, created_at_fallback=int(entry.get("createdAtMs") or 0) // 1000 or None)
 
     # ⚠️ 刻意**没有** DELETE /tasks/{id}（2026-09-15 定）：上游没有取消端点，
     # "删本地记录"只会制造"任务没了"的错觉（跑着的照跑照扣）。对外接口面
