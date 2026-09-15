@@ -53,6 +53,12 @@ CONFIG_BARE = {"PORT", "COOKIES_FILE", "LOGFIRE_TOKEN"}
 NOT_IN_TEMPLATE = {
     # gunicorn master 在 auto 模式下自己注入，模板里已按"勿手工设置"登记
     # （注意：它也**在**模板里，这里仅作说明位，不再重复登记）
+    #
+    # 已废弃的鉴权变量（0.0.20 起由**单变量** `AVM_AUTH` 取代）。生产代码**会读**它们，
+    # 但只为了在启动期**拒绝**并打印迁移映射（见 settings.legacy_auth_error）——
+    # 登记进模板会让运维以为还能用，与本意正相反，故只在这里说明理由。
+    "AVM_GATE_KEY": "已废弃：仅用于启动期拒绝，迁移写法 = AVM_AUTH=key:<原值>",
+    "AVM_PASSTHROUGH_COOKIE": "已废弃：仅用于启动期拒绝，迁移写法 = AVM_AUTH=passthrough",
 }
 
 DECLARED = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$", re.M)
@@ -199,6 +205,31 @@ class TestEnvTemplate(unittest.TestCase):
             "以下变量**生产代码会读取**，但 .env.example 里没有登记 —— "
             "运维照模板配 .env 时无从知道它们存在：\n  " + "\n  ".join(undeclared),
         )
+
+    # ---- 鉴权单变量（0.0.20：AVM_AUTH 取代 AVM_GATE_KEY / AVM_PASSTHROUGH_COOKIE）----
+
+    def test_template_declares_the_single_auth_variable(self):
+        declared = {m.group(1) for m in DECLARED.finditer(
+            ENV_EXAMPLE.read_text(encoding="utf-8")
+        )}
+        self.assertIn("AVM_AUTH", declared,
+                      "鉴权现在是一个变量 AVM_AUTH（三选一），模板必须登记它")
+
+    def test_deprecated_auth_vars_are_not_declared(self):
+        """★ 废弃项必须**明确不可配**：有人把 AVM_GATE_KEY 写回模板，运维就会以为还能用
+        （代码仍读它，但只为了在启动期拒绝 —— 理由写在 NOT_IN_TEMPLATE 里）。
+        反向也要钉住：白名单里的每个名字都必须真的有生产代码读它，否则白名单会腐烂成
+        "随便加的豁免"。"""
+        text = ENV_EXAMPLE.read_text(encoding="utf-8")
+        declared = {m.group(1) for m in DECLARED.finditer(text)}
+        code = production_source()
+        for name in ("AVM_GATE_KEY", "AVM_PASSTHROUGH_COOKIE"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, declared, f"{name} 已废弃，不该在模板里声明")
+                self.assertIn(name, NOT_IN_TEMPLATE)
+                self.assertTrue(is_read(name, code),
+                                f"{name} 在 NOT_IN_TEMPLATE 里，但生产代码并不读它 ⇒ "
+                                "白名单条目已失效（废弃判定大概被删了）")
 
 
 class TestBlanksMeanUnset(unittest.TestCase):

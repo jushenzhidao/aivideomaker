@@ -187,7 +187,7 @@ def build_upstreams(settings, log: Callable[[str], None] | None = None) -> dict[
     """构造**本进程持有凭据**的 web 上游。
 
     ⚠️ 只建**本进程持有凭据**的那份：透传线的客户端必须等看到调用方凭据才能建
-    （见 `build_web_for_cookie`）。所以 `AVM_PASSTHROUGH_COOKIE=1` 且没配
+    （见 `build_web_for_cookie`）。所以 `AVM_AUTH=passthrough` 且没配
     `AVM_COOKIE` 时，这里返回**空字典** —— 但服务依然可用。
     """
     if not settings.cookie:

@@ -135,13 +135,16 @@ class TestPassthroughCookieConfig(unittest.TestCase):
         self.assertTrue(s.passthrough_cookie)
 
     def test_from_env_reads_the_switch(self):
-        s = Settings.from_env({"AVM_PASSTHROUGH_COOKIE": "1"})
+        s = Settings.from_env({"AVM_AUTH": "passthrough"})
         self.assertTrue(s.passthrough_cookie)
+        self.assertEqual(s.auth, "passthrough")
 
     def test_gate_and_passthrough_cannot_coexist(self):
+        # 环境变量层已表达不出这个组合（AVM_AUTH 三态互斥）；这里守的是**代码内直接
+        # 构造 Settings** 的场景（测试夹具 / 嵌入用法）—— 报错要指向单变量写法。
         with self.assertRaises(ValueError) as ctx:
             settings(gate_key="sk-gate").validate()
-        self.assertIn("AVM_GATE_KEY", str(ctx.exception))
+        self.assertIn("AVM_AUTH", str(ctx.exception))
 
     def test_gate_alone_is_still_fine(self):
         settings(passthrough_cookie=False, gate_key="sk-gate", cookie=COOKIE_A).validate()
@@ -233,6 +236,8 @@ class TestHealthzHidesNothing(PassthroughHttpCase):
         j = self.client.get("/healthz").json()
         self.assertEqual(j["available_upstreams"], ["web"])
         self.assertEqual(j["upstream"], "web")
+        # 鉴权模式如实报出（0.0.20 起是单变量三选一）；旧键保留，供既有巡检取用
+        self.assertEqual(j["auth"], "passthrough")
         self.assertTrue(j["passthrough_cookie"])
         self.assertTrue(j["credentials_from_caller"])
         self.assertIn("billing_notes", j)

@@ -30,7 +30,7 @@
 pip install -r requirements.txt
 
 export AVM_COOKIE="auth_session=…" # 浏览器导出，TTL 约 400 天（或改用透传由调用方自带，见下）
-export AVM_GATE_KEY=sk-local       # 本机闸门（不设则对任何调用方开放）
+export AVM_AUTH=key:sk-local       # 鉴权：一个变量三选一（留空 = 不校验）
 
 python3 src/ark_server.py --port 8808
 ```
@@ -42,6 +42,7 @@ python3 src/ark_server.py --port 8808
 [ark-compat] available lines  : web
 [ark-compat] billing          : web upstream: tier=base is always billed; tier=turbo is free up to 10s
 [ark-compat] upstream host    : https://aivideomaker.ai
+[ark-compat] auth mode        : gate
 [ark-compat] gate             : sk-local
 ```
 
@@ -59,18 +60,21 @@ r = client.content_generation.tasks.create(
 )
 ```
 
-## 鉴权：进程持凭据，还是调用方自带凭据（透传）
+## 鉴权：**一个变量** `AVM_AUTH`，三选一
 
-**开关一开，调用方的 `Authorization: Bearer` 就是上游凭据本身**
-—— 本进程不再持有凭据，也就没有"服务自己的账号"这回事。
-
-| 线 | 进程持凭据（默认） | 调用方自带（透传） |
+| `AVM_AUTH` | 含义 | 上游凭据来自 |
 |---|---|---|
-| `web` | `AVM_COOKIE` | `AVM_PASSTHROUGH_COOKIE=1`，Bearer 放**网页会话 cookie** |
+| 留空（或 `open`） | 不校验（本机自用） | 本进程的 `AVM_COOKIE` |
+| `passthrough` | 调用方的 `Authorization: Bearer` **就是上游凭据本身**（网页会话 cookie） | 调用方（本进程不再需要 `AVM_COOKIE`） |
+| `key:<密钥>` | 闸门：Bearer 必须等于 `<密钥>` | 本进程的 `AVM_COOKIE` |
+
+`passthrough` 即"没有服务自己的账号"这回事：每个调用方带自己的会话，各自享自己账号的
+免费窗口。取值写法**刻意不猜** —— 裸密钥不算闸门（必须写 `key:` 前缀），
+`key:` 空密钥、`gate:x` 这类近似写法一律**拒绝启动**并列出可选写法。
 
 ```bash
-# 每个调用方带自己的会话，各自享自己账号的免费窗口
-export AVM_PASSTHROUGH_COOKIE=1
+# 每凭据一账号：调用方自带会话
+export AVM_AUTH=passthrough
 python3 src/ark_server.py --port 8808
 
 curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
@@ -83,10 +87,12 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
 
 三条**必须知道**的约束：
 
-1. **透传与闸门 `AVM_GATE_KEY` 互斥。** 同一个 Bearer 不可能既是闸门密钥又是上游凭据，
-   同设时启动直接失败 —— 否则每个请求都 401，而现象看起来像"调用方凭据错了"。
+1. **闸门与透传互斥，且单变量让那个组合无法表达。** 同一个 Bearer 不可能既是闸门密钥
+   又是上游凭据；旧版用两个变量（`AVM_GATE_KEY` + `AVM_PASSTHROUGH_COOKIE`）表达同设时
+   每个请求都 401，而现象看起来像"调用方凭据错了"。那两个变量**已废弃**：只要还有行为
+   （闸门非空 / 透传不是显式的关值），启动就被拒绝并打印迁移映射 —— 不静默放过。
 2. **透传按凭据隔离（owner 维度）。** 任务表多了 `owner` 维度（凭据的 sha256 前 16 位，
-   **不落凭据原文**），`GET /tasks`、`GET/DELETE /tasks/{id}` 全按归属过滤，别人的任务一律 404
+   **不落凭据原文**），`GET /tasks`、`GET /tasks/{id}` 全按归属过滤，别人的任务一律 404
    （连"存在"都不透露）。切换开关前建的旧记录没有归属，在透传模式下查不到 ——
    保留窗口只有 7 天，很快自然淘汰。
    ⚠️ 这是**防御性隔离**，不是"多租户网关"定位：本项目语义是**账号级**（一个实例 =
@@ -113,17 +119,19 @@ key 落库这件事）。防线：文件权限自动收到 `0600`、凭据绝不
 删除与保留窗口清理时随记录一起删除。`owner` 指纹照旧不变 —— owner 管**租户隔离**，
 credential 管**上游解析**，两者用途不同、互不替代。
 
-`/healthz` 会把这件事说清楚：`credentials_from_caller`、`passthrough_cookie`，
-以及 `available_upstreams` —— 透传线的客户端要等凭据才存在，但**能力**照样如实上报
-（否则会显示成"没配任何上游"）。透传模式下 `?deep=1` 没带凭据**不会** 401，
-而是在 `upstream_probe` 里写明原因。
+`/healthz` 会把这件事说清楚：`auth`（当前模式）、`credentials_from_caller`、
+`passthrough_cookie`、`gate`，以及 `available_upstreams` —— 透传线的客户端要等凭据才
+存在，但**能力**照样如实上报（否则会显示成"没配任何上游"）。透传模式下 `?deep=1`
+没带凭据**不会** 401，而是在 `upstream_probe` 里写明原因。
 
-`AVM_PASSTHROUGH_COOKIE=1` 时，调用方的 `Authorization: Bearer` 就是**网页会话
-cookie 本身**（裸 token 或完整 Cookie 串都行），本进程不再需要 `AVM_COOKIE`。
+`AVM_AUTH=passthrough` 时，调用方的 `Authorization: Bearer` 就是**网页会话 cookie
+本身**（裸 token 或完整 Cookie 串都行），本进程不再需要 `AVM_COOKIE`；
 任务表按**凭据指纹**隔离，A 看不到 B 的任务。
 
-⚠️ 它与 `AVM_GATE_KEY` **互斥**：同一个 Bearer 不可能既是闸门密钥又是上游凭据，
-两者同设会让每个请求都在闸门处 401 —— 所以 `Settings.validate()` 直接拒绝启动。
+⚠️ 闸门与透传互斥（同一个 Bearer 不可能既是闸门密钥又是上游凭据）：旧版这是两个变量
+（`AVM_GATE_KEY` + `AVM_PASSTHROUGH_COOKIE`），同设会让每个请求都在闸门处 401，只能靠
+`Settings.validate()` 拦。现在收成**一个变量**（`AVM_AUTH` 三选一），那种组合
+**根本无法表达**；旧变量只要还有行为，启动即被拒并打印迁移映射。
 
 ## 上游选线（已移除）
 
@@ -167,7 +175,7 @@ AVM_TASK_STORE=memory      # 显式开发/测试开关：重启即丢
 
 **凭据绑定列（E2E-AVM-011）**：透传创建的任务会在这份库里存一份**会话凭据原文**
 （`credential` 列，与 `owner` 指纹分开 —— owner 管租户隔离、credential 管上游解析），
-供 `GET/DELETE /tasks/{id}` 免凭据轮询时解析上游。文件权限自动收到 `0600`；
+供 `GET /tasks/{id}` 免凭据轮询时解析上游。文件权限自动收到 `0600`；
 删除与保留窗口清理时凭据随记录一起删除；绝不进日志 / span / 响应体。
 
 ## 查询节流（避免把上游打到 429）
@@ -453,6 +461,16 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 ├── test_minter_chrome_guard.py 铸造器 Chrome 生命周期守卫（绝不叠实例）
 ├── test_minter_bind_guard.py 铸造服务绑定安全（非回环 + 无 key ⇒ 拒绝启动）
 ├── test_minter_timezone.py  铸造时区门禁（缺 TZ ⇒ 铸造恒 interactive；含变异自证）
+├── test_minter_healthcheck_port.py 健康检查**跟随 PORT/BIND_HOST**（假 unhealthy 的反例自证）
+├── test_auth_single_var.py  鉴权单变量（三态解析、旧变量拒绝、闸门×透传不可表达）
+├── test_compose_wiring_check.py 宿主机侧接线校验（含"它自己能被证伪"的变异清单）
+├── test_minter_preflight_attribution.py 前置校验的归因准确性（P-07/P-08）
+├── test_minter_render_budget.py   render 预算（冷启动 / 常规两条）
+├── test_turnstile_render_states.py 铸造失败分类与页面内状态采样
+├── test_billing_advisory.py  计费提醒只在 duration 越线时出现
+├── test_task_credential_binding.py 任务凭据绑定（免凭据查询 / 租户隔离 / 空表 401）
+├── test_upstream_model_visibility.py 请求值与实际执行值分列（`model` / `upstream_model`）
+├── test_logfire_export_signal.py  观测出口"真的在发"（而不是只装上了 SDK）
 └── test_ua_consistency.py   UA / 服务名一致性
 ```
 

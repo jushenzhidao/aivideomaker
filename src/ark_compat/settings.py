@@ -6,17 +6,23 @@
 本项目只对接**一条上游**：网页端内部接口（tRPC over `/api`，会话 cookie）。
 它没有取消端点，但有一个免费窗口 —— `tier=turbo` 且 `duration ≤ 10s` 不计费。
 
-**凭据的两种来源**：
+**凭据与鉴权：一个变量（`AVM_AUTH`）三选一**
 
-===========================================  ==========================================
-本进程持有一份凭据（默认）                     调用方按请求自带凭据（透传）
-===========================================  ==========================================
-web：`AVM_COOKIE`                            web：`AVM_PASSTHROUGH_COOKIE=1`
-===========================================  ==========================================
+=================  =========================================================
+留空 / `open`      不校验（本机自用）；上游凭据取本进程的 `AVM_COOKIE`
+`passthrough`      调用方按请求自带凭据：`Authorization: Bearer` **就是上游凭据**
+                   （网页会话 cookie，裸 token 或完整 Cookie 串），本进程不需要 `AVM_COOKIE`
+`key:<密钥>`       闸门：`Authorization: Bearer` 必须等于 `<密钥>`；上游凭据仍取 `AVM_COOKIE`
+=================  =========================================================
 
-透传模式下调用方的 `Authorization: Bearer` 就是**上游凭据本身**（网页会话 cookie）。
-因此它与闸门（`AVM_GATE_KEY`）**互斥**：单一 Bearer 不可能既当闸门密钥又当上游凭据，
-同设的后果是每个请求都 401（见 `validate()`）。
+为什么收成一个变量：闸门与透传**互斥** —— 单一 Bearer 不可能既当闸门密钥又当上游凭据，
+同设的后果是每个请求都 401。那是个**必然失败**的组合，以前只能靠 `validate()` 拦；
+现在这种组合**根本无法表达**（见 `parse_auth`）。
+
+旧变量 `AVM_GATE_KEY` / `AVM_PASSTHROUGH_COOKIE` **已废弃**：只要它们还"有行为"
+（闸门非空 / 透传为真），`from_env()` 就拒绝并打印迁移映射 —— **不静默放过**：
+忽略一个有行为的旧变量，会让闸门无声变开放、或透传无声失效，两者都是
+本项目最忌讳的「配了不生效」。
 """
 
 from __future__ import annotations
@@ -47,6 +53,93 @@ def _parse_send(raw) -> bool | str:
     if v in ("1", "true", "yes", "on"):
         return True
     return "if-token-present"
+
+
+# ---------------------------------------------------------------- 鉴权（一个变量）--
+
+AUTH_OPEN = "open"                  # 不校验（本机自用）
+AUTH_PASSTHROUGH = "passthrough"    # 调用方的 Bearer 就是上游凭据
+AUTH_GATE = "gate"                  # 调用方的 Bearer 必须等于闸门密钥
+AUTH_FORMS = "留空（或 open）/ passthrough / key:<密钥>"
+
+# 已废弃的旧变量：**只在启动期用来拒绝**，不再参与任何行为判定。
+# 刻意不登记进 .env.example —— 登记会让人以为还能用（见 test_env_template 的 NOT_IN_TEMPLATE）。
+LEGACY_AUTH_VARS = ("AVM_GATE_KEY", "AVM_PASSTHROUGH_COOKIE")
+# 显式的"关"值：只有这些（与空串）算"没有行为"。其余任何非空值都按"意图开启"处理 ——
+# 旧代码的 flag 白名单只认 1/true/yes，写 `on` 的人以为自己开了透传而实际是关的，
+# 迁移期不能沿用那个口径（见 legacy_auth_usage 的说明）。
+_LEGACY_OFF_VALUES = frozenset({"0", "false", "no", "off"})
+_LEGACY_MIGRATION = {
+    "AVM_GATE_KEY": "AVM_AUTH=key:<原 AVM_GATE_KEY 的值>",
+    "AVM_PASSTHROUGH_COOKIE": "AVM_AUTH=passthrough",
+}
+
+
+def parse_auth(raw) -> tuple:
+    """`AVM_AUTH` → `(模式, 闸门密钥, 问题)`；问题非空 ⇒ 取值不合法。
+
+    刻意**不猜意图**：裸密钥（`AVM_AUTH=sk-xxx`）不当作闸门密钥。猜错的代价不对称 ——
+    把"我想开闸门"猜成别的模式，结果就是闸门静默消失。`key:` 前缀因此是必需的，
+    顺带让密钥本身叫 `passthrough` 也不产生歧义。
+    """
+    value = str(raw or "").strip()
+    low = value.lower()
+    if low in ("", AUTH_OPEN, "none"):
+        return AUTH_OPEN, "", ""
+    if low == AUTH_PASSTHROUGH:
+        return AUTH_PASSTHROUGH, "", ""
+    if low.startswith("key:"):
+        secret = value.split(":", 1)[1].strip()
+        if secret:
+            return AUTH_GATE, secret, ""
+        return AUTH_OPEN, "", (
+            "AVM_AUTH=key: 的密钥是空的 ⇒ 等于没有闸门。拒绝启动（不猜：空密钥一律不算闸门）。"
+            f"可选写法：{AUTH_FORMS}。"
+        )
+    return AUTH_OPEN, "", (
+        f"AVM_AUTH={value!r} 不是合法取值。可选写法：{AUTH_FORMS}。"
+        "裸密钥不算 —— 闸门必须显式写成 `key:<密钥>`，否则无法与模式名区分。"
+    )
+
+
+def legacy_auth_usage(env: Mapping[str, str]) -> tuple:
+    """`(还有行为的旧变量, 仅显式写了"关"值的旧变量)` —— 迁移期用。
+
+    "有行为" = 闸门**非空** / 透传**不是显式的关值**。
+
+    为什么透传侧按"非关即开"判定、而不是按旧代码那套 flag 白名单：旧代码的白名单只认
+    `1/true/yes`，写 `AVM_PASSTHROUGH_COOKIE=on` 的人**以为自己开了透传，实际是关的**
+    （这次审计顺带发现的旧口径不一致）。迁移期不能再沿用那个口径 —— 那种取值的**意图**
+    明确是"开"，静默按关处理正是本项目最忌讳的「配了不生效」⇒ 一律拒绝启动，
+    让它按迁移映射改成 `AVM_AUTH=passthrough`。
+
+    只写了显式关值（`0/false/no/off`）或空串的旧部署语义与 `AVM_AUTH` 留空完全一致
+    ⇒ 不拦，只在启动日志里提示删除。⚠️ 空串按本项目既有口径 = **没设**
+    （模板里 `VAR=` 就是"没设"），故 `AVM_GATE_KEY=` 不做任何提示。
+    """
+    effective, deprecated = [], []
+    for name in LEGACY_AUTH_VARS:
+        raw = str(env.get(name, "") or "")
+        if not raw.strip():
+            continue
+        has_effect = bool(raw.strip()) if name == "AVM_GATE_KEY" else (
+            raw.strip().lower() not in _LEGACY_OFF_VALUES
+        )
+        (effective if has_effect else deprecated).append(name)
+    return tuple(effective), tuple(deprecated)
+
+
+def legacy_auth_error(names: tuple) -> str:
+    """旧变量迁移指引（拒绝启动时打印）。**必须给出精确映射**，否则运维只能猜。"""
+    lines = [f"{'、'.join(names)} 已废弃 —— 鉴权现在是**一个变量** `AVM_AUTH`，"
+             f"取值只能是：{AUTH_FORMS}。"]
+    lines += [f"  你设的 {n} ⇒ 改成 {_LEGACY_MIGRATION[n]}" for n in names]
+    lines += [
+        "  改完请把旧变量从 .env / compose override 里删掉（否则仍会拒绝启动）。",
+        "  为什么不做兼容：忽略一个有行为的旧变量，会让闸门无声变开放、或透传无声失效 ——"
+        "代价不对称，宁可起不来。",
+    ]
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -85,7 +178,14 @@ class Settings:
 
     # ---- 通用 ----
     base_url: str = DEFAULT_BASE_URL
+    # ---- 鉴权：**一个变量**（见模块头）----
+    # `gate_key` / `passthrough_cookie` 是**生效字段**（下游 `require_bearer` / `upstreams` /
+    # `/healthz` 只认它们）；模式 `auth` 由它们**派生**（见下面的 property）。
+    # 刻意不做成字段：字段就可能与真实行为不一致（`Settings(passthrough_cookie=True)`
+    # 这种直接构造在测试夹具里很常见），而报出去的模式必须是行为的忠实描述。
     gate_key: str = ""
+    # 旧变量残留（只显式写了"关"值的那几个）：仅用于启动期提示，不参与任何行为。
+    auth_deprecated: tuple = ()
     service_name: str = SERVICE_NAME
     service_title: str = SERVICE_TITLE
     environment: str = ""
@@ -125,9 +225,21 @@ class Settings:
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
         env = os.environ if env is None else env
+        # 鉴权：一个变量定模式。非法取值、以及"旧变量还有行为"都在这里拒绝
+        # —— 刻意放在 from_env 而不是 validate()：环境变量的**原文**只在这里读得到，
+        # 而迁移判定依赖原文（`AVM_GATE_KEY=` 空串 = 没设 vs `AVM_PASSTHROUGH_COOKIE=0` = 显式关）。
+        auth_mode, gate_key, auth_problem = parse_auth(env.get("AVM_AUTH", ""))
+        legacy_effective, legacy_deprecated = legacy_auth_usage(env)
+        if auth_problem:
+            raise ValueError(auth_problem)
+        if legacy_effective:
+            raise ValueError(legacy_auth_error(legacy_effective))
         return cls(
             cookie=normalize_cookie_header(env.get("AVM_COOKIE", "")),
-            passthrough_cookie=_env_flag(env, "AVM_PASSTHROUGH_COOKIE"),
+            # 生效字段由模式派生（`auth` 自己是 property，见类里）：
+            # `AVM_AUTH=passthrough` ⇒ 透传；`key:<密钥>` ⇒ 闸门密钥；留空 ⇒ 都不设。
+            passthrough_cookie=(auth_mode == AUTH_PASSTHROUGH),
+            auth_deprecated=legacy_deprecated,
             user_id=str(env.get("AVM_USER_ID", "")).strip(),
             visitor_id=str(env.get("AVM_VISITOR_ID", "")).strip(),
             max_concurrent=int(env.get("AVM_MAX_CONCURRENT") or 2),
@@ -139,7 +251,8 @@ class Settings:
             minter_timeout=float(env.get("AVM_MINTER_TIMEOUT") or 25),
             account_report_identity=_env_flag(env, "AVM_ACCOUNT_REPORT_IDENTITY"),
             base_url=str(env.get("AVM_BASE_URL") or DEFAULT_BASE_URL).rstrip("/"),
-            gate_key=str(env.get("AVM_GATE_KEY", "")).strip(),
+            # 闸门密钥（来自 `AVM_AUTH=key:<密钥>`；裸密钥不被接受 —— 见 parse_auth）
+            gate_key=gate_key,
             # 服务名可用 AVM_SERVICE_NAME 临时覆盖，但默认值只有一个来源
             service_name=str(env.get("AVM_SERVICE_NAME") or SERVICE_NAME).strip(),
             environment=str(env.get("AVM_ENVIRONMENT", "")).strip(),
@@ -159,6 +272,18 @@ class Settings:
             trust_env=not _env_flag(env, "AVM_NO_TRUST_ENV"),
             account_report_seconds=int(env.get("AVM_ACCOUNT_REPORT_SECONDS") or 300),
         )
+
+    @property
+    def auth(self) -> str:
+        """归一化的鉴权模式（`open` / `passthrough` / `gate`）—— 由**生效字段**派生。
+
+        为什么是 property 而不是字段：字段就可能与真实行为不一致（直接构造 `Settings` 的
+        调用方——测试夹具、嵌入用法——不会自动同步那个副本），而 `/healthz` 与启动日志报出的
+        模式必须是**行为**的忠实描述。派生之后二者永远一致，不可能漂移。
+        """
+        if self.gate_key:
+            return AUTH_GATE
+        return AUTH_PASSTHROUGH if self.passthrough_cookie else AUTH_OPEN
 
     @property
     def web_ready(self) -> bool:
@@ -183,18 +308,16 @@ class Settings:
             )
 
         if self.passthrough_cookie and self.gate_key:
-            # 这不是"运行时才发现的偶发问题"，而是**必然失败**的组合：闸门先校验
-            # `Authorization: Bearer`，而透传要求同一个 Bearer 就是上游凭据。
-            # 两者同设时每个请求都会在闸门处 401，透传永远不生效 —— 且现象
-            # （401 AuthenticationError）看起来像是"调用方凭据错了"，极易误诊。
+            # 环境变量层**已不可能**表达这个组合（`AVM_AUTH` 三态天然互斥，见 parse_auth）；
+            # 这里守的是代码内直接构造 Settings 的场景（测试夹具、嵌进别的进程）。
             raise ValueError(
-                "AVM_GATE_KEY 与透传互斥（AVM_PASSTHROUGH_COOKIE）："
-                "同一个 Authorization: Bearer 不可能既是闸门密钥又是上游凭据。"
-                "要透传就清空 AVM_GATE_KEY；要闸门就关掉透传。"
+                "闸门（gate_key）与透传（passthrough_cookie）互斥：同一个 Authorization: "
+                "Bearer 不可能既是闸门密钥又是上游凭据。用 **一个变量** 表达："
+                f"AVM_AUTH={AUTH_FORMS}（二选一，不设 = 不校验）。"
             )
 
         if not self.web_ready:
             raise ValueError(
                 "至少要配一份凭据：AVM_COOKIE（至少含 auth_session=...），"
-                "或 AVM_PASSTHROUGH_COOKIE=1 透传调用方的会话 cookie。"
+                f"或 AVM_AUTH={AUTH_PASSTHROUGH} 透传调用方的会话 cookie。"
             )

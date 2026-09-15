@@ -52,6 +52,11 @@ E2E-AVM-012 新增：`AVM_MINTER_URL` 里的**端口**必须与 minter 的 `PORT
 镜像 `HEALTHCHECK` 把 `127.0.0.1:8899` 写死导致的**假 unhealthy**：判据已收口到服务自身的
 `--selfcheck`（见 `Dockerfile.minter` / `turnstile_service.selfcheck()`），静态解析看不见
 镜像内部，故那一层由 `tests/test_minter_healthcheck_port.py` 钉住。
+
+鉴权（0.0.20 起）：`AVM_AUTH` 是**一个变量三选一**（留空 / `passthrough` / `key:<密钥>`）。
+本工具在 `--resolve` 时**复用 `ark_compat.settings` 的判据**，把两类"容器启动即被拒"的配置
+提前到部署前报出来：取值非法（裸密钥、`key:` 空密钥），以及已废弃的
+`AVM_GATE_KEY` / `AVM_PASSTHROUGH_COOKIE` 仍"有行为"。
 """
 
 from __future__ import annotations
@@ -405,6 +410,32 @@ def _flag(raw: str) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+def auth_problems(app_env: dict) -> list:
+    """鉴权配置的问题清单（判据复用 `ark_compat.settings`，不重写）。
+
+    两件事：① `AVM_AUTH` 取值是否合法（裸密钥、`key:` 空密钥都会被容器拒绝）；
+    ② 已废弃的 `AVM_GATE_KEY` / `AVM_PASSTHROUGH_COOKIE` 是否"还有行为" ——
+    那种部署在容器里会被**拒绝启动**，故必须在部署前就指出来。
+    """
+    sys.path.insert(0, str(ROOT / "src"))
+    try:
+        from ark_compat.settings import legacy_auth_error, legacy_auth_usage, parse_auth
+    except Exception as e:  # noqa: BLE001  导入不到就不给"看起来没问题"的结论
+        return [f"[接线] 无法导入 ark_compat.settings（{type(e).__name__}: {e}）⇒ "
+                "无法按真实值复核鉴权配置（不能当成通过）。"]
+    problems: list[str] = []
+    _, _, problem = parse_auth(app_env.get("AVM_AUTH", ""))
+    if problem:
+        problems.append(f"[接线] {APP}.AVM_AUTH 会让容器**启动即被拒**：{problem}")
+    effective, _deprecated = legacy_auth_usage(app_env)
+    if effective:
+        problems.append(
+            f"[接线] {APP} 还留着已废弃的鉴权变量 ⇒ 容器**启动即被拒**：\n      "
+            + legacy_auth_error(effective).replace("\n", "\n      ")
+        )
+    return problems
+
+
 # `AVM_MINTER_URL` 的主机名落在这些值上 = "就是本机/宿主自身"。minter 走 host 网络 ⇒
 # 它监听的端口与 URL 里的端口**必须**是同一个数字。指向别的主机时本工具无从判定（那可能
 # 是另一台机器上的 minter），故跳过、不误报。
@@ -490,12 +521,12 @@ def check_resolved(services: dict) -> list[str]:
         if err:
             problems.append("[守卫] minter 会拒绝启动：\n      " + err.replace("\n", "\n      "))
 
-    # 闸门与透传互斥（`Settings.validate()` 的同一条契约，这里提前一步拦住）
-    if _flag(app.get("AVM_PASSTHROUGH_COOKIE", "")) and app.get("AVM_GATE_KEY", "").strip():
-        problems.append(
-            f"[接线] {APP} 同时开了 AVM_PASSTHROUGH_COOKIE 与非空 AVM_GATE_KEY ⇒ "
-            "同一个 Authorization 不可能既是闸门密钥又是上游凭据，服务会拒绝启动。"
-        )
+    # ★ 鉴权（0.0.20 起是**一个变量** `AVM_AUTH`）：取值合法性 + 旧变量迁移，判据**直接
+    #   调用容器里的那份代码**（`ark_compat.settings.parse_auth` / `legacy_auth_usage`）——
+    #   重写一遍必然分叉，而分叉的后果是"宿主机说没事、容器起不来"（或更糟：宿主机拦住了
+    #   一个本该能跑的配置，从此没人再信这个门禁）。
+    #   放在宿主机侧的价值：在**部署前**就把"启动必被拒"的配置指出来，不必等容器起不来。
+    problems += auth_problems(app)
     return problems
 
 

@@ -339,11 +339,13 @@ class TestConfig(unittest.TestCase):
         s = Settings.from_env(
             {
                 "AVM_COOKIE": "auth_session=x",
-                "AVM_GATE_KEY": "g",
+                # 鉴权是一个变量三选一（0.0.20）：闸门写法 = key:<密钥>
+                "AVM_AUTH": "key:g",
                 "AVM_DISABLE_LOGFIRE": "1",
             }
         )
         self.assertEqual(s.cookie, "auth_session=x")
+        self.assertEqual(s.auth, "gate")
         self.assertEqual(s.gate_key, "g")
         self.assertFalse(s.enable_logfire)
 

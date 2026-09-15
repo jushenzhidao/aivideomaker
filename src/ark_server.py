@@ -54,9 +54,12 @@ def main(argv=None) -> int:
     except ImportError:
         sys.exit("需要 uvicorn：pip install -r requirements.txt")
 
-    # 配置错误（例如缺 AVM_COOKIE）在起服务之前就暴露，而不是等第一个请求打进来
-    settings = Settings.from_env()
+    # 配置错误（例如缺 AVM_COOKIE、旧的鉴权变量还留着）在起服务之前就暴露，
+    # 而不是等第一个请求打进来。⚠️ `from_env()` 也包在里面：`AVM_AUTH` 的取值校验与
+    # 「旧变量还有行为 ⇒ 拒绝启动」都在那一层（见 settings.parse_auth / legacy_auth_usage），
+    # 否则那两处会以 traceback 而不是一句可读的 exit 信息呈现。
     try:
+        settings = Settings.from_env()
         settings.validate()
     except ValueError as e:
         sys.exit(str(e))
@@ -79,7 +82,14 @@ def main(argv=None) -> int:
             "[ark-compat] credentials      : 调用方自带（web ← 调用方会话 cookie）"
             " —— 本进程不持有该侧凭据"
         )
-    print(f"[ark-compat] gate             : {settings.gate_key or 'open (建议设 AVM_GATE_KEY)'}")
+    # 鉴权模式**如实打印**（一个变量三选一，见 settings 模块头）：排障时不必再猜
+    # "到底是不是闸门模式"。旧的鉴权变量若只剩"关"值，也在这里点名提示删除。
+    print(f"[ark-compat] auth mode        : {settings.auth}")
+    print(f"[ark-compat] gate             : "
+          f"{settings.gate_key or f'open (建议设 AVM_AUTH=key:<密钥>)'}")
+    if settings.auth_deprecated:
+        print(f"[ark-compat] [warn] 已废弃的鉴权变量仍在环境里（当前取'关'值、无行为差异）："
+              f"{', '.join(settings.auth_deprecated)} —— 请删除，鉴权现由 AVM_AUTH 一个变量表达")
 
     uvicorn.run(
         app,

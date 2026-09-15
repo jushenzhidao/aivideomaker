@@ -123,14 +123,18 @@ npm run credits   # 积分消耗对账
 pip install -r requirements.txt
 
 export AVM_COOKIE="auth_session=…"     # 唯一需要的凭据
-export AVM_GATE_KEY=sk-local           # 本机闸门（不设则对任何调用方开放）
+export AVM_AUTH=key:sk-local           # 鉴权：一个变量三选一（留空 = 不校验）
 
 python3 src/ark_server.py --port 8808  # base_url: http://127.0.0.1:8808/api/v3
 ```
 
-> **调用方自带凭据（透传）**：`export AVM_PASSTHROUGH_COOKIE=1`，调用方的
-> `Authorization: Bearer` 直接携带**账号的**网页会话 cookie，本进程不再需要 `AVM_COOKIE`；
-> 它与 `AVM_GATE_KEY` 互斥（同一个 Bearer 不可能既是闸门密钥又是上游凭据）。
+> **鉴权是**一个变量** `AVM_AUTH`，三选一**（详解见 `src/ark_compat/README.md`）：
+> 留空（不校验，本机自用）｜ `passthrough`（调用方的 `Authorization: Bearer` 直接携带
+> **账号的**网页会话 cookie，本进程不再需要 `AVM_COOKIE`）｜ `key:<密钥>`（闸门）。
+> ⚠️ 闸门与透传**互斥**（同一个 Bearer 不可能既是闸门密钥又是上游凭据）—— 收成单变量
+> 之后，那个"必然 401"的组合**根本无法表达**；旧的 `AVM_GATE_KEY` /
+> `AVM_PASSTHROUGH_COOKIE` 已废弃：**只要它们还有行为，启动就会被拒绝并打印迁移映射**
+> （不静默放过 —— 忽略一个有行为的旧变量，要么闸门无声消失、要么透传无声失效）。
 
 ```python
 from arkruntime import Ark
@@ -169,7 +173,7 @@ Seedance 2.5「全能参考」上限为**图 4 / 视频 1 / 音频 2**，超限�
 > **项目定位：账号级语义 —— 一个实例服务一个账号。** 凭据、并发额度、免费窗口、
 > 任务归属全部按账号隔离。多账号 = **部署多实例**（每实例一份 `AVM_COOKIE`，或调用方
 > 固定带同一账号的 cookie）+ new-api 轮询（每渠道填一个账号的 cookie）；账号很少时
-> 也可以单实例透传（`AVM_PASSTHROUGH_COOKIE=1`，每凭据仍是独立账号上下文、零串扰）。
+> 也可以单实例透传（`AVM_AUTH=passthrough`，每凭据仍是独立账号上下文、零串扰）。
 
 ```bash
 cp .env.example .env      # 只需填 AVM_COOKIE（.env 已被 gitignore）—— 铸造服务不需要凭据
@@ -324,5 +328,8 @@ docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_P
 - 变量名以**代码实际读取的**为准。历史上有三个名字写错（`AVM_COOKIE_FILE` / `AVM_PORT` /
   重复定义的 `AVM_GATE_KEY`），共同后果都是**不报错、静默不生效**。
   `tests/test_env_template.py` 是一道门禁：声明了却不被代码读取的变量会判失败。
+  ⚠️ 其中 `AVM_GATE_KEY` 连同 `AVM_PASSTHROUGH_COOKIE` 现在**已废弃**（鉴权收成单变量
+  `AVM_AUTH`）：它们仍被代码读取，但只为了在启动期**拒绝**并在报错里给出迁移映射 ——
+  故刻意不登记进模板（见该测试里的 `NOT_IN_TEMPLATE`）。
 - 批量或自动化调用一律先 dry-run 预检，并留意上方「验证码闸门」——连续提交会把它翻起来。
 - `docs/web-reverse/captured/` 中为公开页面的抓取快照，仅用于离线分析。

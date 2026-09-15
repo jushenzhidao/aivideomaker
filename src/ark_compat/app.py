@@ -12,15 +12,18 @@
 上游只有一条：**网页端内部接口**（tRPC over `/api`，会话 cookie）。
 差异被 `upstreams.py` 吸收。
 
-**鉴权有两种形态**：
+**鉴权是一个变量（`AVM_AUTH`）三选一**（详解见 `settings.py` 的模块头）：
 
-    进程持有凭据      `AVM_COOKIE`
-    调用方自带凭据    `AVM_PASSTHROUGH_COOKIE=1`（Bearer 里放网页会话 cookie）
+    AVM_AUTH=              不校验（本机自用）；上游凭据取 `AVM_COOKIE`
+    AVM_AUTH=passthrough   调用方的 `Authorization: Bearer` 就是**上游凭据本身**
+                           （`auth_session=…` 裸 token 或完整 Cookie 串，见
+                           `docs/web-reverse/`）；本进程不需要 `AVM_COOKIE`
+    AVM_AUTH=key:<密钥>    闸门：Bearer 必须等于 `<密钥>`；上游凭据仍取 `AVM_COOKIE`
 
-透传时调用方的 `Authorization: Bearer` 就是**上游凭据本身**（`auth_session=…`
-裸 token 或完整 Cookie 串，见 `docs/web-reverse/`）。它与闸门 `AVM_GATE_KEY`
-**互斥** —— 同一个 Bearer 不可能既是闸门密钥又是上游凭据（`Settings.validate()`
-直接拒绝启动）。透传即多租户：任务表按**凭据指纹**隔离，见 `store.py` 的 `owner`。
+闸门与透传**互斥**（同一个 Bearer 不可能既当闸门密钥又当上游凭据）：以前用两个变量
+表达、靠 `Settings.validate()` 拒绝那个必然 401 的组合；现在用一个变量让那种组合
+**根本无法表达**（`settings.parse_auth`；旧变量若还有行为会直接拒绝启动）。
+透传即多租户：任务表按**凭据指纹**隔离，见 `store.py` 的 `owner`。
 
 **任务查询的凭据绑定（E2E-AVM-011）**：透传的鉴权前置在 newapi —— 调用方
 （newapi 的任务轮询）**不再要求重带凭据**。创建任务时把当时的凭据绑定到这条
@@ -137,11 +140,12 @@ def _bearer(request: Request) -> str:
 
 
 async def require_bearer(request: Request, authorization: str | None = Header(default=None)) -> str:
-    """闸门鉴权。未设 AVM_GATE_KEY 时不校验（本地自用）。
+    """闸门鉴权。`AVM_AUTH` 不是 `key:<密钥>` 时不校验（本机自用 / 透传）。
 
-    开了透传（`AVM_PASSTHROUGH_COOKIE`）就**不该**再设闸门：此时 Bearer 要拿去当
-    上游凭据，而闸门会先把它挡掉 —— 那种组合在 `Settings.validate()` 里直接拒绝启动，
-    不让它变成"每个请求都 401"的线上迷局。
+    `AVM_AUTH=passthrough` 时**不该**再是闸门模式：此时 Bearer 要拿去当上游凭据，
+    而闸门会先把它挡掉 —— 那种组合现在**无法用环境变量表达**（一个变量三选一，
+    见 `settings.parse_auth`）；`Settings.validate()` 只兜住代码内直接构造 Settings
+    的场景，不让它变成"每个请求都 401"的线上迷局。
     """
     gate = request.app.state.settings.gate_key
     if not gate:
@@ -651,7 +655,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         s = request.app.state.settings
         pool: dict = request.app.state.upstreams
         # 透传线的客户端要等看到凭据才存在，所以"能力"要并上 settings 的声明 ——
-        # 否则 `AVM_PASSTHROUGH_COOKIE=1` 的健康检查会显示"没有可用上游"，
+        # 否则 `AVM_AUTH=passthrough` 的健康检查会显示"没有可用上游"，
         # 而服务明明是好的（这会把人引向错误的方向）。
         kinds = sorted(set(pool) | (set(s.available_upstreams) if s.passthrough_cookie else set()))
 
@@ -662,6 +666,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "available_upstreams": kinds,
             "billing_notes": {k: billing_note() for k in kinds},
             "base_url": s.base_url,
+            # 鉴权模式**如实报出**（一个变量三选一）：排障时不必再猜"到底是不是闸门模式"。
+            # `gate` / `passthrough_cookie` / `credentials_from_caller` 一并保留 ——
+            # 它们由 `auth` 派生，已有调用方与巡检在按这几个键取值。
+            "auth": s.auth,
             "gate": "required" if s.gate_key else "open",
             "passthrough_cookie": s.passthrough_cookie,
             "credentials_from_caller": s.passthrough_cookie,

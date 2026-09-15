@@ -302,5 +302,67 @@ class TestPortCoherence(unittest.TestCase):
         self.assertEqual(self.tool.split_netloc("not-a-url"), ("", ""))
 
 
+class TestAuthSingleVariable(unittest.TestCase):
+    """鉴权配置的接线判据（0.0.20：一个变量 `AVM_AUTH` 取代两个旧变量）。
+
+    判据**复用 `ark_compat.settings`**（宿主机侧不重写第二份实现）。这里守的是"复用本身
+    没写错"：非法取值、以及"旧变量还有行为"，都必须在**部署前**被拦下 —— 否则那两类配置
+    会让容器启动即被拒（`unreachable` 之外最难查的一种形态：命令退出非 0、日志埋在
+    worker 启动里）。
+    """
+
+    def setUp(self):
+        self.tool = _load_tool()
+
+    def test_accepted_values_pass(self):
+        for value in ("", "open", "none", "passthrough", "key:sk-x"):
+            with self.subTest(value=value):
+                self.assertEqual(self.tool.auth_problems({"AVM_AUTH": value}), [])
+
+    def test_invalid_auth_value_is_caught(self):
+        """裸密钥不猜（本轮的硬约束）—— 必须被拦下并说明会拒绝启动。"""
+        problems = self.tool.auth_problems({"AVM_AUTH": "sk-abc"})
+        self.assertTrue(problems)
+        self.assertTrue(any("启动即被拒" in p for p in problems), problems)
+
+    def test_empty_gate_secret_is_caught(self):
+        problems = self.tool.auth_problems({"AVM_AUTH": "key:"})
+        self.assertTrue(any("启动即被拒" in p for p in problems), problems)
+
+    def test_legacy_vars_with_effect_are_caught(self):
+        for env in ({"AVM_GATE_KEY": "sk-old"},
+                    {"AVM_PASSTHROUGH_COOKIE": "1"},
+                    {"AVM_PASSTHROUGH_COOKIE": "on"}):
+            with self.subTest(env=env):
+                problems = self.tool.auth_problems(env)
+                self.assertTrue(any("已废弃" in p for p in problems), problems)
+                self.assertTrue(any("AVM_AUTH=" in p for p in problems),
+                                f"报错必须给出迁移映射：{problems}")
+
+    def test_legacy_explicit_off_is_not_flagged(self):
+        """`=0` 与留空同义（旧模板的默认值就是 0）⇒ 部署前不该报错。"""
+        self.assertEqual(self.tool.auth_problems({"AVM_PASSTHROUGH_COOKIE": "0"}), [])
+
+    def test_compose_passes_the_variable_through(self):
+        """compose 必须转发 `AVM_AUTH`，且用 `:-` 形态（留空=没设）。"""
+        services = self.tool.parse_services(COMPOSE.read_text(encoding="utf-8"))
+        self.assertEqual(services["ark-compat"].get("AVM_AUTH"), "${AVM_AUTH:-}")
+
+    def test_check_resolved_actually_surfaces_auth_problems(self):
+        """★ 变异自证抓到的缺口：上面几条**直调** `auth_problems`，于是把
+        `check_resolved` 里那句调用删掉时它们照样全绿 —— 门禁会静默失效。
+        所以必须从**入口**再断言一次（这正是本项目"门禁要能被证伪"的用法）。"""
+        svc = {
+            "ark-compat": {"AVM_MINTER_URL": "http://host.docker.internal:8899",
+                           "ARK_HOST": "0.0.0.0", "AVM_MINTER_KEY": "k",
+                           "AVM_GATE_KEY": "sk-old"},
+            "minter": {"MINTER_KEY": "k", "PORT": "8899", "BIND_HOST": "127.0.0.1",
+                       "TZ": "Asia/Shanghai"},
+        }
+        problems = self.tool.check_resolved(svc)
+        self.assertTrue(any("已废弃" in p for p in problems), problems)
+        self.assertTrue(any("AVM_AUTH=" in p for p in problems), problems)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

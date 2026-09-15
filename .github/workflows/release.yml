@@ -218,7 +218,7 @@ jobs:
           CID="$(docker run -d -p 8808:8808 \
             -e AVM_DISABLE_LOGFIRE=1 \
             -e AVM_TASK_STORE=memory \
-            -e AVM_PASSTHROUGH_COOKIE=1 \
+            -e AVM_AUTH=passthrough \
             "${IMAGE}@${DIGEST}")"
           trap 'docker logs "${CID}" 2>&1 | tail -n 30 || true; docker rm -f "${CID}" >/dev/null 2>&1 || true' EXIT
 
@@ -234,10 +234,12 @@ jobs:
 
           cat /tmp/healthz.json
           # AVM_DISABLE_LOGFIRE=1 / AVM_TASK_STORE=memory 保证冒烟测试零外发、不落 DB 文件。
-          # AVM_PASSTHROUGH_COOKIE=1 是**必需**的：settings.validate() 在启动期就要求
+          # AVM_AUTH=passthrough 是**必需**的：settings.validate() 在启动期就要求
           # 「AVM_COOKIE 或透传模式」二者之一，缺失则 worker 直接退出码 3、master 关闭，
           # /healthz 永远起不来（2026-09-14 实测：报 "至少要配一份凭据"）。
           # 选透传而不是塞一份真 cookie：它不需要任何真实凭据即可通过校验，且不落任何密文。
+          # ⚠️ 鉴权自 0.0.20 起是**一个变量**（AVM_AUTH 三选一）—— 旧的
+          #    AVM_PASSTHROUGH_COOKIE / AVM_GATE_KEY 若"还有行为"会让启动被拒，别再写回去。
           python3 -c "import json;d=json.load(open('/tmp/healthz.json'));assert d.get('ok') is True, d;print('healthz ok |', d.get('service'), '| task_store =', d.get('task_store'))"
 
   # minter 镜像（Turnstile 铸造服务：Chrome + Xvfb，约 1.6GB）。
