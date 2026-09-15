@@ -39,6 +39,41 @@ LOG_FORMAT = (
     "<level>{message}</level>"
 )
 
+# ---- 探活路径：不进 Logfire 上报 --------------------------------------------
+#
+# 探活是**被反复轮询**的（compose 的 HEALTHCHECK 每 30s 打一次 `/healthz`），一次请求
+# 在 Logfire 上就是一条 span **加**一条日志 —— 一天上千条，真实请求被淹掉，还白跑出站
+# 流量。所以两样都摘：**span** 在 `instrument_fastapi` 的 `excluded_urls` 里摘，
+# **日志**在 logfire 那个 sink 的 filter 里摘。
+# 摘掉的只是"上报"：本地 stderr 照打 —— 探活真坏掉时，本机仍然看得见。
+PROBE_PATHS = ("/healthz", "/")
+
+
+def is_probe_path(path: str) -> bool:
+    """是不是探活路径。**唯一定义处**：span 排除与日志过滤都从这里派生。"""
+    return path in PROBE_PATHS
+
+
+def probe_excluded_urls() -> str:
+    """把 `PROBE_PATHS` 翻成 otel 的 `excluded_urls`（逗号分隔的**正则**串）。
+
+    🔴 坑：上游拿这串做 `re.search`（**子串**匹配），不是路径相等 —— 手写 `"/"`
+    会命中**每一个** URL（任何 URL 都含 `/`），等于把全站追踪静默关掉；未锚定的
+    `"/healthz"` 也会连带吃掉 `/healthz/extra`。所以这里由 `PROBE_PATHS`
+    **机械生成**全锚定形态，谁都不必（也不该）手写这串正则。
+    """
+    return ",".join(rf"^https?://[^/]+{re.escape(p)}$" for p in PROBE_PATHS)
+
+
+def keep_off_logfire(record) -> bool:
+    """logfire 那个 sink 的 filter：探活请求的日志不上报（本地 sink 不受影响）。
+
+    `avm_probe` 由 app 的请求中间件按 `is_probe_path()` 绑定；请求之外的日志没有
+    这个键，照常上报。
+    """
+    return not record["extra"].get("avm_probe")
+
+
 # ---- 属性体积控制 ----------------------------------------------------------
 #
 # 不做脱敏，但**要做体积控制**：参考图可以是几 MB 的 data URI，原样挂上去会把
@@ -97,7 +132,12 @@ def setup_observability(settings) -> bool:
         )
 
         try:
-            logger.add(logfire.loguru_handler(), level=settings.log_level)
+            # 探活请求的日志不上报（`keep_off_logfire` 按中间件绑的 `avm_probe` 判）
+            logger.add(
+                logfire.loguru_handler(),
+                level=settings.log_level,
+                filter=keep_off_logfire,
+            )
         except Exception as e:  # 不同 logfire 版本的桥接 API 略有差异
             logger.debug(f"loguru→logfire 桥接不可用：{e}")
 
@@ -138,10 +178,17 @@ def _has_token() -> bool:
 
 
 def instrument_fastapi(app) -> None:
-    """给 FastAPI 挂自动 span。抓头显式关掉（默认也是关，这里把意图写死）。"""
+    """给 FastAPI 挂自动 span。抓头显式关掉（默认也是关，这里把意图写死）。
+
+    探活路径（`PROBE_PATHS`）排除在外：它们被反复轮询，每次成一条 span 就是纯噪声。
+    """
     import logfire
 
-    logfire.instrument_fastapi(app, capture_headers=_CAPTURE_HEADERS)
+    logfire.instrument_fastapi(
+        app,
+        capture_headers=_CAPTURE_HEADERS,
+        excluded_urls=probe_excluded_urls(),
+    )
 
 
 # ---- 值裁剪 ----------------------------------------------------------------

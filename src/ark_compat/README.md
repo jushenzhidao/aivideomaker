@@ -377,6 +377,15 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
 - **loguru** 是唯一日志出口，每条带 `request_id`（同时回显在响应头 `x-request-id`）。
 - 经 `logfire.loguru_handler()` 桥接进 Logfire；`instrument_fastapi` 让每个请求成一条
   span，`instrument_httpx` 让每次上游调用成子 span。
+- 🔴 **探活路径不上报**（`observability.PROBE_PATHS` = `/healthz` 与 `/`）：容器
+  HEALTHCHECK 每 30s 打一次 `/healthz`，每条都成 span + 日志就是一天上千条噪声。
+  **span** 在 `instrument_fastapi(excluded_urls=…)` 里摘，**日志**在 logfire 那个 sink 的
+  filter（`keep_off_logfire`，按请求中间件绑的 `avm_probe` 判）里摘 —— 两个口都从
+  `is_probe_path()` 派生，改一处不会漏另一处。本地 stderr 照打：探活真坏掉时本机仍看得见。
+  ⚠️ 这串**不能手写正则**：上游做的是 `re.search`（**子串**匹配），写 `"/"` 会命中
+  **每一个** URL（任何 URL 都含 `/`）⇒ 全站追踪被静默关掉；未锚定的 `"/healthz"` 也会
+  连带吃掉 `/healthz/extra`。故由 `PROBE_PATHS` 机械生成全锚定形态。
+  门禁：`tests/test_logfire_probe_exclusion.py`（含变异自证：把上面的写法改回朴素串必红）。
 - 具名 span（属性即契约，用内存 exporter 断言：`tests/test_trace_contract.py`）：
   - `ark.create.submit` —— `ark_id` / `upstream` / `ark_model` /
     `resolution` / `duration` / `billed` / `warning_count` / `warnings` /

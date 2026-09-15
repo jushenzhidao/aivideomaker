@@ -79,6 +79,7 @@ from .observability import (
     clip,
     describe_error,
     instrument_fastapi,
+    is_probe_path,
     logfire_exporting,
     logfire_ready,
     record_account,
@@ -628,7 +629,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.middleware("http")
     async def request_context(request: Request, call_next):
         rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
-        with logger.contextualize(request_id=rid):
+        # 探活请求：本地照打日志，但**不上报 Logfire**（`observability.keep_off_logfire`
+        # 按这个 extra 键判定）。与 `instrument_fastapi` 的 span 排除**同源** ——
+        # 两边都从 `is_probe_path()` 派生，改一处不会漏另一处。
+        probe = is_probe_path(request.url.path)
+        with logger.contextualize(request_id=rid, avm_probe=probe):
             started = time.perf_counter()
             try:
                 response = await call_next(request)
