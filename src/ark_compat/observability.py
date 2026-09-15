@@ -39,30 +39,88 @@ LOG_FORMAT = (
     "<level>{message}</level>"
 )
 
-# ---- 探活路径：不进 Logfire 上报 --------------------------------------------
+# ---- 不进上报的路径：探活 + 公开文档端点 ------------------------------------
 #
-# 探活是**被反复轮询**的（compose 的 HEALTHCHECK 每 30s 打一次 `/healthz`），一次请求
-# 在 Logfire 上就是一条 span **加**一条日志 —— 一天上千条，真实请求被淹掉，还白跑出站
-# 流量。所以两样都摘：**span** 在 `instrument_fastapi` 的 `excluded_urls` 里摘，
-# **日志**在 logfire 那个 sink 的 filter 里摘。
+# 这一串路径的共同点是**被人反复轮询或扫描**：容器 HEALTHCHECK 每 30s 打一次
+# `/healthz`；交互式文档（`/docs` `/redoc` `/openapi.json`）不鉴权、是扫描器的常规
+# 目标。一次请求在 Logfire 上就是一条 span **加**一条日志 —— 一天上千条，真实请求被
+# 淹掉，还白跑出站流量。所以两样都摘：**span** 在 `instrument_fastapi(excluded_urls=…)`
+# 里摘，**日志**在 logfire 那个 sink 的 filter 里摘。
 # 摘掉的只是"上报"：本地 stderr 照打 —— 探活真坏掉时，本机仍然看得见。
-PROBE_PATHS = ("/healthz", "/")
+#
+# 施工面：`AVM_LOGFIRE_EXCLUDED_PATHS`（路径表，逗号分隔；留空 = 用下表；`-` = 不排除
+# 任何路径）。**使用方只写路径，永远不写正则** —— 正则由 `_regex_for()` 机械生成。
+DEFAULT_PROBE_PATHS = ("/healthz", "/", "/docs", "/redoc", "/openapi.json")
+
+# 生效表：由 `setup_observability()` 按 settings 解析后写入。做成模块级而不是逐请求
+# 读 settings，是为了**保证 span 排除与日志过滤同源**（两者都只读这一个变量）。
+_PROBE_PATHS: tuple = DEFAULT_PROBE_PATHS
+
+
+def probe_paths() -> tuple:
+    """当前生效的排除表（排障用；刻意不进 `/healthz` 响应 —— 那是个不鉴权端点）。"""
+    return _PROBE_PATHS
+
+
+def set_probe_paths(paths=None) -> tuple:
+    """写入生效表（去重、保序）。`None` = 回落内置默认表。返回生效表。"""
+    global _PROBE_PATHS
+    _PROBE_PATHS = tuple(dict.fromkeys(DEFAULT_PROBE_PATHS if paths is None else paths))
+    return _PROBE_PATHS
+
+
+def _path_matches(path: str, pattern: str) -> bool:
+    """一条路径的匹配规则 —— **语义的唯一定义处**（谓词与正则都从这里来）。
+
+    · 普通路径（`/healthz`）：**精确**相等
+    · 以 `/` 结尾（`/internal/`）：**子树**（前缀）
+    · `/` 本身：只匹配根路径 —— 若按"子树"解释它就等于**整个站**，那是另一件事
+      （要全局关掉上报请用 `AVM_DISABLE_LOGFIRE`，而不是在这里写 `/`）
+    """
+    if pattern.endswith("/") and len(pattern) > 1:
+        return path.startswith(pattern)
+    return path == pattern
 
 
 def is_probe_path(path: str) -> bool:
-    """是不是探活路径。**唯一定义处**：span 排除与日志过滤都从这里派生。"""
-    return path in PROBE_PATHS
+    """这个请求路径要不要**排除在上报之外**。span 侧与日志侧都只调它。"""
+    return any(_path_matches(path, p) for p in _PROBE_PATHS)
+
+
+def _regex_for(pattern: str) -> str:
+    """把一条路径翻成 otel `excluded_urls` 用的正则（与 `_path_matches` 同构）。
+
+    🔴 坑：上游拿 `excluded_urls` 做 `re.search`（**子串**匹配），不是路径相等 ——
+    裸写 `"/"` 会命中**每一个** URL（任何 URL 都含 `/`）；未锚定的 `"/healthz"` 会
+    连带吃掉 `/healthz/extra`。所以这里**必须**全锚定。实测：朴素写法 `/healthz,/`
+    会把 `/api/v3/...` 与 `/openapi.json` 一并判为排除（全站追踪静默关掉）。
+
+    ⚠️ 被匹配的串是 `scheme://host + scope["path"]`（**不含 query**，见
+    `opentelemetry.instrumentation.asgi.get_host_port_url_tuple`）⇒ 探活常带的
+    `/healthz?deep=1` 与 `/healthz` 命中同一条。
+    """
+    host = r"^https?://[^/]+"
+    if pattern.endswith("/") and len(pattern) > 1:
+        return host + re.escape(pattern)              # 子树
+    return host + re.escape(pattern) + "$"            # 精确（含根路径）
 
 
 def probe_excluded_urls() -> str:
-    """把 `PROBE_PATHS` 翻成 otel 的 `excluded_urls`（逗号分隔的**正则**串）。
+    """生效表 → otel 的 `excluded_urls`（逗号分隔的正则串）。"""
+    return ",".join(_regex_for(p) for p in _PROBE_PATHS)
 
-    🔴 坑：上游拿这串做 `re.search`（**子串**匹配），不是路径相等 —— 手写 `"/"`
-    会命中**每一个** URL（任何 URL 都含 `/`），等于把全站追踪静默关掉；未锚定的
-    `"/healthz"` 也会连带吃掉 `/healthz/extra`。所以这里由 `PROBE_PATHS`
-    **机械生成**全锚定形态，谁都不必（也不该）手写这串正则。
+
+def reject_reason(pattern: str) -> str | None:
+    """`AVM_LOGFIRE_EXCLUDED_PATHS` 条目不合规时给出理由（None = 合规）。
+
+    不合规**不静默**：调用方（`_apply_excluded_paths`）会把它剔出生效表并告警 ——
+    "配了不生效还不说话"正是本项目最忌讳的形状。
     """
-    return ",".join(rf"^https?://[^/]+{re.escape(p)}$" for p in PROBE_PATHS)
+    if not pattern.startswith("/"):
+        return "必须以 / 开头（这里写路径，不是正则、也不是域名）"
+    if "?" in pattern or "#" in pattern:
+        return "不要带 query/fragment（判定用的是路径，不含 query）"
+    return None
 
 
 def keep_off_logfire(record) -> bool:
@@ -101,6 +159,33 @@ SECRET_HEADERS = frozenset(
 )
 
 
+def _apply_excluded_paths(settings) -> tuple:
+    """把 `settings.logfire_excluded_paths` 变成生效表，并**如实报告**被拒的条目。
+
+    被拒的条目**不进生效表**且**告警** —— 静默忽略等于"配了不生效"，那正是要消灭的
+    形状。`None`（未设/留空）⇒ 内置默认表；`()`（写了 `-`）⇒ 一条都不排除。
+    """
+    configured = getattr(settings, "logfire_excluded_paths", None)
+    if configured is None:
+        effective = set_probe_paths(None)
+    else:
+        kept, rejected = [], []
+        for raw in configured:
+            why = reject_reason(raw)
+            if why:
+                rejected.append(f"{raw}（{why}）")
+            else:
+                kept.append(raw)
+        effective = set_probe_paths(kept)
+        if rejected:
+            logger.warning(
+                "AVM_LOGFIRE_EXCLUDED_PATHS 里这些条目被忽略（只写路径，别写正则）：{}",
+                "；".join(rejected),
+            )
+    logger.info("Logfire 上报排除路径：{}", "、".join(effective) or "（无）")
+    return effective
+
+
 def setup_observability(settings) -> bool:
     """装配日志与追踪。幂等：重复调用只重装 loguru sink。返回 logfire 是否可用。"""
     global _LOGFIRE_READY, _MAX_ATTR_CHARS, _CAPTURE_HEADERS
@@ -110,6 +195,10 @@ def setup_observability(settings) -> bool:
     logger.add(sys.stderr, level=settings.log_level, format=LOG_FORMAT, colorize=True)
 
     _MAX_ATTR_CHARS = int(getattr(settings, "logfire_max_chars", 0) or DEFAULT_MAX_ATTR_CHARS)
+    # 排除表与"logfire 装不装"无关（日志侧也要用它），所以放在下面那条早退之前
+    _apply_excluded_paths(settings)
+    # 轮询表同理：**两张表在装配期各解析一次**，span 侧与日志侧都只读生效表
+    _apply_poll_paths(settings)
 
     if not settings.enable_logfire:
         logger.info("logfire 已关闭（AVM_DISABLE_LOGFIRE=1）；仅本地日志")
@@ -177,17 +266,31 @@ def _has_token() -> bool:
     return bool(os.environ.get("LOGFIRE_TOKEN", "").strip())
 
 
+def fastapi_excluded_urls() -> str:
+    """`instrument_fastapi` 用的排除正则：**探活表 + 轮询表**，两张表各出一份。
+
+    ⚠️ 这张表是**入站 span 唯一的杠杆**：实测（2026-09-15）`suppress_instrumentation()`
+    在 ASGI 中间件上无效 —— 中间件在 handler 之外就把 span 建好了，handler 里再包一层
+    也追不回。所以"轮询不产生 span"只能靠这里。
+
+    留空（用户把两张表都写成 `-`）时返回空串 —— 那正是"不排除任何路径"。
+    """
+    return ",".join(x for x in (probe_excluded_urls(), poll_excluded_urls()) if x)
+
+
 def instrument_fastapi(app) -> None:
     """给 FastAPI 挂自动 span。抓头显式关掉（默认也是关，这里把意图写死）。
 
-    探活路径（`PROBE_PATHS`）排除在外：它们被反复轮询，每次成一条 span 就是纯噪声。
+    探活路径（`/healthz` 等）与**轮询路径**（任务查询）排除在外：两者都被反复请求，
+    每次成一条 span 就是纯噪声。两件事分别由 `probe_excluded_urls()` /
+    `poll_excluded_urls()` 出，**同源**于 `is_probe_path` / `is_poll_path`。
     """
     import logfire
 
     logfire.instrument_fastapi(
         app,
         capture_headers=_CAPTURE_HEADERS,
-        excluded_urls=probe_excluded_urls(),
+        excluded_urls=fastapi_excluded_urls(),
     )
 
 
@@ -381,16 +484,58 @@ _GAUGES: dict = {}
 def _gauge(name: str, *, unit: str, description: str):
     """懒建并缓存指标对象。
 
-    每次 `logfire.metric_gauge()` 都新建会让 SDK 侧重复注册同名仪表；而 logfire
-    没装配时提前建也不合适（对象会绑在当时的全局 provider 上）。
-    """
-    g = _GAUGES.get(name)
-    if g is None:
-        import logfire
 
-        g = logfire.metric_gauge(name, unit=unit, description=description)
-        _GAUGES[name] = g
-    return g
+def count_poll(*, upstream: str, status: str, reported: bool, cached: bool = False,
+               source: str = "poll") -> None:
+    """记一次任务查询。**不产生 span** —— 这就是闸门 1（产生层）的落点。
+
+    轮询本身是有价值的信息（"调用方多密"、"各状态各占多少"），只是**不该一条一条存
+    span**：同一个任务几十上百条几乎逐字段相同的 span，读的时候要靠肉眼去重、存的时候
+    按条计价。做成计数器即"量在、明细不要"。
+
+    🔴 标签**只能放低基数字段**：`upstream` / `status` / `reported` / `cached` / `source`
+    都是有限的枚举；**绝不放 `ark_id` / `task_id`** —— 那会把时间序列打成一任务一条，
+    比 span 还贵。要按任务追明细，去 trace 里查（跃迁那几条一定在）。
+    """
+    if not _LOGFIRE_READY:
+        return
+    _metric(
+        "counter",
+        "avm.task.poll_requests",
+        unit="1",
+        description="任务查询请求数（含不产生 span 的重复轮询；reported=true 才是留了 span 的那些）",
+    ).add(
+        1,
+        attributes={
+            "upstream": upstream,
+            "status": status or "unknown",
+            "reported": bool(reported),
+            "cached": bool(cached),
+            "source": source,
+        },
+    )
+
+
+def record_wait(*, upstream: str, final_status: str, seconds: float, source: str = "poll") -> None:
+    """记一个任务「从提交到终态」的等待时长（只在确实拿到终态时记）。
+
+    `source` 区分口径：`watcher` = 后台盯梢线程测到的（含排队等待），
+    `poll` = 调用方轮询时观测到的。两者是同一段时间的两次独立测量，混起来会互相干扰。
+    """
+    if not _LOGFIRE_READY:
+        return
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return
+    if value < 0:
+        return
+    _metric(
+        "histogram",
+        "avm.task.wait_seconds",
+        unit="s",
+        description="任务从提交到进入终态的等待时长",
+    ).record(value, attributes={"upstream": upstream, "final_status": final_status, "source": source})
 
 
 def record_account(
@@ -462,5 +607,112 @@ def record_account(
 
 
 def reset_gauge_cache() -> None:
-    """测试用：丢掉已缓存的指标对象（换了 provider / reader 之后必须重建）。"""
-    _GAUGES.clear()
+    """测试用：丢掉**全部**已缓存的指标对象（换了 provider / reader 之后必须重建）。
+
+    名字沿用历史（它起初只管 gauge）；现在 gauge / counter / histogram 共用一份缓存。
+    """
+    _METRICS.clear()
+
+
+# ---- 轮询路径：不算进 trace 的「高频无害流量」 -------------------------------
+#
+# 🔴 **闸门 1（产生层）**：本轮改动的唯一定性依据。
+#
+# 为什么需要第二张表，而不是往探活表里塞一行：**语义不同，判定也不同**。
+#   · 探活路径（`/healthz` 等）：**根本不是业务**，任何状态都不该上报；
+#   · 轮询路径（任务查询）：**是业务，但被重复调用**。同一个任务被调用方按秒级轮询
+#     到终态，几百次请求里绝大多数 span 与上一条**逐字段相同**（同 task_id、同 status）
+#     —— 那不是可观测性，是重复计价。Logfire 官方文档明确把 "High-frequency polling"
+#     列为 `suppress_instrumentation()` 的用例。
+#
+# 排除的粒度**只能是 URL** —— 这是实测定下来的，不是偏好：
+#   `suppress_instrumentation()` 的压制作用在 **span 处理器层**
+#   （`logfire._internal.exporters.processor_wrapper.SuppressInstrumentationProcessorWrapper`），
+#   而入站 span 由 ASGI 中间件在 **handler 之外**创建 ⇒ 在 handler 里包 suppress 追不回来。
+#   所以排的是整条任务查询路径。代价是「首次查询」的 HTTP 层 span 也没了，但那次由我们
+#   自己的 `ark.task.fetch` span 覆盖（含失败路径）——证据不丢，只是换了通道。
+#
+# 🔴 **轮询的失败必须留痕**（span 侧按 URL 排不出去，粒度做不到，所以分两处补）：
+#   · span：失败路径照发 `ark.task.fetch`（见 `app._task_view`）；
+#   · 日志：请求中间件对轮询路径**只在 4xx/5xx 时**才发那条 access log。
+DEFAULT_POLL_PATHS = (
+    "/api/v3/contents/generations/tasks/",   # 方舟线：查询任务
+    "/v1/videos/",                          # OpenAI 兼容线：查询任务
+)
+
+_POLL_PATHS: tuple = DEFAULT_POLL_PATHS
+
+
+def poll_paths() -> tuple:
+    """当前生效的轮询排除表（排障用）。"""
+    return _POLL_PATHS
+
+
+def set_poll_paths(paths=None) -> tuple:
+    """写入生效表（去重、保序）。`None` = 回落内置默认表。返回生效表。"""
+    global _POLL_PATHS
+    _POLL_PATHS = tuple(dict.fromkeys(DEFAULT_POLL_PATHS if paths is None else paths))
+    return _POLL_PATHS
+
+
+def is_poll_path(path: str) -> bool:
+    """这条路径是不是「被轮询的业务端点」。**span 侧与日志侧都只调它**。
+
+    与 `is_probe_path` 共用 `_path_matches` —— 匹配语义只有一处定义，两张表不会漂。
+    """
+    return any(_path_matches(path, p) for p in _POLL_PATHS)
+
+
+def poll_excluded_urls() -> str:
+    """生效表 → otel `excluded_urls`（与探活表**同一套正则生成器**）。"""
+    return ",".join(_regex_for(p) for p in _POLL_PATHS)
+
+
+def _apply_poll_paths(settings) -> tuple:
+    """与 `_apply_excluded_paths` 同构：不合规条目**不进生效表**且**告警**。"""
+    configured = getattr(settings, "logfire_poll_paths", None)
+    if configured is None:
+        effective = set_poll_paths(None)
+    else:
+        kept, rejected = [], []
+        for raw in configured:
+            why = reject_reason(raw)
+            if why:
+                rejected.append(f"{raw}（{why}）")
+            else:
+                kept.append(raw)
+        effective = set_poll_paths(kept)
+        if rejected:
+            logger.warning(
+                "AVM_LOGFIRE_POLL_PATHS 里这些条目被忽略（只写路径，别写正则）：{}",
+                "；".join(rejected),
+            )
+    logger.info("Logfire 轮询排除路径：{}", "、".join(effective) or "（无）")
+    return effective
+
+
+# ---- 压制出站调用（片段里的 `with suppress_instrumentation():` 落点） ---------
+
+
+@contextmanager
+def suppress_http():
+    """包住一次**轮询用的出站调用**：它产生的 span 不进 trace（含 httpx 自动 span）。
+
+    🔴 实测语义（2026-09-15；logfire 5.0.0 + httpx 0.27.2），四条都是跑出来的：
+      1. 压制判定在 **span 处理器层**、按 contextvar 生效 ⇒ 上下文里的**一切** span 都被丢，
+         **包括我们自己显式开的 `logfire.span()`**。所以绝不能把要留痕的 span 包在里面
+         —— 正确顺序是「先开 span，再用它只包 GET」（与片段一致）。
+      2. 出站 httpx 埋点打在 **`HTTPTransport.handle_request`** 上 ⇒ 用 `MockTransport`
+         的测试**看不到** httpx span。这解释了为什么「httpx 自动子 span」从来没被测试
+         钉住过（测试全绿 ≠ 它真的在）。
+      3. 入站 ASGI span **压不掉**（中间件在 handler 之外建 span）⇒ 入站一侧只能靠
+         `excluded_urls`（见 `poll_excluded_urls`）。
+      4. contextvar 是**按上下文**的 ⇒ 后台线程里的压制不影响同进程的在飞请求，反之亦然。
+    """
+    if not _LOGFIRE_READY:
+        yield
+        return
+    import logfire
+
+    with logfire.suppress_instrumentation():
+        yield

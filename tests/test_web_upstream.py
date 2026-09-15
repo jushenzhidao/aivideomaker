@@ -395,17 +395,41 @@ class FakeWebClient:
         self.uploaded.append(source if isinstance(source, str) else f"<{len(source)} bytes>")
         return {"publicUrl": f"https://static.img2video.ai/rehost-{len(self.uploaded)}.png", "kind": "image"}
 
-    def wait_for_task(self, task_id, *, timeout=600.0, interval=10.0):
+    def wait_for_task(self, task_id, *, timeout=600.0, interval=10.0, on_poll=None):
         self._events[task_id].wait(timeout=5)
         with self._lock:
             self.active -= 1
+        # ⚠️ 替身必须跟着真客户端的签名走：`on_poll` 是闸门 1（产生层）新加的钩子。
+        #    替身不收它 ⇒ 调用处 TypeError ⇒ 被 `_watch` 的兜底捕获 ⇒ **槽位提前释放**
+        #    ⇒ 闸门并发测试从"拦得住"变成"拦不住"（实测：peak 由 2 变 3 才暴露）。
+        #    这里显式调一次，让"跃迁事件 + 计数"那条新路径真的被执行到。
+        if on_poll is not None:
+            on_poll("succeed")
         return {"done": True, "ok": True, "status": "succeed", "task": {}, "ms": 1}
 
     def release(self, task_id: str) -> None:
         self._events[task_id].set()
 
     def get_task(self, task_id: str) -> dict:
-        return {"id": task_id, "taskStatus": "succeed", "aiModel": "minimax-h3", "url": "https://cdn/a.mp4", "kelingKeyId": "480"}
+        # 字段贴近**真实**站点记录：`duration` 是字符串（这正是 GET 契约对不上的元凶），
+        # 另带 cover / credits / paid / aspectRatio 这些官方 schema 里没有的字段 ——
+        # 它们的去留由 tests/test_ark_task_schema.py 与 TestWebAppLayer 的键集断言钉住。
+        return {
+            "id": task_id,
+            "taskStatus": "succeed",
+            "aiModel": "minimax-h3",
+            "url": "https://cdn/a.mp4",
+            "kelingKeyId": "480",
+            "duration": "5",
+            "aspectRatio": "16:9",
+            "cover": "https://cdn/cover.jpg",
+            "credits": 1,
+            "paid": False,
+            # 时间戳也是真实站点记录的一部分（官方 schema 里 created_at / updated_at
+            # 是必返的 integer）—— 不给的话 `_epoch` 那条路径在 app 层根本走不到。
+            "createdAt": "2026-09-15T13:10:18.405Z",
+            "completedAt": "2026-09-15T13:12:39.538Z",
+        }
 
     def get_credits(self):
         return 796
@@ -598,10 +622,41 @@ class TestWebAppLayer(unittest.TestCase):
         """
         tid = self.client.post(TASKS_PATH, json=ark_body()).json()["id"]
         j = self.client.get(f"{TASKS_PATH}/{tid}").json()
-        self.assertEqual(j["model"], "doubao-seedance-2-5-260628", "model 是**请求值**")
-        self.assertEqual(j["upstream_model"], "minimax-h3", "upstream_model 是**实际值**")
-        self.assertNotEqual(j["model"], j["upstream_model"], "两者不同才是这件事的意义所在")
-        self.assertEqual(j["upstream"], "web", "`upstream` 仍然是上游**种类**，不是原始记录")
+        self.assertEqual(set(j) - OFFICIAL_TASK_FIELDS, set(), "不得出现官方 schema 之外的键")
+        self.assertEqual(set(j) - ARK_BODY_FIELDS, set(), "不得出现收窄白名单之外的键")
+        self.assertEqual(set(j), set(ARK_BODY_FIELDS), "站点记录完整时白名单字段应全部到齐")
+        self.assertIsInstance(j["duration"], int, "官方契约里 duration 是 integer")
+        self.assertEqual(j["duration"], 5)
+        self.assertEqual(set(j["content"]), {"video_url"}, "last_frame_url 没值就不给键")
+
+    def test_unknown_values_are_omitted_rather_than_faked(self):
+        """还在跑的任务：只回 `status` + `error` —— 没有 URL 就不给 content，
+        没有可信值就不给 duration / ratio。"""
+        self.fake.get_task = lambda _tid: {"id": _tid, "taskStatus": "processing"}
+        tid = self.client.post(TASKS_PATH, json=ark_body()).json()["id"]
+        j = self.client.get(f"{TASKS_PATH}/{tid}").json()
+        self.assertEqual(j["status"], "running")
+        self.assertIn("error", j)
+        for absent in ("content", "duration", "ratio", "created_at", "updated_at",
+                       "model", "resolution"):
+            self.assertNotIn(absent, j, f"{absent} 没有可信值就不该出现")
+
+    def test_upstream_evidence_is_not_in_the_body_but_stays_in_the_trace(self):
+        """★ 报告 AVM12-OPEN-UPSTREAM 的事实改走 logfire。
+
+        实测背景：三次真实提交请求的都是 `doubao-seedance-2-5-260628`，成片 URL 里却是
+        `minimax_h3`（web 线只有 `ai.minimaxH3` 一条 tRPC 程序）。这些证据（上游实际模型、
+        原始站点记录、告警、计费）现在**一律不进响应体**，改由 `ark.task.fetch` span 承载
+        —— 见 test_trace_contract.py 的同类断言。
+        """
+        tid = self.client.post(TASKS_PATH, json=ark_body()).json()["id"]
+        j = self.client.get(f"{TASKS_PATH}/{tid}").json()
+        for gone in (
+            "model", "upstream_model", "upstream", "upstream_record", "requested", "effective",
+            "warnings", "unsupported", "cover", "output_format", "resolution", "usage",
+            "seed", "framespersecond", "service_tier", "execution_expires_after",
+        ):
+            self.assertNotIn(gone, j, f"{gone} 是适配层内部证据 / 编造值，不属于对外契约")
 
     # ---- 媒体转存（站点只收自己 CDN 的地址）----
 

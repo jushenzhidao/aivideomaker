@@ -5,7 +5,13 @@
 
 翻译方向：
     Ark create body  →  web {params}（站点 tRPC 接口的字段形状）
-    站点任务记录       →  Ark task object
+    站点任务记录       →  Ark task object（**内部**视图，带 upstream_record 等证据字段）
+    内部视图           →  Ark task object（**对外契约**，见 ark_task_view：白名单裁剪）
+
+⚠️ 后两跳分开是刻意的（2026-09-15）：`normalize_web_task` 产出的内部视图必须保留
+适配层排障要用的证据（上游实际执行的模型、原始站点记录、告警、计费），而
+`GET /tasks/{id}` 只能回官方 schema 里的字段（官方 SDK 对 unknown field 是报错而非忽略）。
+把"证据"与"对外契约"混成一个 dict，就会二选一地牺牲一头。
 
 Seedance 2.5「全能参考」的三条专属字段（`omni_reference_task_type` /
 `output_format` / `generate_audio`）在这里是**建模**的，不是丢进 unsupported
@@ -520,6 +526,14 @@ _WEB_STATUS_TO_ARK = {
     "error": "failed",
     "cancelled": "cancelled",
     "canceled": "cancelled",
+    # 官方第 6 态 `expired`（任务超时）。站点侧若把超时任务标成这几个词，必须落到
+    # 它自己的档位而不是被默认成 `queued` —— "超时"与"还在排队"对调用方是
+    # 完全相反的两个结论（前者该放弃重试，后者该继续等）。
+    "expired": "expired",
+    "expire": "expired",
+    "timeout": "expired",
+    "timedout": "expired",
+    "timed_out": "expired",
 }
 
 
@@ -543,16 +557,15 @@ def normalize_web_task(raw: Mapping[str, Any] | None) -> dict:
 
     return {
         "id": raw.get("id"),
-        # ⚠️ `model` 是**上游记录里的**模型名；对外的任务视图会把它覆盖成**调用方请求的**
-        #    模型（`app._task_view` 的 `view["model"] = entry["model"]`）⇒ 只看 `model`
-        #    永远发现不了"上游换了模型"。要看实际值请用下面那个平行的 `upstream_model`。
+        # `model` 是**站点回显**的模型名（`app._task_view` 会把它覆盖成调用方**请求**的
+        # 模型）⇒ 内部视图里 `model`(请求值) 与 `upstream_model`(实际值) 并列可见。
+        # ⚠️ 两者**都不进对外响应体**（2026-09-15 用户口径：响应体不要 model）。
         "model": raw.get("aiModel"),
-        # ★ 上游**实际执行**的模型，与 `model`（请求值）并列暴露。
-        #   依据：web 线只有 `ai.minimaxH3` 一条 tRPC 程序（见 docs/web-reverse/），站点对
-        #   调用方请求的模型名只是**回显** —— 2026-09-14 三次真实提交请求的都是
+        # ★ 上游**实际执行**的模型。依据：web 线只有 `ai.minimaxH3` 一条 tRPC 程序，
+        #   站点对调用方请求的模型名只是**回显** —— 2026-09-14 三次真实提交请求的都是
         #   `doubao-seedance-2-5-260628`，而成片 URL 里一律是 `minimax_h3`。
-        #   报告 AVM12-OPEN-UPSTREAM 的诉求就是这个事实要在契约里读得到。
-        #   刻意**不**用它去改写 `model`：请求值与实际值都必须保留，否则又是一处"静默改写"。
+        #   报告 AVM12-OPEN-UPSTREAM 的诉求（这个事实必须查得到）现在由 trace 满足：
+        #   `ark.task.fetch` span 的 `upstream_model` / `upstream_record`。
         "upstream_model": raw.get("aiModel"),
         "status": ark_status,
         "error": (
@@ -560,37 +573,106 @@ def normalize_web_task(raw: Mapping[str, Any] | None) -> dict:
             if ark_status == "failed"
             else None
         ),
-        "content": {
-            "video_url": raw.get("url") if succeeded else None,
-            "last_frame_url": None,
-            "file_url": None,
-        },
-        "usage": {
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            # ⚠️ 站点侧 `credits` 与 `paid` **不是一回事**：paid=false 时记 credits=1。
-            # 判断这次是否花钱只看 `paid`。
-            "credits": raw.get("credits"),
-            "paid": bool(raw.get("paid")),
-        },
-        "frames": None,
-        "framespersecond": 24,
+        "content": {"video_url": raw.get("url") if succeeded else None},
+        # ⚠️ 站点侧 `credits` 与 `paid` **不是一回事**（paid=false 时记 credits=1）。
+        # 判断这次是否花钱只看 `paid`。
+        # ⚠️ 官方那两个 token 字段（`completion_tokens` / `total_tokens`）**不再伪造 0**：
+        #    站点不提供 token 用量，编一个 0 等于声称"本次消耗 0 token"，比不给更糟。
+        "usage": {"credits": raw.get("credits"), "paid": bool(raw.get("paid"))},
         "created_at": _epoch(raw.get("createdAt")),
         "updated_at": _epoch(raw.get("completedAt") or raw.get("createdAt")),
-        "seed": -1,
-        "service_tier": "default",
-        "execution_expires_after": 172800,
-        "generate_audio": False,
         "duration": raw.get("duration"),
         "ratio": raw.get("aspectRatio"),
-        "output_format": UPSTREAM_OUTPUT_FORMAT,
+        # 实际产出档位（站点 `kelingKeyId`）——内部对账用，**不进响应体**（2026-09-15 口径）。
         "resolution": f"{res_key}p" if res_key.isdigit() else None,
-        "draft": False,
-        "draft_task_id": None,
-        "cover": raw.get("cover"),
         # ⚠️ 键名是 `upstream_record`，**不是** `upstream`：`app._task_view` 用 `upstream`
         #    表示上游**种类**（`"web"`）并会覆盖同名键 ⇒ 原始站点记录若放 `upstream`，
         #    会在视图最后一跳被丢掉，而它正是"上游到底跑了什么"的唯一原始证据
         #    （报告 AVM12-OPEN-UPSTREAM 的根因之一：证据在最后一跳消失）。
         "upstream_record": dict(raw),
     }
+
+
+# 🔴 对外契约白名单：能出现在 `GET /api/v3/contents/generations/tasks/{id}` 响应体里的字段，
+#    必须**同时**满足两个条件：
+#      ① 在官方「查询视频生成任务」的响应参数表里
+#         （https://www.volcengine.com/docs/82379/1521309 ，2026-09-15 取证）——
+#         官方 SDK（Java/Go）对 unknown field 是**报错**而非忽略，多一个键就是坏一个客户端；
+#      ② 我们**真的知道它的值**（`ark_task_view` 里值为空就不给键）。
+#
+#    2026-09-15 第二轮用户口径：`model` / `resolution` 不要；凡值不确定或取不到的字段一并删掉，
+#    只留必要字段（`id` / `status` / 出片地址为核心）。为此归一化层**已停止产出编造值**
+#    （`seed:-1` / `framespersecond:24` / `service_tier:"default"` / `execution_expires_after:172800`
+#    / `draft:false` / `usage.completion_tokens:0` …）—— 编一个看起来合理的常量比"不给"更糟：
+#    调用方会把它当成事实。
+#
+# 适配层的证据（`upstream_model` / `upstream_record` / `requested` / `effective` / `warnings` /
+# `unsupported` / `usage.credits` / `usage.paid` / `resolution`）一律不进响应体，
+# 改由 `ark.task.fetch` span 承载（见 `app._task_view`）—— 证据换通道，而不是消失。
+ARK_TASK_FIELDS = (
+    "id",
+    "status",
+    "error",
+    "content",
+    "duration",
+    "ratio",
+    "created_at",
+    "updated_at",
+)
+
+
+def _int_or_none(v: Any) -> int | None:
+    """宽松转 int —— 站点把 `duration` 存成**字符串** `"5"`。转不了就如实给 None。"""
+    if v is None or v == "":
+        return None
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def ark_task_view(view: Mapping[str, Any]) -> dict:
+    """内部任务视图 → 对外响应体：**白名单 + 只给有值的字段**。
+
+    两条同时成立才输出：
+      1. 字段在 `ARK_TASK_FIELDS` 里（官方 schema 的子集，官方 SDK 不容 unknown field）；
+      2. 字段**真的有值** —— 值为 `None` 就不给键。
+
+    唯一例外是 `error`：恒给（官方规定任务成功时显式返回 `null`，那是**确定**的信息，
+    不是"不知道"）。`content` 只在真有出片地址时才给。
+
+    `id` / `status` / `error` 之外的字段官方文档都没标必选 ⇒ 给不准的值反而是往契约里
+    塞假话，不如不给。
+
+    ⚠️ `duration` 转成 `integer`：站点任务记录里它是**字符串** `"5"`，原样透传会让强类型
+    SDK（Java/Go）反序列化直接抛 —— 这就是 2026-09-15 报告"跟原生 response 对不上"的元凶。
+    """
+    out: dict[str, Any] = {}
+    for key in ARK_TASK_FIELDS:
+        if key not in view:
+            continue
+        val = view[key]
+        if key == "content":
+            content = val if isinstance(val, Mapping) else {}
+            url = content.get("video_url")
+            if url:
+                block: dict[str, Any] = {"video_url": url}
+                if content.get("last_frame_url"):
+                    block["last_frame_url"] = content["last_frame_url"]
+                out["content"] = block
+            continue
+        if key == "error":
+            out["error"] = (
+                {"code": val.get("code"), "message": val.get("message")}
+                if isinstance(val, Mapping)
+                else None
+            )
+            continue
+        if key in ("duration", "created_at", "updated_at"):
+            num = _int_or_none(val)
+            if num is not None:
+                out[key] = num
+            continue
+        if val is not None and val != "":
+            out[key] = val
+    return out

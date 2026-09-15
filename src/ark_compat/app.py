@@ -77,12 +77,15 @@ from .cookie import AUTH_COOKIE_NAME, normalize_cookie_header
 from .errors import ParamError, WebApiError
 from .observability import (
     clip,
+    count_poll,
     describe_error,
     instrument_fastapi,
+    is_poll_path,
     is_probe_path,
     logfire_exporting,
     logfire_ready,
     record_account,
+    record_wait,
     set_upstream_calls,
     setup_observability,
     span,
@@ -92,7 +95,7 @@ from .settings import Settings
 from .openai_videos import OPENAI_VIDEOS_PATH, ark_body_from_openai, openai_task_view
 from .sniff import sniff_file
 from .store import build_task_store
-from .translate import billing_note, billing_view, translate_create
+from .translate import ark_task_view, billing_note, billing_view, translate_create
 from .upstreams import build_upstreams, build_web_for_cookie
 
 TASKS_PATH = "/api/v3/contents/generations/tasks"
@@ -264,6 +267,65 @@ class TaskViewCache:
                 if len(self._views) >= self.max_entries:
                     del self._views[next(iter(self._views))]
             self._views[ark_id] = (dict(view), expires_ms)
+
+
+class PollReportGate:
+    """轮询上报闸门（**闸门 1：产生层**）：同一任务只在**状态跃迁**时才留 span。
+
+    为什么需要它：调用方（newapi 的任务轮询）按秒级打 `GET /tasks/{id}`，一个 60~300s
+    的任务就是几十上百次查询，而查到的**绝大多数状态与上一条完全相同** ——
+    逐条存 span 不是可观测性，是重复计价（Logfire 官方文档就把 "High-frequency polling"
+    列为应当排除埋点的用例）。
+
+    所以：**没见过的状态才留痕**，其余只累加指标（`avm.task.poll_requests`）。
+
+    契约不出现空洞（这是与"干脆整条端点不埋点"的关键区别）：
+      · 终态一定是一次跃迁（或首次观测）⇒ 每个任务仍有一条带**终态 + `paid`** 的
+        `ark.task.fetch`，出片后对账口径不变；
+      · **失败一律留痕**（`reason="error"`）—— 失败时上游状态未知，不能据此认定"没变化"。
+
+    🔴 进程内状态（与 `TaskViewCache` 同口径）：多 worker 下每个 worker 各有一份
+    "已上报状态"，同一任务**最多** N(worker) 条"首次观测"span。这是刻意接受的代价
+    （相对每任务上百条），换的是：不必为纯观测用途引入一个跨进程账本。
+    """
+
+    def __init__(self, max_entries: int = 1024):
+        self.max_entries = max(1, int(max_entries))
+        self._lock = threading.Lock()
+        # ark_id -> {"status": 已上报的状态, "polls": 本进程观测到的查询次数}
+        self._seen: dict[str, dict] = {}
+
+    def observe(self, ark_id: str, status: str, *, error: str | None = None) -> dict | None:
+        """这次查询要不要留痕。返回 `None` = 不留（只计数）；否则给出理由与跃迁信息。
+
+        返回的字典直接变成 span 属性：`reason`（first / transition / error）、
+        `from`（上一次已上报的状态）、`to`（这次看到的）、`polls`（本进程累计查询次数）。
+        """
+        key = str(ark_id)
+        status = str(status or "")
+        with self._lock:
+            prev = self._seen.get(key)
+            polls = (int(prev["polls"]) + 1) if prev else 1
+            previous = prev["status"] if prev else ""
+            if error:
+                reason = "error"
+            elif prev is None:
+                reason = "first"
+            elif previous != status:
+                reason = "transition"
+            else:
+                prev["polls"] = polls          # 还在轮询，但状态没变 ⇒ 只计数
+                return None
+            # 🔴 失败时状态未知 ⇒ **不许**用空串覆盖已知状态，否则下一次成功查询会被读成
+            #    "跃迁"（凭空多一条 span，还给对账一个假的跃迁方向）。
+            self._remember(key, {"status": previous if error else status, "polls": polls})
+            return {"reason": reason, "from": previous, "to": status, "polls": polls}
+
+    def _remember(self, key: str, rec: dict) -> None:
+        if len(self._seen) >= self.max_entries and key not in self._seen:
+            # 超限扔最早插入的一条。任务量是每小时几条，这个上限只是防无界增长的保险丝。
+            del self._seen[next(iter(self._seen))]
+        self._seen[key] = rec
 
 
 def _passthrough_web_upstream(request: Request, cookie: str):
@@ -610,6 +672,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         logger.warning(f"清理过期任务失败（不影响启动）：{e}")
     # 查询节流缓存：挡调用方的高频轮询，别把上游打到 429（ttl<=0 = 关闭）
     app.state.task_cache = TaskViewCache(settings.task_cache_ttl)
+    # 轮询上报闸门：同一任务**只有状态跃迁（含首次观测、失败）才留 span**
+    app.state.poll_gate = PollReportGate()
     logger.info(
         "上游就绪 available={} task_store={} task_cache_ttl={}s",
         sorted(app.state.upstreams),
@@ -642,13 +706,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise
             elapsed_ms = (time.perf_counter() - started) * 1000
             response.headers["x-request-id"] = rid
-            logger.info(
-                "{} {} -> {} ({:.0f}ms)",
-                request.method,
-                request.url.path,
-                response.status_code,
-                elapsed_ms,
-            )
+            # 轮询路径（任务查询）里**成功的那些**同样不入库：一个任务几十上百行
+            # `GET …/tasks/{id} -> 200`，与它的 span 是同一笔重复计价（闸门 1：产生层）。
+            # 🔴 但**失败必须留痕** —— 4xx/5xx 是"调用方到底看到了什么"的唯一记录，
+            #    静音掉等于把事故现场一起删掉。span 侧的排除粒度是 URL、做不到这个区分，
+            #    所以在这里补：失败照报、成功静音。
+            quiet = probe or (is_poll_path(request.url.path) and response.status_code < 400)
+            with logger.contextualize(avm_probe=quiet):
+                logger.info(
+                    "{} {} -> {} ({:.0f}ms)",
+                    request.method,
+                    request.url.path,
+                    response.status_code,
+                    elapsed_ms,
+                )
             return response
 
     # -------------------------------------------------------- error handlers --
@@ -978,51 +1049,98 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def _task_view(request: Request, entry: dict, upstream) -> dict:
         # 先看节流缓存：非终态 TTL 内复用、终态永久复用 —— 轮询的请求量不能
         # 原样打到上游（429 的主要来源，任务出片要 ~60s）。
-        view = request.app.state.task_cache.get(entry["id"])
+        ark_id = entry["id"]
+        calls: list = []
+        error: str | None = None
+        view = request.app.state.task_cache.get(ark_id)
         cached = view is not None
-        if cached:
-            # 命中缓存：没有上游调用可记，但 span 契约属性（status/paid）照样给 ——
-            # 对账口径不因缓存出现空洞；cached=True 说明这次没打上游。
+        if not cached:
+            # 🔴 **闸门 1（产生层）**：先取数据、**后决定要不要留痕**。
+            #    OTel 没有"丢弃已开的 span"，所以不能"先开 span 再看结论 ⇒ 不该记就扔" ——
+            #    只能把 span 的创建推迟到结论出来之后。代价是这条 span 不再包住上游调用，
+            #    它的耗时改看 `upstream_calls[].duration_ms`（另有 `upstream_ms` 汇总）。
+            #    换来的：轮询（同状态重复查询）**一条 span 都不产生**。
+            with upstream_exchanges() as box:
+                try:
+                    view = await asyncio.to_thread(upstream.get_task, entry["taskId"])
+                except WebApiError as e:
+                    error = describe_error(e)
+                    logger.warning("查任务失败 upstream_task={} — {}", entry["taskId"], e)
+                    view = {}
+                else:
+                    # 只有**成功取到**的视图才进缓存（上游失败的空壳不该被记住）
+                    request.app.state.task_cache.put(ark_id, view or {})
+            calls = list(box)
+
+        view = dict(view or {})
+        status = str(view.get("status") or "")
+        # 这次查询要不要留痕：首次观测 / 状态跃迁 / 失败 ⇒ 留；同状态重复轮询 ⇒ 只计数。
+        # 这就是那道闸门 —— 判据只有"状态变没变"，与轮询有多密无关。
+        decision = request.app.state.poll_gate.observe(ark_id, status, error=error)
+        count_poll(
+            upstream=upstream.kind,
+            status=status,
+            reported=decision is not None,
+            cached=cached,
+        )
+        if decision is not None:
             with span(
                 "ark.task.fetch",
                 upstream=upstream.kind,
                 ark_id=entry["id"],
                 upstream_task_id=entry["taskId"],
-                cached=True,
-                status=(view or {}).get("status") or "",
-                paid=bool(((view or {}).get("usage") or {}).get("paid")),
-                upstream_response=view or {},
-            ):
-                pass
-        else:
-            with upstream_exchanges() as calls:
-                try:
-                    with span(
-                        "ark.task.fetch",
-                        upstream=upstream.kind,
-                        ark_id=entry["id"],
-                        upstream_task_id=entry["taskId"],
-                        cached=False,
-                    ) as sp:
-                        # 上游层返回的已经是归一化好的 Ark 任务对象
-                        try:
-                            view = await asyncio.to_thread(upstream.get_task, entry["taskId"])
-                        except WebApiError as e:
-                            sp.set_attribute("error", describe_error(e))
-                            set_upstream_calls(sp, calls)
-                            raise
-                        # 终态与**实际计费结果**必须进 trace —— 出片后对账就靠这两项
-                        sp.set_attribute("status", (view or {}).get("status") or "")
-                        sp.set_attribute("paid", bool(((view or {}).get("usage") or {}).get("paid")))
-                        # 归一化后的任务对象（出片地址、用量、resolution 回填都在这里）
-                        sp.set_attribute("upstream_response", view or {})
-                        set_upstream_calls(sp, calls)
-                        # 只有**成功取到**的视图才进缓存（上游失败的空壳不该被记住）
-                        request.app.state.task_cache.put(entry["id"], view or {})
-                except WebApiError as e:
-                    logger.warning("查任务失败 upstream_task={} — {}", entry["taskId"], e)
-                    view = {}
-        view = dict(view or {})
+                cached=cached,
+                # ★ 跃迁信息：读 trace 的人不必再靠"跟上一行对比"来推断状态变没变。
+                #   `reason` = first（首次观测）/ transition（跃迁）/ error（失败）。
+                transition_reason=decision["reason"],
+                transition_from=decision["from"],
+                transition_to=decision["to"],
+                poll_count=decision["polls"],
+                # 终态与**实际计费结果**必须进 trace —— 出片后对账就靠这两项
+                status=status,
+                paid=bool((view.get("usage") or {}).get("paid")),
+                # 归一化后的任务对象（出片地址、用量、resolution 回填都在这里）
+                upstream_response=view,
+                # 只有这两项必须单独挂：它们来自**本地任务记录**（`entry`），不在
+                # `upstream_response` 里 —— 不挂就真的丢了。
+                # 其余证据（上游实际模型 / 站点原始记录 `upstream_record` / 实际产出档位
+                # `resolution`）**早在 `upstream_response` 里**（归一化后的完整视图），
+                # 同一份数据挂两遍只会让 trace 变大、口径还容易漂。
+                warnings=entry.get("warnings") or [],
+                unsupported=entry.get("unsupported") or [],
+            ) as sp:
+                if error:
+                    sp.set_attribute("error", error)
+                total_ms = sum(float(c.get("duration_ms") or 0) for c in calls)
+                if total_ms:
+                    sp.set_attribute("upstream_ms", round(total_ms, 1))
+                set_upstream_calls(sp, calls)
+                if decision["reason"] == "transition":
+                    # 「状态跃迁用事件而不是 span」的落点：跃迁本身记成一个**事件**。
+                    # ⚠️ 事件必须挂在一条 span 上，而"跨请求的全程唯一 span"在本服务
+                    #    落不了地（span 不能跨 HTTP 请求；多 worker 下同一条轮询会落到
+                    #    不同进程）⇒ 这里退一步：事件挂在**跃迁那一条** span 上，同时把
+                    #    跃迁方向做成属性（`transition_from` / `transition_to`）便于过滤。
+                    sp.add_event(
+                        "status_change",
+                        {"from": decision["from"], "to": decision["to"]},
+                    )
+        # 等待时长只在**真的看到跃迁进终态**时记一次（同状态轮询记一遍 = 重复计数）
+        if (
+            decision is not None
+            and decision["reason"] == "transition"
+            and status in _TERMINAL_ARK_STATUS
+        ):
+            # 老记录（`createdAtMs` 落库之前建的）没有创建时刻 ⇒ **不记**：与其记一个 0 秒，
+            # 不如不给 —— 与响应体收窄同一条纪律（值不确定的一律不给）。
+            created_ms = int(entry.get("createdAtMs") or 0)
+            if created_ms:
+                record_wait(
+                    upstream=upstream.kind,
+                    final_status=status,
+                    seconds=max(0.0, time.time() - created_ms / 1000),
+                    source="poll",
+                )
         view["id"] = entry["id"]
         # `model` = **调用方请求的**模型（覆盖掉上游记录里的同名值）
         view["model"] = entry["model"]
@@ -1037,9 +1155,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         view["effective"] = entry["effective"]
         view["warnings"] = entry["warnings"]
         view["unsupported"] = entry["unsupported"]
-        # 上游不承接 generate_audio，回显调用方的请求值，而不是伪造一个默认值
-        view["generate_audio"] = bool(entry["requested"].get("generate_audio"))
-        return view
+        # 说明：`generate_audio` 此前在这里"回显请求值"，现已删除 —— 站点根本不承接它，
+        # 回显等于替上游承诺一件它没答应的事（2026-09-15 口径：值不确定的字段一律不给）。
+        # 🔴 最后一跳收窄（`ark_task_view`）：只留官方 schema 里、且**我们真知道值**的字段
+        #    —— `id` / `status` / `error` / `content.video_url` / `duration` / `ratio` /
+        #    `created_at` / `updated_at`。上面挂的内部证据（`model` / `upstream_model` /
+        #    `upstream_record` / `resolution` / `requested` / `effective` / `warnings` /
+        #    `unsupported` / `usage.credits` / `usage.paid`）**一律不进响应体**。
+        #    理由：官方 SDK（Java/Go）碰到 unknown field 是**报错**而非忽略，多一个键就是把
+        #    一个能跑的客户端变成报错的客户端；而给不准的值等于往契约里塞假话。
+        #    证据不丢：`ark.task.fetch` span 上带着**裁剪前**的完整内部视图
+        #    （`upstream_response`）、站点原始记录（`upstream_record`）以及
+        #    `upstream_model` / `warnings` / `unsupported`，logfire 侧照常可查。
+        return ark_task_view(view)
 
     return app
 

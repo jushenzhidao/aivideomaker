@@ -274,6 +274,21 @@ docker compose up -d      # 起 ark-compat + minter（宿主端口见 AVM_HOST_P
 > python3 tools/compose_wiring_check.py --probe   # = --resolve + 与 ark-compat 同网络的容器内真实打 /healthz
 > ```
 >
+> 上面那条手工放行现在有自动化版本 —— **幂等、默认只读、失败自动回滚**：
+>
+> ```bash
+> python3 tools/host_preflight.py               # 只读：打印将要做的事（要求服务已在跑）
+> sudo python3 tools/host_preflight.py --apply  # 起服务 + 放行 + 容器内实测；探测不过 ⇒ 回滚本次新增的规则
+> ```
+>
+> 🔴 **放行"谁"是按 docker 桥接接口，不按写死的网段**：`-i br-+`（用户自定义网络 `br-xxxxxxxx`）
+> 加 `-i docker0` ⇒ **与子网无关**，Docker 换地址池（`default-address-pools` 配成 10.x /
+> 192.168.x）、网络重建拿到新网段，规则都照样命中。ufw 主机不支持接口通配符，改为
+> **枚举 docker 真实桥接网段**逐条放行（`docker network ls --filter driver=bridge`）。
+> 端口从 `docker inspect` 读，并与 `AVM_MINTER_URL` 的端口**交叉核对**（分叉即拒绝上线）。
+> ⚠️ 判定链是 **INPUT** 而不是 `DOCKER-USER`（后者只看转发流量）；任何情况下都不会写成
+> `from any`（8899 = 谁能连上谁就能领过闸凭证）。
+>
 > 🔧 **冷启动那一次铸造**：常规 45s 预算下，冷 profile 的首次铸造曾在新部署上从未成功过
 > （现象：`mint` 返回 503 + TIMEOUT，而 `/healthz` 早已报 ready）。三轮复盘的定性演变
 > （别再倒回去）：E2E-AVM-004 证伪了旧的「冷启动 ≈46s 慢成功」解释（120s 冷预算下仍
@@ -312,9 +327,20 @@ master 下发除数为 worker 数，由 worker 内探测到的账号额度按 ÷
 `logfire[fastapi]`：少了这个 extra，`instrument_fastapi` 每次启动都会静默失败（只留一条
 警告），每个请求的自动 span 随之消失。
 
-探活端点（`/healthz` 与根路径 `/`）**不进 Logfire 上报**：容器 HEALTHCHECK 的轮询否则会把
-真实请求淹掉 —— span 与日志两样都摘，本地 stderr 日志不受影响。排除串是**正则**且由代码里的
-路径表机械生成（手写 `"/"` 会命中每一个 URL，等于把全站追踪静默关掉）。
+探活端点与公开文档端点（`/healthz`、`/`、`/docs`、`/redoc`、`/openapi.json`）**不进 Logfire
+上报**：容器 HEALTHCHECK 的轮询与扫描器否则会把真实请求淹掉 —— span 与日志两样都摘，本地
+stderr 日志不受影响。名单可用 `AVM_LOGFIRE_EXCLUDED_PATHS` 覆盖：**只写路径，不写正则**
+（普通路径精确匹配，以 `/` 结尾按子树匹配；留空 = 内置默认，写 `-` = 不排除任何路径），
+正则由代码机械生成 —— 手写 `"/"` 会命中每一个 URL，等于把全站追踪静默关掉。
+
+**任务查询端点（轮询）同样不进上报**（闸门 1：产生层，2026-09-15）：`GET /tasks/{id}` 会被
+调用方按秒级反复查询，一个任务几十上百次请求里绝大多数 span 逐字段相同 —— 那是重复计价，
+不是可观测性。现在的口径是**状态跃迁才留痕**：首次观测 / 状态跃迁 / 失败才发
+`ark.task.fetch`，其余只累加指标（`avm.task.poll_requests`）；盯梢线程对上游的轮询 GET 也
+被压制，全程只留一条 `ark.task.watch` span，跃迁记成它上面的 `status_change` 事件。
+实测：同一个任务被查 60 次由 **123 条 span 降到 6 条**。名单可用 `AVM_LOGFIRE_POLL_PATHS`
+覆盖，语义与探活表同构。⚠️ 只摘**成功**的轮询日志 —— 4xx/5xx 照报，否则"调用方到底看到了
+什么"在 Logfire 里就不存在了。
 
 ## 关键结论
 

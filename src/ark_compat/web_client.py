@@ -29,7 +29,7 @@ from loguru import logger
 
 from .cookie import normalize_cookie_header
 from .errors import CaptchaRequiredError, ParamError, WebApiError
-from .observability import note_upstream, safe_headers
+from .observability import note_upstream, safe_headers, suppress_http
 from .sniff import image_dimensions, sniff_file
 
 # 站点约定
@@ -527,18 +527,41 @@ class WebClient:
             raise WebApiError("model.getModel", f"task {task_id} not found", code="NOT_FOUND", http_status=404)
         return rec
 
-    def wait_for_task(self, task_id: str, *, timeout: float = 600.0, interval: float = 10.0) -> dict:
-        """轮询到终态。"""
+    def wait_for_task(
+        self,
+        task_id: str,
+        *,
+        timeout: float = 600.0,
+        interval: float = 10.0,
+        on_poll=None,
+    ) -> dict:
+        """轮询到终态。
+
+        🔴 **每一次轮询 GET 都包在 `suppress_http()` 里**（闸门 1：产生层）。
+        站点查询是只读且被高频重复的：按"一次调用一条 span"记账，一个任务就是几十上百条
+        内容几乎相同的 span。明细改由调用方（`web_queue._watch`）在**一条**覆盖全程的
+        span 上以「事件 + 指标」承载 —— 量从"每次一条"降到"每任务一条"。
+
+        `on_poll(status)` 每次轮询后被调一次（含还没进终态的那些）。
+        🔴 **它抛异常不允许影响盯梢**：埋点坏掉不许把"放槽位"一起赔进去 —— 槽位是
+        闸门，卡住就是整条线停摆（实测过的故障模式）。
+        """
         t0 = time.time()
         last: dict | None = None
         while time.time() - t0 < timeout:
             try:
-                last = self.get_task(task_id)
+                with suppress_http():
+                    last = self.get_task(task_id)
             except WebApiError as e:
                 if e.code == "NOT_FOUND":
                     raise
                 last = None
             status = str((last or {}).get("taskStatus") or "").lower()
+            if on_poll is not None:
+                try:
+                    on_poll(status)
+                except Exception as e:  # noqa: BLE001 —— 埋点失败绝不影响业务
+                    logger.debug(f"on_poll 回调失败（不影响盯梢）：{e}")
             if status in TERMINAL:
                 return {
                     "done": True,
@@ -583,18 +606,14 @@ class WebClient:
                     error=f"{type(e).__name__}: {e}",
                     duration_ms=(time.perf_counter() - started) * 1000,
                 )
-                raise WebApiError("download", f"{type(e).__name__}: {e}") from None
+                raise
             note_upstream(
                 "download",
                 upstream="web",
                 request={"url": source},
-                response={"http_status": r.status_code, "bytes": len(r.content)},
-                status="ok" if r.status_code < 400 else "error",
+                response={"bytes": len(buf)},
                 duration_ms=(time.perf_counter() - started) * 1000,
             )
-            if r.status_code >= 400:
-                raise WebApiError("download", f"{r.status_code} for {source[:120]}", http_status=r.status_code)
-            buf = r.content
             tail = source.split("?")[0].rstrip("/").split("/")[-1]
             base = re.sub(r"\.[^.]+$", "", unquote(tail) or "file") or "file"
         else:
@@ -614,7 +633,8 @@ class WebClient:
         if max_bytes and len(buf) > max_bytes:
             raise ParamError(
                 f"{info['kind']} too large: {len(buf)} bytes > maxBytes {max_bytes} "
-                f"({int(max_bytes) // 1048576}MB for {info['content_type']})"
+                f"({int(max_bytes) // 1048576}MB for {info['content_type']})",
+                "input_reference",
             )
 
         upload_url = pre.get("uploadUrl")

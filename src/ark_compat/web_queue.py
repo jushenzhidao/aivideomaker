@@ -26,6 +26,7 @@ import time
 from typing import Callable
 
 from .errors import WebApiError
+from .observability import count_poll, describe_error, record_wait, span
 
 
 class WebSubmitQueue:
@@ -101,14 +102,69 @@ class WebSubmitQueue:
         return str(task_id)
 
     def _watch(self, task_id: str) -> None:
+        """盯到任务进终态，再放槽 —— **全程一条 span**（闸门 1：产生层）。
+
+        本方法就是片段里 `watch_task` 在本服务的落点：
+          · 覆盖全程的**唯一** span `ark.task.watch` —— 一个 300s 任务原来是几十~上百条
+            （每次轮询的上游 GET 各一条），现在 1 条；
+          · 每次轮询只 `add_event` 记**状态跃迁** + 累加指标，不再逐次开 span；
+          · 轮询真正发出的 GET 由 `WebClient.wait_for_task` 里的 `suppress_http()` 压掉。
+
+        🔴 槽位释放放在最外层 `finally`，而 span 的创建在它**里面** ——
+        埋点坏掉绝不许可把闸门一起卡死（那会是整条线停摆，实测过的故障模式）。
+        """
+        polls = {"n": 0, "last": ""}
+        res: dict | None = None
+        failure: str | None = None
         try:
-            res = self.client.wait_for_task(
-                task_id, timeout=self.watch_timeout, interval=self.poll_interval
-            )
-            self._log(f"[queue] slot released ({task_id} -> {res.get('status')})")
-        except Exception as e:  # noqa: BLE001
-            # 盯梢失败也必须放槽位，否则闸门会永久卡死
-            self._log(f"[queue] watcher gave up on {task_id}: {e}")
+            with span(
+                "ark.task.watch",
+                upstream=self._upstream,
+                upstream_task_id=task_id,
+            ) as sp:
+
+                def on_poll(status: str) -> None:
+                    polls["n"] += 1
+                    if status != polls["last"]:
+                        # 「状态跃迁用事件而不是 span」：事件挂在覆盖全程的那条 span 上 ——
+                        # 于是"变了什么"照旧看得见，而每次轮询不再各付一条 span。
+                        sp.add_event("status_change", {"from": polls["last"], "to": status})
+                        polls["last"] = status
+                    count_poll(
+                        upstream=self._upstream,
+                        status=status,
+                        reported=False,
+                        source="watcher",
+                    )
+
+                try:
+                    res = self.client.wait_for_task(
+                        task_id,
+                        timeout=self.watch_timeout,
+                        interval=self.poll_interval,
+                        on_poll=on_poll,
+                    )
+                    self._log(f"[queue] slot released ({task_id} -> {res.get('status')})")
+                except Exception as e:  # noqa: BLE001
+                    failure = describe_error(e)
+                    # 盯梢失败也必须放槽位，否则闸门会永久卡死
+                    self._log(f"[queue] watcher gave up on {task_id}: {e}")
+
+                sp.set_attribute("task.poll_count", polls["n"])
+                sp.set_attribute("task.last_status", polls["last"])
+                if res is not None:
+                    final_status = str(res.get("status") or "")
+                    sp.set_attribute("task.final_status", final_status)
+                    sp.set_attribute("task.done", bool(res.get("done")))
+                    sp.set_attribute("task.watch_ms", res.get("ms"))
+                    record_wait(
+                        upstream=self._upstream,
+                        final_status=final_status,
+                        seconds=float(res.get("ms") or 0) / 1000.0,
+                        source="watcher",
+                    )
+                if failure:
+                    sp.set_attribute("error", failure)
         finally:
             with self._lock:
                 self._running.pop(task_id, None)

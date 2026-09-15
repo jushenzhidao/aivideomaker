@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""上游**实际执行**的模型必须能在契约里读到（报告 AVM12-OPEN-UPSTREAM）。
+"""上游**实际执行**的模型必须仍然可查（报告 AVM12-OPEN-UPSTREAM）—— 2026-09-15 起走 logfire。
 
 历轮三次真实提交的结论一致：请求的是 `doubao-seedance-2-5-260628`，成片 URL 里却是
 `minimax_h3`（web 线只有 `ai.minimaxH3` 一条 tRPC 程序，站点对请求的模型名只是回显）。
-但对外任务视图里 `model` 被覆盖成**请求值**、嵌套的原始记录又被 `upstream`（上游种类）
-覆盖掉 ⇒ "上游到底跑了什么"这个事实**在最后一跳消失**，契约里读不到。
 
-修法两条（都在 `translate.py`）：
-  1. `normalize_web_task` 增加平行的 `upstream_model`（= 站点记录里的 `aiModel`），
-     与 `model`（请求值）**并列**暴露 —— 谁都不改写谁；
-  2. 原始记录换到不会被覆盖的键 `upstream_record`（`app._task_view` 会用 `upstream`
-     表示上游种类）—— 证据链不再在最后一跳断掉。
+这个事实的**可见位置变过一次**，别再按老位置找：
+  1. `normalize_web_task`（本文件）仍产出平行的 `upstream_model`（= 站点记录里的
+     `aiModel`）与 `upstream_record`（键名刻意不叫 `upstream`，那个键在 app 层表示
+     上游**种类**并会被覆盖）—— 谁都不改写谁，两者并存且不同；
+  2. 但对外响应体已按官方 schema 收窄（见 `tests/test_ark_task_schema.py`），
+     这两个键**不再出现在 `GET /tasks/{id}`** 里 —— 调用方读到的 `model` 仍是请求值；
+  3. 实际执行值改由 logfire 的 `ark.task.fetch` span 承载（`upstream_model` /
+     `upstream_response`），断言在 `tests/test_trace_contract.py` 与 `test_web_upstream.py`。
+
+本文件只钉第 1 层（内部视图），响应体与 trace 两层各有自己的门禁。
 
 运行：python3 tests/test_upstream_model_visibility.py
 """
@@ -50,7 +53,7 @@ class TestUpstreamModelIsVisible(unittest.TestCase):
         # 归一化层里 `model` 仍是上游记录里的值；**请求值**由 app 层另给（见
         # tests/test_web_upstream.py 的 app 层用例）。
         self.assertEqual(view["model"], "minimax_h3")
-        self.assertIn("upstream_model", view, "字段名被改掉了？调用方按它读")
+        self.assertIn("upstream_model", view, "内部视图的键名被改掉了？（trace 按它读）")
 
     def test_missing_model_is_none_never_fabricated(self):
         """记录里没有这个字段时如实给 None —— 拿请求值顶上等于"看不到"变"看到假的"。"""

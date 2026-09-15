@@ -183,6 +183,15 @@ services:
       AVM_LOGFIRE_SCRUBBING: ${AVM_LOGFIRE_SCRUBBING:-0}
       AVM_LOGFIRE_CAPTURE_HEADERS: ${AVM_LOGFIRE_CAPTURE_HEADERS:-0}
       AVM_LOGFIRE_MAX_CHARS: ${AVM_LOGFIRE_MAX_CHARS:-20000}
+      # 不进 Logfire 上报的路径表（逗号分隔的**路径**，**不是正则** —— 正则由代码
+      # 机械生成全锚定形态，见 observability._regex_for）。留空 = 代码内置默认
+      # （`/healthz`、`/` 加交互式文档三条）；`-` = 不排除任何路径。
+      # 容器 HEALTHCHECK 每 30s 打一次 `/healthz`，不摘掉就是一天上千条噪声。
+      AVM_LOGFIRE_EXCLUDED_PATHS: ${AVM_LOGFIRE_EXCLUDED_PATHS:-}
+      # 被**轮询**的业务路径表（语义与上表同构，见 .env.example / observability.py）。
+      # 留空 = 内置默认（任务查询路径：方舟线 + OpenAI 兼容线）；`-` = 不排除。
+      # 容器多 worker ⇒ 轮询更密，这张表是容器部署里削减量最大的一项。
+      AVM_LOGFIRE_POLL_PATHS: ${AVM_LOGFIRE_POLL_PATHS:-}
 
       # 容器内没有 macOS scutil 代理，保持关闭
       AVM_NO_TRUST_ENV: ${AVM_NO_TRUST_ENV:-0}
@@ -399,6 +408,9 @@ services:
     #    （回滚：ufw delete allow proto tcp from 172.16.0.0/12 to any port 8899）
     #    部署前实测「包能到」：python3 tools/compose_wiring_check.py --probe
     #    —— 在与 ark-compat 同网络的一次性容器里真实打一次 /healthz；宿主能连 ≠ 容器能连。
+    #    自动化：`sudo python3 tools/host_preflight.py --apply`（按 docker 桥接**接口**
+    #    `-i br-+` / `-i docker0` 放行 ⇒ 与子网无关，换地址池也命中；ufw 主机则枚举真实
+    #    网段。幂等放行 + 容器内实测 + 探测不过就回滚；不带 --apply 时全程只读）。
     # （host 网络下没有端口映射，`expose` 是死配置，已删——服务直接监听宿主 8899）
     environment:
       # 监听端口。🔴 挪端口时**必须同时**改 `AVM_MINTER_URL`（宿主侧地址）—— host 网络下

@@ -153,6 +153,42 @@ credential 管**上游解析**，两者用途不同、互不替代。
 | GET | `/v1/videos/{id}` | 查询（OpenAI v1/videos 形状） |
 | GET | `/healthz` | 存活 + 上游可用性与计费口径；`?deep=1` 额外查上游 |
 
+### `GET /api/v3/contents/generations/tasks/{id}` 的响应体
+
+**只含必要字段，且只含有真实值的字段**（2026-09-15 两轮口径：先对齐官方
+[查询视频生成任务](https://www.volcengine.com/docs/82379/1521309) 的「响应参数」表，
+再收窄到"不要 `model` / `resolution`，值不确定或取不到的一律不给"）：
+
+```json
+{"id": "cgt-…", "status": "succeeded", "error": null,
+ "content": {"video_url": "https://…/x.mp4"},
+ "duration": 5, "ratio": "16:9", "created_at": 1789477818, "updated_at": 1789477959}
+```
+
+- **白名单**：`id` · `status` · `error` · `content{video_url[,last_frame_url]}` ·
+  `duration` · `ratio` · `created_at` · `updated_at`（`translate.ARK_TASK_FIELDS`）。
+  官方 SDK（Java/Go）对 unknown field 是**报错**而非忽略 ⇒ 多一个键就是坏一个客户端。
+- **没有值就不给键**，唯一例外是 `error`（官方规定成功时显式返回 `null`，那是**确定**的
+  信息，不是"不知道"）。任务还在跑时，响应可能就只有 `{"status": "queued", "error": null}`
+  —— 那是**正确**的，不是字段漏了。
+- 🔴 `duration` 是 **integer**。站点任务记录里它是**字符串** `"5"` —— 原样透传会让官方
+  Java/Go SDK 在反序列化时**抛类型错误**（这就是 2026-09-15 报告"跟原生接口对不上"的元凶）。
+- **不给编造值**。`seed:-1` / `framespersecond:24` / `service_tier:"default"` /
+  `execution_expires_after:172800` / `draft:false` / `usage.completion_tokens:0` 这些
+  曾经让响应"看起来很完整"的常量，已从归一化层**移除** —— 编一个合理的值比不给更糟：
+  调用方会把它当成事实。
+- `status` 覆盖官方 6 态，含 **`expired`**（任务超时 —— 与"还在排队"是相反的两个结论，
+  从前它会落到 `queued`）。
+
+**证据去哪了**：上游实际执行的模型、原始站点记录、实际产出档位（`resolution`）、创建时的
+`warnings[]` / `unsupported[]`、计费 `paid` —— 一律**不进响应体**，只走 logfire 的
+`ark.task.fetch` span（属性见下）。**想零成本看校验结论请用 dry-run**，
+不要指望在查询响应里读到它们。
+
+门禁：[`tests/test_ark_task_schema.py`](../../tests/test_ark_task_schema.py) —— 两个字段集
+（官方全集 / 我们的收窄白名单）都**硬编码**在测试里，不引用实现的常量；否则把白名单改宽时
+"多出字段"那条断言会跟着放水（自引用门禁不可证伪）。
+
 ### 交互式文档
 
 | 路径 | 说明 |
@@ -237,8 +273,11 @@ AVM_TASK_STORE=memory      # 显式开发/测试开关：重启即丢
 - **终态**（succeeded/failed/cancelled）：**永久**缓存到记录被删 —— 记录已定格，
   多查一次只是白挨限流。
 
-上游请求量从"调用方想打多勤就多勤"变成"TTL 一拍 + 终态一次"。命中缓存的查询在
-trace 里同样有 `ark.task.fetch` span（`cached=true`，status/paid 契约属性照常）。
+上游请求量从"调用方想打多勤就多勤"变成"TTL 一拍 + 终态一次"。命中缓存的查询**不再**每次
+留一条 span（2026-09-15 闸门 1：产生层）—— 只有**本进程第一次观测**这个任务时才发
+`ark.task.fetch`（那次的 `cached=true`，status/paid 契约属性照常），此后同状态的重复查询
+一律只累加指标。终态与 `paid` 的对账口径因此**不出现空洞**:终态那一次必定是一次跃迁
+（或首次观测），照发。
 注：上游 tRPC 本身支持把多个 `model.getModel` 合并进一次 HTTP（batch 信封），适合
 "一次查多个任务"的列表场景；当前逐任务查询已被 TTL 缓存兜住，批量留作后续增强。
 
@@ -377,15 +416,50 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
 - **loguru** 是唯一日志出口，每条带 `request_id`（同时回显在响应头 `x-request-id`）。
 - 经 `logfire.loguru_handler()` 桥接进 Logfire；`instrument_fastapi` 让每个请求成一条
   span，`instrument_httpx` 让每次上游调用成子 span。
-- 🔴 **探活路径不上报**（`observability.PROBE_PATHS` = `/healthz` 与 `/`）：容器
-  HEALTHCHECK 每 30s 打一次 `/healthz`，每条都成 span + 日志就是一天上千条噪声。
-  **span** 在 `instrument_fastapi(excluded_urls=…)` 里摘，**日志**在 logfire 那个 sink 的
-  filter（`keep_off_logfire`，按请求中间件绑的 `avm_probe` 判）里摘 —— 两个口都从
-  `is_probe_path()` 派生，改一处不会漏另一处。本地 stderr 照打：探活真坏掉时本机仍看得见。
-  ⚠️ 这串**不能手写正则**：上游做的是 `re.search`（**子串**匹配），写 `"/"` 会命中
+- 🔴 **探活与公开文档端点不上报**（`observability.DEFAULT_PROBE_PATHS` = `/healthz`、`/`
+  与交互式文档三条）：容器 HEALTHCHECK 每 30s 打一次 `/healthz`，`/docs` 那一族不鉴权、
+  会被扫描 —— 每条都成 span + 日志就是一天上千条噪声。**span** 在
+  `instrument_fastapi(excluded_urls=…)` 里摘，**日志**在 logfire 那个 sink 的 filter
+  （`keep_off_logfire`，按请求中间件绑的 `avm_probe` 判）里摘 —— 两个口都从
+  `is_probe_path()` 派生，改一处不会漏另一处。本地 stderr 照打：探活坏掉时本机仍看得见。
+  名单可用 `AVM_LOGFIRE_EXCLUDED_PATHS` 覆盖（逗号分隔；留空 = 用默认表，`-` = 不排除）；
+  由 `_apply_excluded_paths()` 在启动时解析，条目不合规会**告警剔除**（不静默放过）。
+  ⚠️ **只写路径，别写正则**：上游做的是 `re.search`（**子串**匹配），写 `"/"` 会命中
   **每一个** URL（任何 URL 都含 `/`）⇒ 全站追踪被静默关掉；未锚定的 `"/healthz"` 也会
-  连带吃掉 `/healthz/extra`。故由 `PROBE_PATHS` 机械生成全锚定形态。
-  门禁：`tests/test_logfire_probe_exclusion.py`（含变异自证：把上面的写法改回朴素串必红）。
+  连带吃掉 `/healthz/extra`。故语义只定义一次（`_path_matches`：普通=精确，尾斜杠=子树），
+  正则由 `_regex_for()` 同构生成。被匹配的串是 `scheme://host + scope["path"]`（**不含
+  query**）⇒ `/healthz?deep=1` 命中同一条。
+  门禁：`tests/test_logfire_probe_exclusion.py`（含变异自证：退化成朴素串 / 丢掉 env 读取
+  都会红）。
+- 🔴 **轮询端点不产生 span（闸门 1：产生层）**：`DEFAULT_POLL_PATHS` = 任务查询路径
+  （方舟线 `/api/v3/contents/generations/tasks/` 与 OpenAI 兼容线 `/v1/videos/`）。
+  与探活表**语义不同、机制同源**：探活"根本不是业务"；这里是业务端点、但被调用方按秒级
+  反复查询 —— 同一个任务几十上百次请求里绝大多数 span 逐字段相同，那是重复计价，
+  不是可观测性（Logfire 官方文档就把 "High-frequency polling" 列为应排除埋点的用例）。
+  实测（同一个任务被查 60 次 / 盯梢 30 次轮询上游）：**123 → 6** 与 **31 → 1** 条 span。
+  实现分三处，**缺一不可**（都是实测结论，不是照抄文档）：
+  1. **入站 span** ⇒ `instrument_fastapi(excluded_urls=…)`。⚠️ handler 里的
+     `suppress_instrumentation()` 对入站**无效** —— ASGI 中间件在 handler 之外就把 span
+     建好了，所以排除粒度只能是 URL。
+  2. **状态跃迁才留痕** ⇒ `app.PollReportGate`：首次观测 / 状态跃迁 / **失败**才发
+     `ark.task.fetch`，其余只累加指标。⇒ 终态与 `paid` 的对账口径**不出现空洞**，
+     而失败**一律留痕**（失败时上游状态未知，不能据此认定"没变化"）。
+  3. **日志** ⇒ 请求中间件对轮询路径**只在 4xx/5xx** 时才把 access log 送上 logfire
+     （成功的轮询静音）。把失败响应一起静音，等于把"调用方到底看到了什么"删掉。
+  名单可用 `AVM_LOGFIRE_POLL_PATHS` 覆盖（与探活表同一套解析器与语义：留空 = 默认表，
+  `-` = 不排除任何路径，非法条目告警剔除）；门禁 `tests/test_poll_suppression.py`
+  （含 10 条变异自证全红）。
+- **出站轮询也不产生 span**：盯梢线程 `WebSubmitQueue._watch` 全程只有**一条** span
+  `ark.task.watch`，状态跃迁记成它上面的 `status_change` **事件**；轮询真正发出的上游 GET
+  由 `WebClient.wait_for_task` 里的 `suppress_http()` 压掉。
+  ⚠️ **顺序契约**：压制按 contextvar 在 **span 处理器层**生效，会连带压掉我们自己显式开的
+  `span()` ⇒ 必须"先开 span、再用它只包 GET"。写反了，全程那条 span 会**静默消失**。
+  ⚠️ 出站 httpx 埋点打在 `HTTPTransport.handle_request` 上 ⇒ 用 `MockTransport` 的测试
+  **看不到** httpx span（这就是"httpx 自动子 span"长期只写在注释里、从没被断言的原因）。
+  指标：`avm.task.poll_requests`（每次查询都计数，`reported` 区分留没留 span，`source`
+  区分调用方轮询 / 盯梢）+ `avm.task.wait_seconds`（跃迁进终态时记一次）。
+  🔴 指标标签**只放低基数枚举**：绝不放 `ark_id` / `task_id` —— 那会把时间序列打成一任务
+  一条，比 span 还贵。
 - 具名 span（属性即契约，用内存 exporter 断言：`tests/test_trace_contract.py`）：
   - `ark.create.submit` —— `ark_id` / `upstream` / `ark_model` /
     `resolution` / `duration` / `billed` / `warning_count` / `warnings` /
@@ -393,7 +467,32 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
   - `ark.create.dry_run` —— 同上（除 taskId）：零成本校验路径也要能在 trace 里复盘
   - `ark.task.fetch` —— `ark_id` / `upstream` / **`upstream_task_id`** / **`status`** /
     **`paid`**（出片后对账的两项关键；`paid` 才是"这次花没花钱"的判据，不是 `credits`）/
-    `upstream_response`（归一化后的任务对象）/ `upstream_calls`
+    `upstream_response`（归一化后的**完整内部视图** —— 上游实际执行的模型
+    `upstream_model`、站点原始记录 `upstream_record`、实际产出档位 `resolution` 都在里面，
+    从 `4211e5b` 起一直如此）/ **`warnings`** / **`unsupported`** / `upstream_calls`
+
+    2026-09-15 响应体两轮收窄时**只单独补了 `warnings` / `unsupported`** —— 它们来自本地
+    任务记录（`entry`），**不在** `upstream_response` 里，不挂就真的丢了。
+    其余证据**不重复上报**：同一份数据挂两遍只会让 trace 变大、口径还容易漂，
+    也会让人误以为"是这次特意补的"（用户当场指出 `upstream_record` "之前在 logfire 就有"）。
+    门禁：`tests/test_trace_contract.py::test_evidence_is_not_uploaded_twice`。
+
+    ★ **只在状态跃迁时产生**（闸门 1，2026-09-15）：同状态的重复轮询**不发 span**（只累加
+    `avm.task.poll_requests`）。判据与理由见上面「轮询端点不产生 span」那条。因此这条 span
+    多带三项**跃迁信息**，读 trace 的人不必再靠"跟上一行对比"推断状态变没变：
+      - `transition_reason` —— `first`（本进程首次观测）/ `transition`（跃迁）/ `error`（失败）
+      - `transition_from` / `transition_to` —— 跃迁方向（`first` 时 `from` 为空串）
+      - `poll_count` —— 本进程观测到的查询次数（含那些没留 span 的）
+      - `cached` —— 这次是不是命中了节流缓存（命中就没有上游调用 ⇒ 无 `upstream_calls`）
+      - `upstream_ms` —— 上游 calls 的耗时合计；⚠️ 因为"先取数据、后决定要不要留痕"，
+        这条 span **不再包住上游调用**，它的自身时长近似 0，看耗时请用这个属性
+      - 跃迁（且不是 `first`）时另挂 `status_change` **事件**（`{from, to}`）
+      ⚠️ 跨请求的"全程唯一 span"在本服务落不了地（span 不能跨 HTTP 请求；多 worker 下同一
+      条轮询会落到不同进程）⇒ 事件只能挂在**跃迁那一条** span 上。
+  - `ark.task.watch` —— 盯梢线程的**全程唯一** span：`upstream` / `upstream_task_id` /
+    `task.poll_count` / `task.last_status` / `task.final_status` / `task.done` /
+    `task.watch_ms`，跃迁记成 `status_change` 事件；盯梢失败或超时另带 `error`。
+    ⚠️ 槽位释放放在 `finally`、span 的创建在它里面 —— 埋点坏掉**绝不许**把闸门卡死。
   - `ark.task.cancel` —— `ark_id` / `upstream_task_id` / `cancelled` / `upstream_response` /
     `upstream_calls`（站点**没有**取消端点，`cancelled=false` 是实话）
   - 失败路径额外带 `error`（含错误码，如 `WebApiError[NOT_FOUND] http=404`）+
@@ -529,7 +628,11 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 ├── test_turnstile_render_states.py 铸造失败分类与页面内状态采样
 ├── test_billing_advisory.py  计费提醒只在 duration 越线时出现
 ├── test_task_credential_binding.py 任务凭据绑定（免凭据查询 / 租户隔离 / 空表 401）
-├── test_upstream_model_visibility.py 请求值与实际执行值分列（`model` / `upstream_model`）
+├── test_ark_task_schema.py  查询响应 = 官方 schema 的**真子集**（无 `model`/`resolution`、
+│                           只给有真值的字段、`duration` 是 int、status 含 expired；
+│                           两个字段集都硬编码 —— 含变异自证）
+├── test_upstream_model_visibility.py 内部视图里 `model`(请求值) 与 `upstream_model`(实际值)
+│                           并存；两者都**不进响应体**，实际值只在 trace（见 test_ark_task_schema）
 ├── test_logfire_export_signal.py  观测出口"真的在发"（而不是只装上了 SDK）
 └── test_ua_consistency.py   UA / 服务名一致性
 ```

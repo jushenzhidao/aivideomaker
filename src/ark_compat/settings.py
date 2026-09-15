@@ -55,6 +55,22 @@ def _parse_send(raw) -> bool | str:
     return "if-token-present"
 
 
+def _parse_excluded_paths(raw):
+    """AVM_LOGFIRE_EXCLUDED_PATHS：逗号分隔的**路径**表（**不是正则**，见 observability）。
+
+    · 留空/未设 ⇒ `None`（= 用内置默认表）——与模板里 `VAR=` 等于"没设"的全局口径一致
+    · `-` / `none` / `off` ⇒ `()`（**显式**不排除任何路径）
+    · 其余 ⇒ 按逗号切开、去空白后的元组；**合法性不在这里判**（`observability.reject_reason`
+      负责，且会把不合规的条目**告警**剔除，不静默放过）
+    """
+    v = str(raw or "").strip()
+    if not v:
+        return None
+    if v.lower() in ("-", "none", "off"):
+        return ()
+    return tuple(p.strip() for p in v.split(",") if p.strip())
+
+
 # ---------------------------------------------------------------- 鉴权（一个变量）--
 
 AUTH_OPEN = "open"                  # 不校验（本机自用）
@@ -201,6 +217,16 @@ class Settings:
     logfire_capture_headers: bool = False
     # 单个属性值里字符串的截断上限：防 data URI 把 trace 撑爆，不是脱敏。
     logfire_max_chars: int = 20000
+    # 不进 Logfire 上报的路径（`AVM_LOGFIRE_EXCLUDED_PATHS`，逗号分隔）。
+    # `None` = **未设/留空 ⇒ 用内置默认表**（探活 + 公开文档端点，见 observability）；
+    # `()` = 显式不排除任何路径（写成 `-`）——"留空"与"显式关掉"必须能分开表达。
+    # ⚠️ 语义是**路径**，不是正则：原样值永不进正则（否则写 `/` 会关掉全站追踪）。
+    logfire_excluded_paths: tuple | None = None
+    # 被**轮询**的业务路径（`AVM_LOGFIRE_POLL_PATHS`，逗号分隔，与上表同构、同解析器）。
+    # 这些路径不算"探活"，但同样被反复请求 ⇒ 不进 Logfire 上报（span + 成功响应的
+    # access log）。默认表 = 任务查询路径（方舟线 + OpenAI 兼容线），见 observability。
+    # `None` = 未设/留空 ⇒ 内置默认表；`()` = 显式不排除（写成 `-`）。
+    logfire_poll_paths: tuple | None = None
     # False 时忽略 HTTP_PROXY / macOS scutil 代理。本地或对回环上游自测时设
     # AVM_NO_TRUST_ENV=1，否则请求会被代理走并拿到网关的 502。
     trust_env: bool = True
@@ -269,6 +295,9 @@ class Settings:
             logfire_scrubbing=_env_flag(env, "AVM_LOGFIRE_SCRUBBING"),
             logfire_capture_headers=_env_flag(env, "AVM_LOGFIRE_CAPTURE_HEADERS"),
             logfire_max_chars=int(env.get("AVM_LOGFIRE_MAX_CHARS") or 20000),
+            logfire_excluded_paths=_parse_excluded_paths(env.get("AVM_LOGFIRE_EXCLUDED_PATHS")),
+            # 同一套解析器、同一套语义（路径表，`-` = 显式不排除）
+            logfire_poll_paths=_parse_excluded_paths(env.get("AVM_LOGFIRE_POLL_PATHS")),
             trust_env=not _env_flag(env, "AVM_NO_TRUST_ENV"),
             account_report_seconds=int(env.get("AVM_ACCOUNT_REPORT_SECONDS") or 300),
         )

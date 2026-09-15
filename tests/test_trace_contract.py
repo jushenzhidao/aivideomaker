@@ -367,6 +367,83 @@ class TestSpanContract(unittest.TestCase):
         get_model = [c for c in calls if c["call"] == "model.getModel"][0]
         self.assertEqual(get_model["response"]["body"][0]["result"]["data"]["json"]["kelingKeyId"], "704")
 
+    def test_fetch_span_carries_the_evidence_the_body_no_longer_shows(self):
+        """★ 响应体收窄后，被拿掉的证据必须仍在 trace 里（2026-09-15）。
+
+        `GET /tasks/{id}` 现在只回"官方 schema 里、且我们真有值"的字段
+        （见 tests/test_ark_task_schema.py）—— 上游实际跑的模型、原始站点记录、
+        实际产出档位因此**只在 span 上**可见。这条断言是那两轮收窄的配套：
+        **响应体收窄 ≠ 证据丢失**。
+        """
+        tid = self.post_task()["id"]
+        r = self.client.get(f"{TASKS_PATH}/{tid}", headers={"Authorization": f"Bearer {GATE}"})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        for gone in ("model", "upstream_model", "upstream", "upstream_record",
+                     "requested", "warnings", "resolution"):
+            self.assertNotIn(gone, body, "内部证据不该出现在响应体里（官方 schema 没有这些键）")
+
+        attrs = self.attrs("ark.task.fetch")
+        # ① 这两项**必须单独挂**：它们来自本地任务记录（entry），不在 upstream_response 里，
+        #    不挂就真的丢了。
+        self.assertEqual(self.as_json(attrs["warnings"]), [], "创建时没有告警就是空列表，不是缺失")
+        self.assertIn("unsupported", attrs)
+        # ② 其余证据从 `upstream_response`（归一化后的完整内部视图，`4211e5b` 起一直在）里读。
+        raw = self.as_json(attrs["upstream_response"])
+        self.assertEqual(raw["upstream_model"], "minimax-h3", "上游实际执行的模型")
+        self.assertEqual(raw["upstream_record"]["aiModel"], "minimax-h3", "站点原始记录")
+        self.assertEqual(raw["upstream_record"]["kelingKeyId"], "704")
+        self.assertEqual(raw["resolution"], "704p", "实际产出档位")
+
+    def test_evidence_is_not_uploaded_twice(self):
+        """同一份数据别挂两遍（2026-09-15 用户指出：`upstream_record` "之前在 logfire 就有"）。
+
+        `upstream_model` / `upstream_record` / `resolution` 都已经在 `upstream_response` 里，
+        再单独挂一份只会让 trace 变大、口径还容易漂 —— 而且会误导人以为"是这次特意补的"。
+
+        ⚠️ 2026-09-15 闸门 1（产生层）之后只会有**一条** span：第二次查询状态没变，
+        `ark.task.fetch` 不再产生（见 `test_repeat_query_produces_no_span`）。
+        证据不重复的断言原样保留 —— 它管的是"挂几份"，与"发几条"是两件事。
+        """
+        tid = self.post_task()["id"]
+        headers = {"Authorization": f"Bearer {GATE}"}
+        self.client.get(f"{TASKS_PATH}/{tid}", headers=headers)
+        self.client.get(f"{TASKS_PATH}/{tid}", headers=headers)  # 同状态重复查询 ⇒ 不再产生 span
+
+        spans = self.spans("ark.task.fetch")
+        self.assertEqual(len(spans), 1, "只有首次观测（含上游调用）那一次留 span")
+        for s in spans:
+            for duplicated in ("upstream_model", "upstream_record", "resolution"):
+                self.assertNotIn(
+                    duplicated, s["attributes"],
+                    f"重复上报了 {duplicated}（它已在 upstream_response 里）",
+                )
+
+    def test_repeat_query_produces_no_span(self):
+        """★ 闸门 1（产生层）：**同状态的重复轮询一条 span 都不产生**。
+
+        为什么这是这一轮最值钱的改动：调用方（newapi 的任务轮询）按秒级打
+        `GET /tasks/{id}`，一个终态任务再被查 10 次，语义上没有任何新信息 ——
+        10 条逐字段相同的 span 就是 10 笔重复计价（Logfire 官方把
+        "High-frequency polling" 明确列为应该排除埋点的用例）。
+
+        契约不出现空洞：终态那一次是**跃迁**，仍然照发（见
+        `test_fetch_span_carries_status_paid_and_the_normalized_task`）。
+        """
+        tid = self.post_task()["id"]
+        headers = {"Authorization": f"Bearer {GATE}"}
+        self.client.get(f"{TASKS_PATH}/{tid}", headers=headers)
+        self.assertEqual(len(self.spans("ark.task.fetch")), 1, "首次观测留一条")
+
+        for _ in range(9):
+            self.client.get(f"{TASKS_PATH}/{tid}", headers=headers)
+        self.assertEqual(
+            len(self.spans("ark.task.fetch")), 1,
+            "同状态重复查询不该再产生 span（闸门 1）—— 只许留下首次观测那一条",
+        )
+        # 对照：请求本身必须照常成功 —— 别把"不埋点"做成"不改动业务"
+        self.assertEqual(self.client.get(f"{TASKS_PATH}/{tid}", headers=headers).status_code, 200)
+
     def test_fetch_failure_keeps_the_error_on_the_span(self):
         """上游说"没这条任务"时，失败原因与它回的原文都要留在 span 上 ——
         否则 trace 里与"我们根本没查"无法区分。"""
