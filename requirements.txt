@@ -9,6 +9,14 @@
 
 # HTTP 服务
 fastapi>=0.115
+# 🔴 **必须显式声明**：`request.form()`（OpenAI `/v1/videos` 收 multipart 表单用，见
+#    `app.py` 的 `_openai_fields`）在 starlette 里是**可选**能力 —— fastapi/starlette
+#    都不把本包列为依赖，缺它时**也不是导入期报错**，而是**第一个 multipart 请求**才抛
+#    `AssertionError: The python-multipart library must be installed to use form parsing`
+#    （starlette/requests.py 的 _get_form）。
+#    2026-09-15 实测踩到：本地 venv 恰好装着（0.0.32）⇒ 550 项全绿，而 CI 干净环境
+#    6 项失败、**镜像同样缺**（Dockerfile 只装本文件）。属"本地恰好装着、干净环境才现形"那一类。
+python-multipart>=0.0.20
 uvicorn>=0.30
 httpx>=0.27
 

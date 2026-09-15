@@ -416,5 +416,71 @@ class TestOpenaiGate(unittest.TestCase):
         self.assertEqual(r.json()["status"], "queued")
 
 
+class TestMultipartDependency(unittest.TestCase):
+    """★ multipart 依赖必须**显式声明** —— "本地恰好装着、干净环境才现形"的典型。
+
+    2026-09-15 实测：`request.form()` 在 starlette 里是**可选**能力，缺
+    `python-multipart` 时**不是导入期报错**，而是**第一个 multipart 请求**才抛
+    `AssertionError: The python-multipart library must be installed to use form parsing`。
+    本地 venv 恰好装着（0.0.32）⇒ 550 项全绿；CI 的干净环境 **6 项失败**、镜像同样缺
+    （Dockerfile 只装 `requirements.txt`）⇒ 整条发版流水线红。
+
+    门禁把"依赖从哪来"钉在**声明**上：只要生产代码解析表单，`requirements.txt` 就必须
+    有这一行，**同时**声明不许是死的（反向断言）——`pytest`/`pyyaml` 那种"只进
+    requirements-dev"的做法在这里**不适用**：它在运行时真的会被用到。
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    @staticmethod
+    def declared_requirements(text: str) -> set:
+        """`requirements.txt` 里**真正声明**的包名（注释一律不算）。
+
+        为什么必须这么做：本文件的注释里也写了 "python-multipart"（解释它为什么必须声明），
+        用 `assertIn("python-multipart", 全文)` 去判 ⇒ **把声明删掉**的变异照样全绿。
+        这与 tests/test_minter_timezone.py 里 `apt_packages()` 是同一个坑（门禁被自己写的
+        文档骗过），项目里已踩过两次 —— 凡"扫清单"一律先剥注释。
+        """
+        import re
+
+        names = set()
+        for line in text.splitlines():
+            line = line.split(" #", 1)[0].strip()
+            if not line or line.startswith("#") or line.startswith("-"):
+                continue
+            m = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+            if m:
+                names.add(m.group(1).lower())
+        return names
+
+    def test_declared_in_requirements(self):
+        declared = self.declared_requirements(
+            (self.ROOT / "requirements.txt").read_text(encoding="utf-8"))
+        self.assertIn(
+            "python-multipart", declared,
+            "requirements.txt 缺 python-multipart ⇒ 干净环境（CI / 镜像）里第一条 "
+            "multipart 请求就会 AssertionError（详见该文件里的注释）："
+            "`request.form()` 是 starlette 的可选能力，不会被任何依赖自动带进来",
+        )
+
+    def test_importable_in_this_environment(self):
+        """本环境也得真装着：本地漏装时这条先红，而不是等到 CI 才红。"""
+        import importlib.util
+
+        self.assertTrue(
+            any(importlib.util.find_spec(n) for n in ("python_multipart", "multipart")),
+            "python-multipart 没装 ⇒ `pip install -r requirements.txt`",
+        )
+
+    def test_declaration_is_not_idle(self):
+        """反向：声明了就必须有生产代码真用它，否则是给镜像白加依赖。"""
+        code = (self.ROOT / "src" / "ark_compat" / "app.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "request.form()", code,
+            "requirements.txt 声明了 python-multipart，但 `app.py` 不再解析表单 ⇒ "
+            "要么恢复用法，要么把这条依赖删掉",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

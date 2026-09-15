@@ -33,6 +33,14 @@
 #
 #    为什么不挪进 requirements.txt：只有**编排/门禁类**检查用它，而 python:3.12-slim
 #    的镜像本来不带 —— 放进生产依赖等于给每个服务进程白加一个解析器。
+#
+# 4) python-multipart（2026-09-15，**同类但归生产依赖 —— 别搬到这里来**）
+#    OpenAI `/v1/videos` 要收 multipart 表单 ⇒ `app.py` 的 `request.form()` 需要它。
+#    同样是"本地恰好装着（0.0.32）、CI 与镜像才现形"：CI 干净环境 **6 项失败**
+#    （`AssertionError: The python-multipart library must be installed to use form parsing`）、
+#    镜像同样缺（Dockerfile 只装 requirements.txt）⇒ 整条流水线红。
+#    与上面三个的区别：**运行时真会用到** ⇒ 它属于 `requirements.txt`。
+#    门禁：`tests/test_openai_videos.py::TestMultipartDependency`（声明 + 反向"不许是死依赖"）。
 
 websocket-client>=1.7
 pytest>=8
