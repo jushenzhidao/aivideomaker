@@ -274,6 +274,53 @@ class RedactionCase(unittest.TestCase):
         err = self.assert_redacted(r, code="InvalidParameter")
         self.assertIn("bogus", err["message"], "我们自己的报文要留着'哪个值错了'")
 
+    # ---- 场景 6：站点把「套餐并发打满」报成 tRPC **500 + INTERNAL_SERVER_ERROR** ----
+    def test_upstream_500_queue_full_from_the_customer_report_leaks_nothing(self):
+        """客户报障原文（2026-09-16）：
+
+            INTERNAL_SERVER_ERROR status=500 — ai.minimaxH3: The queue is full.
+            The pro plan can only run 4 task at a time.
+
+        站点把并发打满报成 **tRPC 500 + `data.code=INTERNAL_SERVER_ERROR`**（见
+        `docs/web-reverse/TESTCASES.md` ④；premium 是 2、pro 是 4）。
+
+        🔴 这是一条**历史泄漏**的回归锚：`eeef9db` 之前 `_web_code_for` 是
+        `… else e.code` 兜底、message 直接给 `str(exc)` ⇒ 站点自己的错误码与原文**原样**
+        出现在出口（`code: "INTERNAL_SERVER_ERROR"` + `ai.minimaxH3: The queue is full…`）。
+        把 `_web_code_for` 的兜底改回 `e.code` 时本用例必须变红（已变异自证）。
+        """
+        raw = "ai.minimaxH3: The queue is full. The pro plan can only run 4 task at a time."
+
+        class QueueFullSite(FakeSite):
+            """只把创建 procedure 换成「站点 500 + INTERNAL_SERVER_ERROR」。"""
+
+            def _handle(self, request):
+                if request.url.path == "/api/ai.minimaxH3":
+                    self.requests.append(request)
+                    return httpx.Response(
+                        500,
+                        json=[{"error": {"json": {
+                            "message": raw,
+                            "data": {"code": "INTERNAL_SERVER_ERROR", "httpStatus": 500},
+                        }}}],
+                    )
+                return super()._handle(request)
+
+        site = QueueFullSite()
+        site.set("model.needsCaptcha", False)
+        self.app_with(make_client(site, user_id="u-test"))
+
+        r = self.post()
+        # 上游 500 不在我们对外放行的状态码白名单里 ⇒ 收敛成 502（别把上游的 500 当我们的 500）
+        self.assertEqual(r.status_code, 502, r.text)
+        self.assert_redacted(r, code="UpstreamError")
+        for token in ("INTERNAL_SERVER_ERROR", "queue is full", "pro plan", "4 task"):
+            self.assertNotIn(token, r.text, f"{token!r} 漏到出口了：{r.text}")
+        # 对偶：全量原文仍在 trace（脱敏只作用于出口）
+        span = self.spans("ark.create.submit")[0]["attributes"]
+        self.assertIn("queue is full", str(span.get("error", "")))
+        self.assertIn("ai.minimaxH3", str(span.get("error", "")))
+
 
 class TestClientMessagePhases(unittest.TestCase):
     """阶段区分：**调用方自己的素材** vs **上游自己**。
