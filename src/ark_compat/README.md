@@ -151,6 +151,7 @@ credential 管**上游解析**，两者用途不同、互不替代。
 | GET | `/api/v3/contents/generations/tasks/{id}` | 查询（实时回上游取；透传下**可不带凭据**，按创建时绑定的凭据取；TTL 缓存节流见下） |
 | POST | `/v1/videos` | 创建任务（**OpenAI v1/videos 形状**，见下节） |
 | GET | `/v1/videos/{id}` | 查询（OpenAI v1/videos 形状） |
+| GET | `{AVM_PUBLIC_PATH}/{name}` | **成片下载出口**（默认 `/v/{ark_id}.mp4`，见下节）。未配置 `AVM_PUBLIC_BASE` 时**不存在** |
 | GET | `/healthz` | 存活 + 上游可用性与计费口径；`?deep=1` 额外查上游 |
 
 ### `GET /api/v3/contents/generations/tasks/{id}` 的响应体
@@ -188,6 +189,64 @@ credential 管**上游解析**，两者用途不同、互不替代。
 门禁：[`tests/test_ark_task_schema.py`](../../tests/test_ark_task_schema.py) —— 两个字段集
 （官方全集 / 我们的收窄白名单）都**硬编码**在测试里，不引用实现的常量；否则把白名单改宽时
 "多出字段"那条断言会跟着放水（自引用门禁不可证伪）。
+
+## 成片对外出口：不暴露上游域名与模型名
+
+上游返回的成片是一个**公开直链**，实测形态（2026-09-16 取证）：
+
+```
+https://static2.img2video.ai/1789479777409-…-1635002_0_minimax_h3_1635002.mp4
+         └─── 域名：上游服务商 ───┘                └─ 上游**实际执行**的模型名 ─┘
+```
+
+原样透传等于一次泄露**三**样东西，第三条最隐蔽：
+
+| # | 泄露面 | 位置 | 备注 |
+|---|---|---|---|
+| ① | 上游域名 | URL | 直接指向上游服务商 |
+| ② | 上游实际模型名 | URL 的文件名 | 站点对调用方请求的模型名只是**回显**（见 `translate.normalize_web_task`） |
+| ③ | 同一个模型名 | 🔴 **响应头 `content-disposition`** | 上游回的是 `attachment; filename="…_0_minimax_h3_….mp4"` —— **只把 URL 换掉挡不住它**：只要还在转发上游响应头，每一次下载都会把模型名发出去 |
+
+上游还回 `server: cloudflare` / `cf-ray: …` / `nel` / `report-to` —— 这些同样能指认上游。
+
+配上 `AVM_PUBLIC_BASE` 之后：
+
+- `GET /tasks/{id}` 的 `content.video_url` 变成
+  `{AVM_PUBLIC_BASE}/v/cgt-20260916-a1b2c3d4.mp4` —— 路径里只有**本服务的任务 id**；
+- 取用（`GET /v/{name}`）时**才**回源上游，流式转发、不落盘 —— 没被取用的成片不占存储；
+- 响应头走**白名单**（`media_proxy._PASS_THROUGH`）：`content-disposition` 由我们重写，
+  `server` / `cf-ray` / `nel` 一律不透传。白名单而非黑名单 —— 上游以后新增什么头都不会
+  顺着这条管子漏出去（黑名单会静默失守）。
+
+### 下载端点的语义
+
+| 情形 | 状态码 | 说明 |
+|---|---|---|
+| 正常 | `200` / `206` | `Range` 原样透传（播放器会发它） |
+| 任务不存在 / 不属于本凭据 | `404` | 与任务查询同一套归属校验；刻意**不用 403** —— 那会透露"这条任务存在" |
+| 任务在、但还没出片 | `409` | 让调用方明白"不是没有，是还没好"，可以重试 |
+| 回源失败 / 上游 4xx-5xx | `502` / `404` | 报文只有一句通用描述，**不带**上游原文与主机名 |
+
+### 为什么不加密拼接 token
+
+脱敏的要害是"URL 里不含上游信息"，不透明 id 已经做到。加密要额外付三笔成本 ——
+**不可撤销**（除非轮换密钥，那会作废全部已发链接）、**无法与鉴权绑定**、**密钥即全局命门**
+（泄漏即全量泄漏）。它唯一换来的"无状态"在本服务已有一张任务表（`store.py`，7 天保留窗口）
+时没有价值。将来若真要抽成**不能持久化**的独立服务，才需要回到 token 方案。
+
+🔴 **绝不提供"传任意 URL 给我换一个链接"的接口** —— 那等于开放代理 + SSRF，还白送别人
+用你的带宽与出口 IP。下载地址只能由服务**自己**在观测到任务成功时给出（`app._apply_media_gate`），
+调用方无法指定源地址。
+
+### 对调用方的破坏性变更
+
+一旦配置 `AVM_PUBLIC_BASE`，**对外返回的成片地址就换了主机**。已按上游域名写过逻辑
+（域名白名单、签名校验、拼接下载）的调用方要跟着改。留空则不启用，行为与从前逐字节一致。
+
+门禁：[`tests/test_media_proxy.py`](../../tests/test_media_proxy.py) —— 覆盖响应头白名单、
+"响应体零上游痕迹"、归属校验、`404/409/502` 语义，并做了**五条变异自证**：把
+`content-disposition` 改回透传、把 `cf-ray` 塞进白名单、取消扩展名白名单、出口不换址、
+下载端点去掉归属校验 —— 每一条都会让测试变红（门禁可被证伪，否则等于没有）。
 
 ### 交互式文档
 
@@ -660,6 +719,7 @@ src/
     ├── minter.py            铸造服务客户端（取 Turnstile token；多地址轮询/故障转移）
     ├── sniff.py             magic bytes 媒体嗅探 + 图片尺寸
     ├── store.py             任务持久化（SQLite 默认 / 显式内存开关）
+    ├── media_proxy.py       成片对外出口（换成自有地址 + 流式回源 + 响应头白名单脱敏）
     ├── settings.py          环境变量配置（唯一集中解析处）
     ├── observability.py     loguru + logfire 装配（可失败降级）
     ├── app.py               FastAPI 路由与 Ark 错误信封
@@ -676,6 +736,7 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 ├── test_docs_billing_sync.py 文档里的免费秒数必须跟着 FREE_MAX_DURATION 走
 ├── test_seedance25_omni.py  Seedance 2.5 全能参考（截断、专属字段、前置拒绝；零外发）
 ├── test_openai_videos.py    OpenAI /v1/videos 兼容面（Chatfire 契约六字段；零外发）
+├── test_media_proxy.py      成片对外出口（响应头白名单、零上游痕迹、归属；含 5 条变异自证）
 ├── test_trace_contract.py   trace 属性契约（内存 exporter 捞 span 断言 + 凭证红线）
 ├── test_passthrough_cookie.py 透传（多租户隔离、缓存淘汰、闸门互斥）
 ├── test_task_store.py       任务持久化（跨实例可读 = 重启不丢）

@@ -71,6 +71,17 @@ def _parse_excluded_paths(raw):
     return tuple(p.strip() for p in v.split(",") if p.strip())
 
 
+def _normalize_media_path(raw) -> str:
+    """`AVM_PUBLIC_PATH` → `/xxx`。留空/只写斜杠 ⇒ 默认 `/v`（**不是** `/`）。
+
+    ⚠️ 写成 `/` 会让下载路由变成 `/{name}` —— 一条**通配**路径，把每一条未知路径都
+    吃掉，既遮蔽了正常的 404 语义，也等于给调用方多开一个入口。所以这里刻意不
+    允许退化成根。
+    """
+    value = str(raw or "").strip().strip("/")
+    return f"/{value}" if value else "/v"
+
+
 # ---------------------------------------------------------------- 鉴权（一个变量）--
 
 AUTH_OPEN = "open"                  # 不校验（本机自用）
@@ -261,6 +272,21 @@ class Settings:
     # 0 = 显式关闭（每次实时回上游，行为与旧版一致）。
     task_cache_ttl: float = 15.0
 
+    # ---- 成片对外出口（见 media_proxy）----
+    # 上游成片是一个**公开直链**，里面同时带着上游域名与上游**实际执行**的模型名
+    # （形如 `static2.img2video.ai/…_0_minimax_h3_….mp4`），响应头 `content-disposition`
+    # 里还重复一份模型名。配上本服务的对外基址后，`GET /tasks/{id}` 给出的
+    # `content.video_url` 会变成 `{public_base}/v/{ark_id}.mp4` —— 读不出任何上游信息；
+    # 取用时由本服务流式回源并**重写响应头**，三条泄露面一次关掉。
+    #
+    # 留空 = 功能关闭，行为与从前**逐字节一致**（原样透传上游链接）。
+    public_base: str = ""
+    # 成片下载端点的路径前缀（`AVM_PUBLIC_PATH`），默认 `/v`。
+    media_path: str = "/v"
+    # 回源的**空闲**超时（秒，`AVM_MEDIA_READ_TIMEOUT`）：两次读到字节之间超过它才算卡死。
+    # ⚠️ 刻意不用"总超时"：成片可以几百 MB，任何固定总时长都会变成"文件越大越容易失败"。
+    media_read_timeout: float = 60.0
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
         env = os.environ if env is None else env
@@ -303,6 +329,10 @@ class Settings:
             task_db=str(env.get("AVM_TASK_DB", DEFAULT_DB_PATH)).strip() or DEFAULT_DB_PATH,
             task_retention_days=int(env.get("AVM_TASK_RETENTION_DAYS") or DEFAULT_RETENTION_DAYS),
             task_cache_ttl=float(env.get("AVM_TASK_CACHE_TTL") or 15),
+            # 成片对外出口：留空 = 关闭（原样透传上游链接，行为与从前一致）
+            public_base=(env.get("AVM_PUBLIC_BASE") or "").strip().rstrip("/"),
+            media_path=_normalize_media_path(env.get("AVM_PUBLIC_PATH")),
+            media_read_timeout=float(env.get("AVM_MEDIA_READ_TIMEOUT") or 60),
             # 可观测性
             enable_logfire=not _env_flag(env, "AVM_DISABLE_LOGFIRE"),
             logfire_send=_parse_send(env.get("AVM_LOGFIRE_SEND", "if-token-present")),

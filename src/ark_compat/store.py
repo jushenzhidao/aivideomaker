@@ -70,6 +70,17 @@ def _belongs_to(entry: dict, owner: str | None) -> bool:
     return owner is None or (entry.get("owner") or "") == owner
 
 
+def build_patch_sql(fields: tuple) -> str:
+    """`json_set(entry, '$.a', json(?), '$.b', json(?))` + 尾部 `WHERE id = ?`。
+
+    用 `json_set` 而不是整条覆盖：**credential 列与未提到的字段都必须原样留着**。
+    这条纪律有前车之鉴 —— `put()` 走的是 `INSERT OR REPLACE`，整条覆盖会把
+    credential 列清成空串，凭据绑定静默失效。
+    """
+    clause = ", ".join(f"'$.{name}', json(?)" for name in fields)
+    return f"UPDATE tasks SET entry = json_set(entry, {clause}) WHERE id = ?"
+
+
 class MemoryTaskStore:
     """进程内存储。**只用于测试与显式本地调试**，重启即丢。"""
 
@@ -122,6 +133,19 @@ class MemoryTaskStore:
                 # 过期记录连同绑定的凭据一起清掉 —— 保留窗口的语义对两者一致
                 self._credentials.pop(k, None)
             return len(dead)
+
+    # ---- 局部更新 ----------------------------------------------------------
+
+    def patch(self, ark_id: str, **fields) -> None:
+        """只改提到的字段（见 `build_patch_sql`）。空 fields = 什么都不做。"""
+        if not fields:
+            return
+        with self._lock:
+            row = self._rows.get(ark_id)
+            if row is None:
+                return
+            for name, value in fields.items():
+                row[name] = value
 
     def describe(self) -> dict:
         return {"kind": self.kind, "path": ":memory:", "durable": False}
@@ -237,6 +261,20 @@ class SqliteTaskStore:
         with self._session() as conn:
             rows = conn.execute(sql, (*args, int(limit), int(offset))).fetchall()
         return [json.loads(r["entry"]) for r in rows]
+
+    # ---- 局部更新 ----------------------------------------------------------
+
+    def patch(self, ark_id: str, **fields) -> None:
+        """只改提到的字段，**保留 credential 列与其他字段**（见 `build_patch_sql`）。
+
+        典型用途：把成片的上游地址记回任务记录，让后续下载不必再查一次上游。
+        """
+        if not fields:
+            return
+        args = [json.dumps(v, ensure_ascii=False) for v in fields.values()]
+        args.append(ark_id)
+        with self._session() as conn:
+            conn.execute(build_patch_sql(tuple(fields)), args)
 
     def count(self, owner: str | None = None) -> int:
         sql = "SELECT COUNT(*) AS n FROM tasks"

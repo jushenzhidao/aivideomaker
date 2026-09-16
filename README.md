@@ -63,6 +63,7 @@ aivideomaker/
 ├── tools/                             运维与验证工具（零第三方依赖）
 │   ├── egress_audit.py                全量单测 + 零外发审计 + **零跳过**（CI 的测试门禁）
 │   ├── compose_wiring_check.py        编排接线校验（key 必须同源、回环绑定×桥接会被拦；`--resolve` 比对真实值）
+│   ├── env_sync_check.py              `.env` ⇄ `.env.example` 同步核验（**本机工具**：CI 里没有 `.env`）
 │   ├── turnstile_service.py           Turnstile 铸造**服务**（常驻，镜像是 Dockerfile.minter）
 │   └── turnstile_minter.py            铸造核心（Xvfb 有头 Chrome + 原生 CDP）
 ├── docs/
@@ -157,11 +158,13 @@ Seedance 2.5「全能参考」上限为**图 4 / 视频 1 / 音频 2**，超限�
 schema）。⚠️ 三者**不受** `AVM_AUTH` 保护（闸门模式下也无需凭据），且页面资源由**浏览器**
 从 CDN 取 —— 服务端返回 200 也可能白屏。详见 [`src/ark_compat/README.md`](src/ark_compat/README.md)。
 
-测试：`python3 -m unittest discover -s tests`（380+ 项，零消耗、零外发）。
+测试：`python3 -m unittest discover -s tests`（750+ 项，零消耗、零外发）。
 零外发可复验：`python3 tools/egress_audit.py`（有非回环出站、**或有用例被跳过**，都以非 0 退出
 —— 进 CI 的门禁**被跳过 ≠ 通过**，实测有一条编排门禁因此长期没跑过）。
 编排接线可复验：`python3 tools/compose_wiring_check.py`（部署前加 `--resolve` 用**解析后的真实值**
 再核一遍，见下方「部署」）。
+env 同步可复验：`python3 tools/env_sync_check.py`（`.env` ⇄ `.env.example` 的结构 / 取值 /
+消费方三件事；**只在有 `.env` 的机器上跑** —— 该文件不入库，故它进不了 CI）。
 完整说明见 [`src/ark_compat/README.md`](src/ark_compat/README.md)。
 
 ## 部署
@@ -375,4 +378,10 @@ stderr 日志不受影响。名单可用 `AVM_LOGFIRE_EXCLUDED_PATHS` 覆盖：*
   `AVM_AUTH`）：它们仍被代码读取，但只为了在启动期**拒绝**并在报错里给出迁移映射 ——
   故刻意不登记进模板（见该测试里的 `NOT_IN_TEMPLATE`）。
 - 批量或自动化调用一律先 dry-run 预检，并留意上方「验证码闸门」——连续提交会把它翻起来。
+- **成片地址默认原样透传上游直链**，而那条直链里同时带着**上游域名**与**上游实际执行的
+  模型名**（形如 `static2.img2video.ai/…_0_minimax_h3_….mp4`），它的响应头
+  `content-disposition` 里还有一份模型名。要对外交付时配 `AVM_PUBLIC_BASE`，成片地址会换成
+  `{AVM_PUBLIC_BASE}/v/{ark_id}.mp4` 并改由本服务流式回源（响应头白名单化）。
+  这是**对外破坏性变更**（主机变了），留空则不启用。详见
+  [`src/ark_compat/README.md`](src/ark_compat/README.md) 的「成片对外出口」一节。
 - `docs/web-reverse/captured/` 中为公开页面的抓取快照，仅用于离线分析。

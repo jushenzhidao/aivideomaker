@@ -179,6 +179,17 @@ services:
       # 终态永久复用。0 = 关闭。留空 = 代码默认 15s（`:-` 语义与其它可选项一致）。
       AVM_TASK_CACHE_TTL: ${AVM_TASK_CACHE_TTL:-}
 
+      # ---- 成片对外出口（脱敏，见 src/ark_compat/media_proxy.py）----
+      # 配上 AVM_PUBLIC_BASE 后，`GET /tasks/{id}` 给出的成片地址变成
+      # `{AVM_PUBLIC_BASE}/v/{ark_id}.mp4` —— 上游域名与上游实际模型名同时从
+      # 对外面消失；取用时才流式回源，并由本服务**重写响应头**（上游的
+      # `content-disposition` 里也带着模型名，只换 URL 挡不住它）。
+      # ⚠️ 留空 = 关闭（原样透传上游链接，行为与从前一致）。填就要填**完整 URL**：
+      #    它会原样写进响应体，也必须是外部**能访问到本容器**的那个地址（反代域名）。
+      AVM_PUBLIC_BASE: ${AVM_PUBLIC_BASE:-}
+      AVM_PUBLIC_PATH: ${AVM_PUBLIC_PATH:-}
+      AVM_MEDIA_READ_TIMEOUT: ${AVM_MEDIA_READ_TIMEOUT:-}
+
       # ---- 可观测性 ----
       LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
       AVM_LOGFIRE_SEND: ${AVM_LOGFIRE_SEND:-if-token-present}

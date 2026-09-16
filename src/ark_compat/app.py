@@ -69,7 +69,7 @@ import warnings
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import Depends, FastAPI, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from . import __version__
@@ -91,6 +91,7 @@ from .observability import (
     span,
     upstream_exchanges,
 )
+from .media_proxy import MediaProxy, MediaSourceError
 from .settings import Settings
 from .openai_videos import OPENAI_VIDEOS_PATH, ark_body_from_openai, openai_task_view
 from .sniff import sniff_file
@@ -503,6 +504,86 @@ class PollReportGate:
         self._seen[key] = rec
 
 
+# 成片出口（`/v/{ark_id}.mp4`）回源失败时对外的措辞。刻意**不含**任何上游信息
+# （域名 / procedure 名 / 上游原文一律不出口，与 `_upstream_client_message` 同一条纪律）。
+MEDIA_SOURCE_ERROR = "the video source is temporarily unavailable from this service"
+
+
+def _apply_media_gate(proxy, entry: dict, view: dict) -> dict:
+    """成片出口的**出口闸门**：上游 URL 永远不许出现在对外响应体里。
+
+    把 `content.video_url` 换成本服务自己的下载地址（`{public_base}/v/{ark_id}.mp4`）。
+    这是**恒等**替换 —— 与"有没有搬过"无关，所以任务状态照实上报 `succeeded`，
+    不必引入"成功了但拿不到地址"那种自相矛盾的中间态。
+
+    ⚠️ 返回**新 dict**：`view` 是查询缓存的浅拷贝，它的 `content` 仍是缓存里那一个
+    对象 —— 原地改会污染缓存，让后续请求拿到被改写过的视图，而且没有任何提示。
+    """
+    content = view.get("content")
+    source = content.get("video_url") if isinstance(content, dict) else None
+    if not source or str(view.get("status") or "") != "succeeded":
+        return view
+    out = dict(view)
+    # ⚠️ 只给 video_url。尾帧（`last_frame_url`）同样是上游 CDN 直链、且**不走**这条
+    #    出口 —— 宁可少一个可选字段，也不让一条未脱敏的上游链接从另一个键漏出去。
+    #    （上游目前根本不产出它，见 `translate.normalize_web_task`。）
+    out["content"] = {"video_url": proxy.download_url(entry["id"], source)}
+    return out
+
+
+def _remember_source_url(request: Request, entry: dict, view: dict) -> None:
+    """把成片的上游地址记进任务记录，供 `/v/{ark_id}.mp4` 回源时读。
+
+    两点刻意的取舍：
+
+    · **只在缺失时写一次**。这是一次 sqlite 写，而查询路径会被高频轮询（`task_cache`
+      TTL 15s）；每轮都写就变成"读缓存省下的开销又写回去"。
+    · **失败不冒泡**。这只是省一次回源查询的优化，写不进去时下载端点会退回
+      "当场查一次上游"，查询本身没有任何理由为此失败。
+
+    记的是**内部字段**（`entry["source_url"]`），不进响应体 —— 响应体字段由
+    `ark_task_view` 的白名单收窄，多出来的键只是在 sqlite 里躺着。
+    """
+    if entry.get("source_url"):
+        return
+    content = view.get("content")
+    url = content.get("video_url") if isinstance(content, dict) else None
+    if not url or str(view.get("status") or "") != "succeeded":
+        return
+    try:
+        request.app.state.tasks.patch(entry["id"], source_url=url)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("记下成片源地址失败 ark_id={} — {}", entry.get("id"), describe_error(e))
+        return
+    entry["source_url"] = url
+
+
+def _media_ext(name: str) -> str:
+    """`cgt-…-a1b2c3d4.mp4` → `.mp4`（取不到就 `.mp4`）。"""
+    _base, dot, ext = str(name or "").rpartition(".")
+    if dot and 1 <= len(ext) <= 5 and ext.isascii() and ext.isalnum():
+        return f".{ext.lower()}"
+    return ".mp4"
+
+
+def _strip_media_ext(name: str) -> str:
+    """`cgt-…-a1b2c3d4.mp4` → `cgt-…-a1b2c3d4`，用于按 id 查任务记录。
+
+    ark_id 形态固定（`cgt-<ts>-<hex8>`，不含点号），所以剥掉最后一段带点的后缀是
+    安全的；剥不动就原样返回 —— 查不到就是 404，不会误命中别的记录。
+    """
+    base, dot, ext = str(name or "").rpartition(".")
+    if dot and 1 <= len(ext) <= 5 and ext.isascii() and ext.isalnum():
+        return base
+    return str(name or "")
+
+
+def _media_summary(app: FastAPI) -> dict:
+    """`/healthz` 里的成片出口视图。**只报形态（开没开、基址），不含凭据**。"""
+    proxy = getattr(app.state, "media_proxy", None)
+    return proxy.describe() if proxy is not None else {"enabled": False}
+
+
 def _passthrough_web_upstream(request: Request, cookie: str):
     """按调用方凭据取（或建）一个 web 上游：同一凭据复用同一客户端与并发闸门。"""
     cache: dict = request.app.state.passthrough_web
@@ -831,6 +912,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         #    页面仍可能白屏——服务端日志**看不出**这个问题，别误判成路由没生效。
     )
     app.state.settings = settings
+
     app.state.upstreams = build_upstreams(settings, log=lambda m: logger.warning(m))
     # 透传的 web 上游（凭据指纹 -> upstream）。淘汰只挑空闲项（见 _sweep）。
     app.state.passthrough_web = {}
@@ -849,11 +931,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.task_cache = TaskViewCache(settings.task_cache_ttl)
     # 轮询上报闸门：同一任务**只有状态跃迁（含首次观测、失败）才留 span**
     app.state.poll_gate = PollReportGate()
+    # ---- 成片对外出口（见 media_proxy）----
+    # 上游直链里带着上游域名与**上游实际执行的模型名**，响应头 `content-disposition`
+    # 里还重复一份模型名。配上 `AVM_PUBLIC_BASE` 后对外只给 `{base}/v/{ark_id}.mp4`，
+    # 取用时流式回源并**重写响应头** —— 三条泄露面一次关掉。
+    # 未配置 ⇒ `enabled` 为 False，行为与从前逐字节一致。
+    app.state.media_proxy = MediaProxy(
+        public_base=settings.public_base,
+        path=settings.media_path,
+        trust_env=settings.trust_env,
+        read_timeout=settings.media_read_timeout,
+    )
     logger.info(
-        "上游就绪 available={} task_store={} task_cache_ttl={}s",
+        "上游就绪 available={} task_store={} task_cache_ttl={}s media_proxy={}",
         sorted(app.state.upstreams),
         app.state.tasks.describe(),
         settings.task_cache_ttl,
+        app.state.media_proxy.describe() if app.state.media_proxy.enabled else "off",
     )
 
     if logfire_ok:
@@ -973,6 +1067,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # 上报口径一眼可见：脱敏关着时请求/响应是原文，抓头开着则有凭证
             "logfire_scrubbing": bool(s.logfire_scrubbing),
             "logfire_capture_headers": bool(s.logfire_capture_headers),
+            # 成片出口：对外给的是不是本服务自己的地址（脱敏到底生没生效）。
+            # 只报形态，**不含任何凭据**；未配置时 `enabled=False`（= 原样透传上游链接）。
+            "media_proxy": _media_summary(request.app),
         }
         default = pool.get("web")
         if default is not None and getattr(default, "queue", None) is not None:
@@ -1257,11 +1354,85 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         view = await _task_view(request, entry, _upstream_for_task(request, entry))
         return openai_task_view(view, created_at_fallback=int(entry.get("createdAtMs") or 0) // 1000 or None)
 
+    # ---- 成片下载出口（见 media_proxy）------------------------------------
+    # 对外给出的成片地址形如 `{AVM_PUBLIC_BASE}/v/{ark_id}.mp4`：路径里只有本服务
+    # 的任务 id，读不出上游域名与模型名。取用时**鉴权 + 归属校验**，再流式回源，并把
+    # 响应头**白名单化**（上游的 `content-disposition` 里带着模型名，绝不透传）。
+    @app.get(settings.media_path + "/{name}")
+    async def download_media(name: str, request: Request, _: str = Depends(require_bearer)):
+        proxy = getattr(request.app.state, "media_proxy", None)
+        if proxy is None or not proxy.enabled:
+            raise ArkError(404, "TaskNotFound", f"media {name} not found")
+        entry = request.app.state.tasks.get(_strip_media_ext(name))
+        # ⚠️ 归属校验与任务查询**同一套**（`_visible`）：透传模式下 A 拿不到 B 的成片。
+        #    不通过时回 404 而不是 403 —— 与任务查询保持一致，"存在但无权限"本身
+        #    就是一条不该给出的信息。
+        if not _visible(request, entry):
+            raise ArkError(404, "TaskNotFound", f"media {name} not found")
+
+        source = await _source_url_for(request, entry)
+        if not source:
+            # 任务在、但还没有成片（或者说上游那条记录还没给出地址）。用 409 让调用方
+            # 明白"不是没有，是还没好"，可以重试 —— 与 404（不存在）刻意分开。
+            raise ArkError(
+                409,
+                "TaskNotReady",
+                f"task {entry['id']} has no finished video yet",
+            )
+
+        try:
+            stream = await asyncio.to_thread(
+                proxy.open, source, range_header=request.headers.get("range") or ""
+            )
+        except MediaSourceError as e:
+            logger.warning(
+                "成片回源失败 ark_id={} transport={}", entry["id"], e.transport or "-"
+            )
+            raise ArkError(502, "UpstreamError", MEDIA_SOURCE_ERROR) from None
+
+        if stream.status_code >= 400:
+            logger.warning("成片回源 HTTP {} ark_id={}", stream.status_code, entry["id"])
+            status = 404 if stream.status_code == 404 else 502
+            stream.close()
+            raise ArkError(status, "UpstreamError", MEDIA_SOURCE_ERROR)
+
+        return StreamingResponse(
+            stream,
+            status_code=stream.status_code,
+            headers=proxy.out_headers(
+                stream, ark_id=entry["id"], ext=_media_ext(name)
+            ),
+        )
+
+    async def _source_url_for(request: Request, entry: dict) -> str:
+        """成片的**上游**地址：优先用记录里存的那份，没有再当场查一次上游。
+
+        为什么要有第一条路径：查询路径已在高频轮询，顺手记下的 `source_url` 让下载
+        不必再打一次上游（E2E-AVM-011 之后轮询本来就该尽量少打上游）。
+        注意这里走的是 `_internal_view`（**未脱敏**的内部视图）—— 出口层会把地址
+        换成我们自己的，不能拿它去回源（会自己指回自己）。
+        """
+        cached = entry.get("source_url")
+        if cached:
+            return str(cached)
+        view = await _internal_view(request, entry, _upstream_for_task(request, entry))
+        content = view.get("content")
+        url = content.get("video_url") if isinstance(content, dict) else None
+        if url and str(view.get("status") or "") == "succeeded":
+            _remember_source_url(request, entry, view)
+            return str(url)
+        return ""
+
     # ⚠️ 刻意**没有** DELETE /tasks/{id}（2026-09-15 定）：上游没有取消端点，
     # "删本地记录"只会制造"任务没了"的错觉（跑着的照跑照扣）。对外接口面
     # 只有创建 + 查询；记录随保留窗口自然淘汰。
 
-    async def _task_view(request: Request, entry: dict, upstream) -> dict:
+    async def _internal_view(request: Request, entry: dict, upstream) -> dict:
+        """内部任务视图：取数（含节流缓存）+ 证据（span / 轮询闸门 / 内部字段）。
+
+        ⚠️ **不含出口脱敏** —— 这里的 `content.video_url` 仍是**上游直链**。
+        对外的那个地址由 `_task_view` 换；`/v/{ark_id}.mp4` 下载端点则直接用它回源。
+        """
         # 先看节流缓存：非终态 TTL 内复用、终态永久复用 —— 轮询的请求量不能
         # 原样打到上游（429 的主要来源，任务出片要 ~60s）。
         ark_id = entry["id"]
@@ -1370,6 +1541,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         view["effective"] = entry["effective"]
         view["warnings"] = entry["warnings"]
         view["unsupported"] = entry["unsupported"]
+        # 注：出口脱敏（上游 URL → 本服务地址）**不在这一层**。本函数只负责取数与
+        #     证据（节流缓存 / span / 内部字段），出口在 `_task_view` 那一层。
+        #     拆开是为了让 `/v/{ark_id}.mp4` 的下载端点复用同一份取数逻辑 ——
+        #     它要的正是**上游**地址，走出口层反而会被脱敏改写掉。
         # 说明：`generate_audio` 此前在这里"回显请求值"，现已删除 —— 站点根本不承接它，
         # 回显等于替上游承诺一件它没答应的事（2026-09-15 口径：值不确定的字段一律不给）。
         # 🔴 最后一跳收窄（`ark_task_view`）：只留官方 schema 里、且**我们真知道值**的字段
@@ -1382,6 +1557,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         #    证据不丢：`ark.task.fetch` span 上带着**裁剪前**的完整内部视图
         #    （`upstream_response`）、站点原始记录（`upstream_record`）以及
         #    `upstream_model` / `warnings` / `unsupported`，logfire 侧照常可查。
+        return view
+
+    async def _task_view(request: Request, entry: dict, upstream) -> dict:
+        """内部任务视图 → **对外响应体**：先脱敏换址，再走白名单收窄。
+
+        分两步是刻意的：`ark_task_view` 只认白名单，**过了它就没有再改写的机会** ——
+        所以出口脱敏（上游 URL → 本服务成片地址）必须发生在它之前，否则上游直链
+        会原样进响应体。未配置 `AVM_PUBLIC_BASE` 时这里是恒等变换。
+        """
+        view = await _internal_view(request, entry, upstream)
+        proxy = getattr(request.app.state, "media_proxy", None)
+        if proxy is not None and proxy.enabled:
+            # 顺手把上游地址记回任务记录，供 `/v/{ark_id}.mp4` 回源时读（只在缺失时写）
+            _remember_source_url(request, entry, view)
+            view = _apply_media_gate(proxy, entry, view)
         return ark_task_view(view)
 
     return app
