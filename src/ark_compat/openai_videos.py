@@ -14,7 +14,8 @@
 
     model     → 原样保留为请求模型；`_480p/_720p/_1080p` 后缀额外决定分辨率档位
     prompt    → content[] 里的 text 项
-    seconds   → duration（整数秒；越界由 translate 就近钳制并告警）
+    seconds   → duration（整数秒）—— ⚠️ **本端点按分辨率写死**（`PINNED_DURATIONS`）：
+                480p 一律 10s、720p 一律 8s；调用方显式传的值会被**覆盖**，且在 warnings 留痕
     size      → ratio（比例枚举原样；`keep_ratio` 与 `adaptive` 上游语义相同 = 跟随输入图）
     input_reference       → content[] 的 reference_image 项（1-4 张的上限截断由 translate 负责）
     first_frame_image     → content[] 的 first_frame 帧通道
@@ -34,11 +35,29 @@ from typing import Any, Mapping
 
 from .errors import ParamError
 from .sniff import sniff_file
+from .translate import DEFAULT_RESOLUTION
 
 OPENAI_VIDEOS_PATH = "/v1/videos"
 
 # model 名自带分辨率档位（Chatfire 枚举：doubao-seedance-1-0-pro_1080p 一类）。
 _RESOLUTION_SUFFIX_RE = re.compile(r"_(480p|720p|1080p)\s*$", re.I)
+
+# 分辨率 → **写死时长**（`/v1/videos` 专属）。语义是**无条件覆盖**调用方传的 `seconds`，
+# 不是"缺省值"、也不是"仅越界时吸附" —— 调用方写 15s / 20s / 5s 一样被改。
+#
+# 两条都落在站点**已实测免费**的组合上（口径来自真实任务记录，不是页面文案）：
+#   · `480p` → 10s：站点对 480p 只收**离散档位** `5 / 10 / 15 / 20`
+#     （`E2E-AVM-016` 真实提交 `480p/8s` ⇒ `480p supports 5s, 10s, 15s, or 20s duration.`），
+#     9s 这类值连任务都建不起来；10s 是这四档里**已实测 `paid=false`** 的最长档。
+#   · `720p` → 8s：合法时长连续 `5–20`，但免费线**到 8s 为止**（8s 实测 `paid=false`，
+#     9s / 10s 实测 `paid=true`）⇒ 8s 是免费区内最长的一档。
+# ⇒ 等价于「把 `/v1/videos` 钉死在免费区」，也是该端点 `billed=false` 恒成立的原因。
+# 🔴 改这张表 = 改对外计费口径 ⇒ 必须同步 README 与计费门禁（`test_free_window.py` 一族）。
+PINNED_DURATIONS: dict[str, int] = {"480p": 10, "720p": 8}
+
+# 未命中 `PINNED_DURATIONS` 的分辨率（当前只有 `1080p`）**按调用方原值透传**：
+# 1080p 既没实测出免费线、也不是离散档位，凭猜写死等于引入"请求 15s 实际拿 5s"
+# 这种静默改档 —— 本层最该避免的正是它。
 
 # size 枚举 → Ark ratio。keep_ratio / adaptive 都表示"由输入图决定"，上游不区分二者。
 _SIZE_RATIOS = ("16:9", "4:3", "1:1", "3:4", "9:16", "21:9")
@@ -219,6 +238,23 @@ def ark_body_from_openai(fields: Mapping[str, Any], *, reference_format: str = "
         resolution = m.group(1).lower()
 
     duration = _seconds_to_duration(fields.get("seconds"))
+
+    # 「写死时长」：按分辨率覆盖 `seconds`（**无条件**，含调用方显式传值；表见上）。
+    # ⚠️ 查表的键必须是**最终生效**的分辨率，而不是 `resolution`：本函数里 resolution 只可能
+    #    来自 model 后缀，缺后缀时 body 里没有这个键、下游按 `DEFAULT_RESOLUTION` 兜底 ⇒
+    #    若按 `resolution` 直接查表，同一个 720p 请求会因"model 写没写后缀"分成
+    #    "被钉住"与"没钉住"两种结果（9s 一次免费、一次计费），而调用方看不出差别。
+    res_key = resolution or DEFAULT_RESOLUTION
+    pinned = PINNED_DURATIONS.get(res_key)
+    if pinned is not None:
+        if duration is None:
+            notes.append(f"seconds omitted — this endpoint pins {res_key} to {pinned}s")
+        elif duration != pinned:
+            notes.append(
+                f"seconds={duration} overridden to {pinned}s: this endpoint fixes the duration "
+                f"per resolution ({res_key} → {pinned}s)"
+            )
+        duration = pinned
 
     ratio, size_notes = size_to_ratio(fields.get("size"))
     notes.extend(size_notes)

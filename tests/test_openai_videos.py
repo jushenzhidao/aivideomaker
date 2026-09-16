@@ -131,8 +131,12 @@ class TestArkBodyFromOpenai(unittest.TestCase):
         self.assertNotIn("resolution", body)
 
     def test_seconds_string_and_int(self):
+        # ⚠️ 载具必须选**未被写死映射覆盖**的分辨率（当前只有 1080p）：本用例考的是
+        #    "字符串/整数都能解析成秒"，而 480p / 720p（含**无后缀** ⇒ 下游按 720p 兜底）
+        #    的时长会被 `PINNED_DURATIONS` 覆盖 ⇒ 拿它们当载具，测的其实是映射、不是解析。
+        #    2026-09-17 实测踩中：`seconds="12"` 在无后缀模型上得到 8 而非 12。
         for v, want in (("8", 8), (8, 8), ("12", 12)):
-            body, _ = ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "seconds": v})
+            body, _ = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "seconds": v})
             self.assertEqual(body["duration"], want)
 
     def test_seconds_non_integer_is_rejected(self):
@@ -142,7 +146,9 @@ class TestArkBodyFromOpenai(unittest.TestCase):
             ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "seconds": "5.5"})
 
     def test_size_ratio_passthrough(self):
-        body, notes = ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "size": "9:16"})
+        # 载具同上（1080p）：把「size 映射」与**被写死的时长**隔离开。否则 `notes` 里会
+        # 多出一条时长映射说明，`assertEqual(notes, [])` 就不再是在考 size 了。
+        body, notes = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "size": "9:16"})
         self.assertEqual(body["ratio"], "9:16")
         self.assertEqual(notes, [])
 

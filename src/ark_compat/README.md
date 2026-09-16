@@ -290,7 +290,7 @@ Seedance」的两份 OpenAPI（[创建](https://oneapis.apifox.cn/369966278e0) /
 | `GET /v1/videos/{id}` | `{"id", "object": "video", "status", "progress", "video_url", "created_at"}` |
 
 请求字段映射：`model` 原样保留（`_480p/_720p/_1080p` 后缀决定分辨率档位）；
-`prompt` → 提示词；`seconds` → 时长；`size` → 宽高比（`keep_ratio`/`adaptive`
+`prompt` → 提示词；`size` → 宽高比（`keep_ratio`/`adaptive`
 上游语义相同 = 跟随输入图，映射会留痕）；`first_frame_image` / `last_frame_image` → 首/尾帧
 （**只收单值**：给成数组一律 400 —— 参考素材静默丢失是本项目的红线）；
 `input_reference` → **参考图列表**（≤4 张，超限截断并**点名丢掉哪一张**），三种形态都收：
@@ -322,6 +322,22 @@ status 词表：`queued` / `in_progress` / `completed` / `failed`；`progress` �
 终态成功时是 100（上游没有可读百分比，不编造中间值）；`video_url` 仅 `completed`
 且有产出时给值。鉴权、计费口径、dry-run、凭据绑定与方舟线**完全一致**
 （`X-Avm-Dry-Run: 1` 照常可用）。
+
+🔴 **时长是写死的，不是"缺省值"**（2026-09-17 用户口径）：本端点按分辨率**无条件覆盖**
+调用方传的 `seconds` —— 表 = `openai_videos.PINNED_DURATIONS`：
+
+| 请求分辨率 | 实际时长 | 依据 |
+|---|---|---|
+| `480p` | **10 秒** | 站点对 480p 只收**离散档位** `5 / 10 / 15 / 20`（`E2E-AVM-016` 真实提交 `480p/8s` ⇒ `480p supports 5s, 10s, 15s, or 20s duration.`）；10 秒是其中**已实测 `paid=false`** 的最长档 |
+| `720p` | **8 秒** | 合法时长连续，但免费线**到 8 秒为止**（8 秒实测 `paid=false`；9 / 10 秒实测 `paid=true`）⇒ 8 秒是免费区内最长的一档 |
+| `1080p` | 调用方原值 | **不在表内**：免费线未实测、也不是离散档位 ⇒ 凭猜写死等于引入"请求 15 秒实际拿 5 秒"这种静默改档（该请求照旧可能计费） |
+
+`model` 名**不带**分辨率后缀时同样是 `720p`（下游按 `DEFAULT_RESOLUTION` 兜底）⇒ 一样钉到
+8 秒。否则同一个 720p 请求会因"model 写没写后缀"分成**免费与计费两种结果**，而调用方从
+报文里看不出差别。被改写（`seconds=15 overridden to 8s`）与被补默认值（`seconds omitted`）
+都在 `warnings` 里留痕；传的值与表值一致时**不发声**（否则每次请求都带一条告警，
+告警会被读成噪声）。门禁：`tests/test_openai_pinned_duration.py` —— 时长改写与
+**计费结论**两条一起断言（只钉时长会漏掉"钉了却仍在计费区"）。
 
 ⚠️ 刻意没有 `DELETE /v1/videos/{id}`：站点没有取消端点，理由同上。
 

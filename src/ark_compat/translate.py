@@ -35,6 +35,13 @@ from .errors import ParamError
 ARK_RATIOS = frozenset({"16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"})
 ARK_RESOLUTIONS = frozenset({"480p", "720p", "1080p"})
 
+#: 调用方未点名分辨率时代入的站点档位。**唯一真源**。
+#  `translate_create` 与 `openai_videos` 都要用它：前者靠它定档位，后者靠它算
+#  「写死时长」该按哪个分辨率查表（`/v1/videos` 的 resolution 只可能来自 model 后缀，
+#  缺后缀时请求体里根本没有这个键，而下游会按本常量兜底）。
+#  ⚠️ 两边各写一个字面量是必然漂移的写法 —— 曾经就是两处独立的 `"720p"`。
+DEFAULT_RESOLUTION = "720p"
+
 # 🔴 2026-09-16 **顶部更正：本表对 `480p` 是错的**（真实提交实测，报告 `E2E-AVM-016`）
 #
 #   站点对 **480p 只收离散的 `5 / 10 / 15 / 20`**。站点原话（真实提交被拒时返回）：
@@ -313,7 +320,10 @@ def translate_create(
     if ratio and ratio != "adaptive":
         aspect = ratio
 
-    resolution = "720p"
+    # 未点名分辨率 ⇒ `DEFAULT_RESOLUTION`（**不要**在这里写 `"720p"` 字面量：
+    # `openai_videos` 的「写死时长」表也按同一个常量查键，两处不一致会出现
+    # "同一个 720p 请求、一个被钉住另一个没钉"这种只差一个字面量的隐形分歧）。
+    resolution = DEFAULT_RESOLUTION
     if body.get("resolution") not in (None, ""):
         r = str(body["resolution"]).strip()
         if r not in ARK_RESOLUTIONS:
