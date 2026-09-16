@@ -265,6 +265,13 @@ https://static2.img2video.ai/1789479777409-…-1635002_0_minimax_h3_1635002.mp4
 FastAPI 自动注册的文档路由上 —— 即使在闸门模式（`AVM_AUTH=key:…`）下也**不需要**凭据。
 要保护它们得额外加中间件，别误以为"挂了闸门就顺带挡住了文档"。
 
+> **2026-09-16 决定：这三条保持公开，不在应用层加鉴权。** 理由很直接 —— 文档的价值就在
+> "不带凭据也能打开"，在应用层加门会把最常用的调试路径一起挡住，而它挡不住真正想看的人
+> （那类人本来就有凭据）。**但"公开"意味着可见范围必须由部署层决定**：实例要对外时，
+> 在反向代理上处置 `/docs` `/redoc` `/openapi.json`（限来源网段 / 加 Basic Auth / 直接 404）。
+> 这是**部署决策**，代码侧不替你做，也不会代你判断"这个实例算不算对外"。
+> 该口径由 livetest 报告 `E2E-AVM-015` 提出（它建议"结合自身鉴权策略评估是否需要收"）。
+
 🔴 页面里的 JS/CSS 由**浏览器**从 `cdn.jsdelivr.net` 取（ReDoc 还额外拉 Google Fonts 字体）。
 服务端一切正常、`/docs` 明明返回 200，浏览器到不了该 CDN 时**照样白屏**，
 而**日志里没有任何线索** —— 别据此判成"路由没生效"或"服务坏了"。要彻底消除这个外部
@@ -375,18 +382,95 @@ AVM_TASK_STORE=memory      # 显式开发/测试开关：重启即丢
 
 | Ark 字段 | 处理 |
 |---|---|
-| `model` | → 站点模型（**任何** Ark 模型名都映射到站点侧的默认入口） |
+| `model` | **参与路由**（决定上游 procedure）。判定顺序：渠道映射表精确命中 → 名字本身是上游槽位（**默认透传**）→ 渠道映射表通配命中 → 渠道钉住值 → **400**。键与语义见 `docs/channel-options-model.md`；值**不进上游请求体**（站点把模型编在 procedure 路径上）—— 唯一另有副作用的是 `/v1/videos` 面的 `_480p`/`_720p`/`_1080p` 后缀（解析成 `resolution`，**先剥掉再比对槽位**）。**未命中不再静默落到 `ai.minimaxH3`**（迁移见下方「模型映射」） |
 | `content[].type=text` | 多条用 `\n` 连接 → `content` |
 | `content[].type=image_url` | `role=first_frame`/`last_frame` 走帧通道；`reference_image` 或无 role 进 `referenceImageUrls` |
 | `content[].type=video_url` | → `referenceVideoUrl`（单槽位） |
 | `content[].type=audio_url` | → `referenceAudioUrls` |
 | `ratio` | → `aspectRatio`（站点字段名）；`adaptive` 表示跟随源图，不设值 |
-| `resolution` | 480p/720p/1080p 原样透传 |
-| `duration` | 站点约束是「**连续秒数 + 上限**」，因此**原样透传**（越界才就近钳制）；`-1` 目前在翻译层落 5s |
+| `resolution` | 严格枚举 `480p`/`720p`/`1080p`，**大小写敏感**（`480P` / `4k` / 数字 `720` 一律 400）；缺省或空串 → **`720p`**；校验通过后原样透传 |
+| `duration` | 站点约束是「**连续秒数 + 上限**」，因此**原样透传**（越界才就近钳制到 `[5, 20]`）；缺省 → **5**；`-1` 落 5s（带告警）；小数**截断**（`7.5`→`7`，不是四舍五入）；`frames` 按 24fps 换算且**优先级低于** `duration` |
 | `frames` | 按 24fps 换算成秒 |
 | `omni_reference_task_type` | `reference`/`auto` 放行；`edit`/`extend` 上游无此能力 → **真实提交 400**（dry-run 仍可校验） |
 | `output_format` | `mp4` 放行；`mov` 上游只出 mp4，带显式告警 |
 | `generate_audio` | 站点**没有这个开关** —— 记录并回显，同时说明音画由上游决定 |
+
+### 模型映射（**已落地**，2026-09-17）
+
+`model` **是路由键**：它决定上游 procedure（`ai.<槽位>`）。键与语义的**唯一权威表述**在
+[`docs/channel-options-model.md`](../../docs/channel-options-model.md)（与 video-adapter **共用一套**，
+那边的原始出处是 `ADR-012`）。实现落在 `src/ark_compat/channel_options.py`。
+
+```jsonc
+// 渠道级头（逐渠道声明"哪个名字落哪个槽位"）
+X-Channel-Options: {"model_map": {"doubao-seedance-2-0-260128": "seedance20",
+                                  "doubao-seedance-*": "seedance25",
+                                  "*": "minimaxH3"}}
+X-Channel-Options: {"model": "minimaxH3"}      // 钉住：表外名字落这一档
+```
+
+判定顺序：① 映射**精确**命中 → ② 名字本身是上游槽位（**默认透传**）→ ③ 映射**通配**命中
+（特异性最长、与书写顺序无关）→ ④ 渠道**钉住** → ⑤ **400**（报文给出已知槽位与表里已声明的键）。
+每一步都进 `warnings`，并留下证据字段 `effective.model` / `.model_source` / `.model_verified`、
+`web_params.procedure`、span `ark.create.submit` 的 `upstream_slot`。
+
+🔴 **这是对外契约变更**：改动前"任意模型名都通过（一律走 `ai.minimaxH3`）"，现在
+**未命中即 400**（且发生在任何上游请求之前）。要恢复旧行为，给渠道配
+`{"model": "minimaxH3"}` 或 `{"model_map": {"*": "minimaxH3"}}`。
+
+**仍未做完的前置（本实现的一处已知假设）：**
+
+1. **站点 11 个模型的 procedure 清单还没拿到** ⇒ `procedure_for_slot()` 里的 `ai.<槽位>` 是
+   **按命名形态推断**（全站只实测出 `ai.minimaxH3`）。映射到非 `minimaxH3` 槽位时若名字不对，
+   表现为上游 NOT_FOUND（显式失败、不建任务、不计费）；证据字段会标 `model_verified=false`
+   并在 `warnings` 里说明。清单到手后把推断换成**表**，并让表里没有的槽位直接被拒。
+2. **每个模型的能力上限各不相同**，不能假定与 `ai.minimaxH3` 同形 —— 站点文案里
+   `veo31Fast` 支持 **4K**、`seedance25` 上限 **20s**、`seedance20` 上限 **15s**、
+   `wan27` 只给 **720P/1080P** ⇒ 拿到清单时**必须同时带上 per-model 的
+   `duration` / `resolution` 合法域**，否则一次映射就会静默把越界值发给上游。
+   现行 `duration`/`resolution` 校验仍是全局 `[5,20]` × `480p/720p/1080p`。
+
+⚠️ **不要**凭站点回显的 `aiModel` 反推映射：站点对请求模型名只是回显，回显值 ≠ 实际执行模型
+（`tests/test_upstream_model_visibility.py` 钉住这条事实）。
+
+门禁：`tests/test_channel_model_map_wildcard.py`（纯函数层）+
+`tests/test_channel_model_wiring.py`（接线层：真 `WebClient` + 站点替身，断言解析结果真的变成
+上游 URL）。两条都做过变异自证。
+
+### 已知缺陷：非法**类型**的 `duration` / `frames` 落 500（**按口径暂不修，仅登记**）
+
+`translate_create` 里 `duration` 与 `frames` 直接 `float(...)`，抛出的 `TypeError` /
+`ValueError` **没有 handler 接** —— app 只注册了 `ArkError` / `ParamError` /
+`WebApiError` 三个异常处理器。⇒ 非法**类型**的入参走 **500 Internal Server Error**，
+而不是 400 `InvalidParameter`：
+
+| 入参 | 现状（实测） | 应为 |
+|---|---|---|
+| `duration="abc"` / `"1.2.3"` | **500**（ValueError） | 400 `InvalidParameter` |
+| `duration=[]` / `{}` / `["5"]` | **500**（TypeError） | 400 `InvalidParameter` |
+| `frames="abc"` / `[]` / `{}` | **500** | 400 `InvalidParameter` |
+| **`frames=""`** | **500** | 400，或按 `duration` 的口径当"没传" |
+| `duration=true` | 200，静默当 `1s` 再吸附成 5s | 保留现状 |
+| `duration="8"` | 200，接受字符串数字（**无任何告警**） | 保留现状 |
+
+**2026-09-16 用户口径：以上一律"先不修"，仅在此登记备查。** 所以本表是**现状说明**、
+不是待办清单 —— 动这些行为需要重新拍板（修 500 会改对外错误码，属契约变更）。
+
+三条附带证据，供将来动手时省一次排查：
+
+1. **危害不是"少一个 400"，而是归因被颠倒** —— 调用方看到 5xx 会去查服务端故障、去重试、
+   去告警，真相却是它自己传错了；同时监控里的 5xx 被污染，SLO 与告警阈值一起失真。
+2. 🔴 **`frames=""` 还暴露出一条不对称**：`duration` 判 `not in (None, "")`（`""` = 没传），
+   而 `frames` 只判 `is not None` ⇒ 同一个空值在两条**平行**解析路径上语义不同。
+   「两条平行路径只有一处做了某件事」正是本文件反复踩的一类病根（另见 `resolution` 那行）。
+3. 🔴 **当时 758 条测试全绿也照漏**：用例断言的是合法输入的正确输出，非法**类型**从来不在
+   集合里。要修就得**同时**补门禁，且门禁必须断言**状态码 4xx** —— 纯函数层直调只看得到
+   `ValueError` 冒出来，看不到它最终变成 500。⚠️ 修法**不要**改成在全局 handler 里
+   catch-all `ValueError → 400`：那会把服务端自己的 bug（如 `int(None)`、上游响应结构变化）
+   也伪装成客户端错误，是方向相反的同一类病。
+
+对照：OpenAI 面的 `seconds` 走 `_seconds_to_duration`，**已正确**抛 `ParamError`
+（`seconds="abc"` → 400）—— 同一个服务里两条时长路径**只有一条是对的**。
 
 ### 适配层的扩展开关（`extra_body.aivideomaker_*`）
 
@@ -449,6 +533,19 @@ first/last frame`），混用时适配层直接 400，不再让上游拒绝。
 
 判据只有一个：站点任务记录里的 **`paid`** 字段（`credits` 与它**反相** ——
 免费任务也记 `credits`，不要拿它判断）。
+
+🔴 **但 `paid` 不在对外响应体里**（0.0.27 起）：`GET /tasks/{id}` 按官方 schema 收窄，
+`usage` 整块不下发（见「路由」的响应体白名单）⇒ **别再找任务响应里的 `usage`**，
+那里永远没有，而它的缺席**不是**"没计费"的证据（结论恰好相反的那种误读）。
+想自查某条任务花没花钱，只有两个权威口径：
+
+| 口径 | 做法 | 前提 |
+|---|---|---|
+| **余额前后差** | `GET /healthz?deep=1` 取 `balance`：提交前记一次、出片后再记一次，**差值即花费**（免费组合差 0） | 本进程在上游侧有可用凭据 |
+| trace 属性 | `ark.task.fetch` span 的 `paid` | 挂了 Logfire |
+
+`/healthz` 的 `billing_check` 字段会**自述这两条**（`usage_in_task_response: false` + `how`），
+运维不必翻到这一节 —— 加它的直接原因是 livetest 报告 `E2E-AVM-015` 提的那条告警。
 
 响应里的 `effective.billed` 会预告是否计费，并附一句 `billing_note`。
 `extra_body.aivideomaker_prefer_free=true` 是省钱开关：把超过 10s 的**合法**时长

@@ -115,9 +115,9 @@ class TestArkBodyFromOpenai(unittest.TestCase):
 
     def test_minimal_form(self):
         body, notes = ark_body_from_openai(
-            {"model": "doubao-seedance-1-0-pro_1080p", "prompt": "360度环绕运镜"}
+            {"model": "minimaxH3_1080p", "prompt": "360度环绕运镜"}
         )
-        self.assertEqual(body["model"], "doubao-seedance-1-0-pro_1080p")
+        self.assertEqual(body["model"], "minimaxH3_1080p")
         self.assertEqual(body["content"], [{"type": "text", "text": "360度环绕运镜"}])
         # 分辨率来自 model 名的档位后缀
         self.assertEqual(body["resolution"], "1080p")
@@ -132,41 +132,41 @@ class TestArkBodyFromOpenai(unittest.TestCase):
 
     def test_seconds_string_and_int(self):
         for v, want in (("8", 8), (8, 8), ("12", 12)):
-            body, _ = ark_body_from_openai({"model": "m", "prompt": "p", "seconds": v})
+            body, _ = ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "seconds": v})
             self.assertEqual(body["duration"], want)
 
     def test_seconds_non_integer_is_rejected(self):
         with self.assertRaises(ParamError):
-            ark_body_from_openai({"model": "m", "prompt": "p", "seconds": "abc"})
+            ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "seconds": "abc"})
         with self.assertRaises(ParamError):
-            ark_body_from_openai({"model": "m", "prompt": "p", "seconds": "5.5"})
+            ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "seconds": "5.5"})
 
     def test_size_ratio_passthrough(self):
-        body, notes = ark_body_from_openai({"model": "m", "prompt": "p", "size": "9:16"})
+        body, notes = ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "size": "9:16"})
         self.assertEqual(body["ratio"], "9:16")
         self.assertEqual(notes, [])
 
     def test_size_keep_ratio_maps_to_adaptive_with_a_note(self):
-        body, notes = ark_body_from_openai({"model": "m", "prompt": "p", "size": "keep_ratio"})
+        body, notes = ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "size": "keep_ratio"})
         self.assertEqual(body["ratio"], "adaptive")
         self.assertTrue(any("keep_ratio" in n and "adaptive" in n for n in notes))
 
     def test_size_wxh_maps_to_reduced_ratio(self):
-        body, notes = ark_body_from_openai({"model": "m", "prompt": "p", "size": "1920x1080"})
+        body, notes = ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "size": "1920x1080"})
         self.assertEqual(body["ratio"], "16:9")
         self.assertTrue(any("1920x1080" in n and "16:9" in n for n in notes))
 
     def test_unknown_size_falls_through_to_translate_validation(self):
-        body, _ = ark_body_from_openai({"model": "m", "prompt": "p", "size": "5:4"})
+        body, _ = ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "size": "5:4"})
         with self.assertRaises(ParamError):
             translate_create(body)
 
     def test_input_reference_single_string_and_list(self):
         body, _ = ark_body_from_openai(
-            {"model": "m", "prompt": "p", "input_reference": "https://x/a.jpg"}
+            {"model": "minimaxH3", "prompt": "p", "input_reference": "https://x/a.jpg"}
         )
         body2, _ = ark_body_from_openai(
-            {"model": "m", "prompt": "p", "input_reference": ["https://x/a.jpg", "https://x/b.jpg"]}
+            {"model": "minimaxH3", "prompt": "p", "input_reference": ["https://x/a.jpg", "https://x/b.jpg"]}
         )
         for b in (body, body2):
             self.assertEqual(b["content"][0], {"type": "text", "text": "p"})
@@ -180,7 +180,7 @@ class TestArkBodyFromOpenai(unittest.TestCase):
     def test_input_reference_empty_string_is_absent(self):
         """Chatfire 的 curl 惯例：不用的字段传空串。"""
         body, _ = ark_body_from_openai(
-            {"model": "m", "prompt": "p", "input_reference": "", "first_frame_image": ""}
+            {"model": "minimaxH3", "prompt": "p", "input_reference": "", "first_frame_image": ""}
         )
         self.assertEqual(len(body["content"]), 1)
 
@@ -192,7 +192,7 @@ class TestArkBodyFromOpenai(unittest.TestCase):
         （实测：旧行为下 `warnings` 里一个字都没有）。
         """
         body, notes = ark_body_from_openai(
-            {"model": "m", "prompt": "p",
+            {"model": "minimaxH3", "prompt": "p",
              "input_reference": '["https://x/a.png","https://x/b.png"]'}
         )
         urls = [c["image_url"]["url"] for c in body["content"] if c.get("type") == "image_url"]
@@ -203,7 +203,7 @@ class TestArkBodyFromOpenai(unittest.TestCase):
         """看着像数组但不是合法 JSON ⇒ **明确拒**（不许当成一个 URL 用）。"""
         with self.assertRaises(ParamError) as ctx:
             ark_body_from_openai(
-                {"model": "m", "prompt": "p", "input_reference": '["https://x/a.png"'}
+                {"model": "minimaxH3", "prompt": "p", "input_reference": '["https://x/a.png"'}
             )
         self.assertIn("合法 JSON", str(ctx.exception))
 
@@ -215,14 +215,14 @@ class TestArkBodyFromOpenai(unittest.TestCase):
         """
         with self.assertRaises(ParamError) as ctx:
             ark_body_from_openai(
-                {"model": "m", "prompt": "p", "first_frame_image": ["https://x/f.png"]}
+                {"model": "minimaxH3", "prompt": "p", "first_frame_image": ["https://x/f.png"]}
             )
         self.assertIn("不接受数组", str(ctx.exception))
 
     def test_first_and_last_frame(self):
         body, _ = ark_body_from_openai(
             {
-                "model": "m",
+                "model": "minimaxH3",
                 "prompt": "p",
                 "first_frame_image": "https://x/f.png",
                 "last_frame_image": "https://x/l.png",
@@ -236,7 +236,7 @@ class TestArkBodyFromOpenai(unittest.TestCase):
         """首帧/首尾帧与参考图互斥 —— 上游硬约束，由 translate_create 前置 400。"""
         body, _ = ark_body_from_openai(
             {
-                "model": "m",
+                "model": "minimaxH3",
                 "prompt": "p",
                 "first_frame_image": "https://x/f.png",
                 "input_reference": ["https://x/r.png"],
@@ -248,7 +248,7 @@ class TestArkBodyFromOpenai(unittest.TestCase):
     def test_b64_reference_becomes_a_data_uri_with_sniffed_mime(self):
         b64 = base64.b64encode(png_bytes()).decode()
         body, _ = ark_body_from_openai(
-            {"model": "m", "prompt": "p", "input_reference": b64}, reference_format="b64"
+            {"model": "minimaxH3", "prompt": "p", "input_reference": b64}, reference_format="b64"
         )
         url = body["content"][1]["image_url"]["url"]
         self.assertTrue(url.startswith("data:image/png;base64,"))
@@ -256,13 +256,13 @@ class TestArkBodyFromOpenai(unittest.TestCase):
     def test_invalid_b64_is_a_clean_400(self):
         with self.assertRaises(ParamError):
             ark_body_from_openai(
-                {"model": "m", "prompt": "p", "input_reference": "!!!not-b64!!!"},
+                {"model": "minimaxH3", "prompt": "p", "input_reference": "!!!not-b64!!!"},
                 reference_format="b64",
             )
 
     def test_urls_survive_b64_mode(self):
         body, _ = ark_body_from_openai(
-            {"model": "m", "prompt": "p", "input_reference": "https://x/a.jpg"},
+            {"model": "minimaxH3", "prompt": "p", "input_reference": "https://x/a.jpg"},
             reference_format="b64",
         )
         self.assertEqual(body["content"][1]["image_url"]["url"], "https://x/a.jpg")
@@ -271,10 +271,10 @@ class TestArkBodyFromOpenai(unittest.TestCase):
         with self.assertRaises(ParamError):
             ark_body_from_openai({"prompt": "p"})
         with self.assertRaises(ParamError):
-            ark_body_from_openai({"model": "m", "prompt": ""})
+            ark_body_from_openai({"model": "minimaxH3", "prompt": ""})
 
     def test_unknown_fields_are_reported_not_silently_dropped(self):
-        _, notes = ark_body_from_openai({"model": "m", "prompt": "p", "seed": 7, "watermark": True})
+        _, notes = ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "seed": 7, "watermark": True})
         self.assertTrue(any('"seed"' in n for n in notes))
         self.assertTrue(any('"watermark"' in n for n in notes))
 
@@ -332,7 +332,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
     def test_multipart_create_returns_the_contract_shape(self):
         r = self.client.post(
             OPENAI_VIDEOS_PATH,
-            data={"model": "doubao-seedance-1-0-lite_480p", "prompt": "一只猫", "seconds": "5", "size": "16:9"},
+            data={"model": "minimaxH3_480p", "prompt": "一只猫", "seconds": "5", "size": "16:9"},
         )
         self.assertEqual(r.status_code, 200)
         j = r.json()
@@ -346,7 +346,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
     def test_json_create_returns_the_same_shape(self):
         r = self.client.post(
             OPENAI_VIDEOS_PATH,
-            json={"model": "doubao-seedance-1-0-pro_1080p", "prompt": "一只猫", "size": "adaptive"},
+            json={"model": "minimaxH3_1080p", "prompt": "一只猫", "size": "adaptive"},
         )
         self.assertEqual(r.status_code, 200)
         j = r.json()
@@ -359,14 +359,14 @@ class TestOpenaiHttpLayer(unittest.TestCase):
     def test_model_suffix_drives_resolution(self):
         self.client.post(
             OPENAI_VIDEOS_PATH,
-            json={"model": "doubao-seedance-1-0-lite_480p", "prompt": "p"},
+            json={"model": "minimaxH3_480p", "prompt": "p"},
         )
         self.assertEqual(self.fake.created_params[0]["resolution"], "480p")
 
     def test_uploaded_file_is_rehosted_before_submitting(self):
         r = self.client.post(
             OPENAI_VIDEOS_PATH,
-            data={"model": "doubao-seedance-1-0-lite_480p", "prompt": "p"},
+            data={"model": "minimaxH3_480p", "prompt": "p"},
             files={"first_frame_image": ("a.png", png_bytes(), "image/png")},
         )
         self.assertEqual(r.status_code, 200)
@@ -389,7 +389,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
         with mock.patch.object(app_module, "_FORM_PART_MAX_BYTES", 4096):
             r = self.client.post(
                 OPENAI_VIDEOS_PATH,
-                data={"model": "doubao-seedance-1-0-lite_480p", "prompt": "p"},
+                data={"model": "minimaxH3_480p", "prompt": "p"},
                 files={"first_frame_image": ("a.png", big, "image/png")},
             )
         self.assertEqual(r.status_code, 400, r.text)
@@ -408,7 +408,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
         with mock.patch.object(app_module, "_FORMS_MAX_BODY_BYTES", 1024):
             r = self.client.post(
                 OPENAI_VIDEOS_PATH,
-                data={"model": "doubao-seedance-1-0-lite_480p", "prompt": "p"},
+                data={"model": "minimaxH3_480p", "prompt": "p"},
                 files={"first_frame_image": ("a.png", png_bytes() + b"y" * 4096, "image/png")},
             )
         self.assertEqual(r.status_code, 400, r.text)
@@ -419,7 +419,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
         """对照组：正常大小的文件必须照旧走通（否则上面两条只是"什么都过不去"）。"""
         r = self.client.post(
             OPENAI_VIDEOS_PATH,
-            data={"model": "doubao-seedance-1-0-lite_480p", "prompt": "p"},
+            data={"model": "minimaxH3_480p", "prompt": "p"},
             files={"first_frame_image": ("a.png", png_bytes(), "image/png")},
         )
         self.assertEqual(r.status_code, 200, r.text)
@@ -435,7 +435,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
         """
         r = self.client.post(
             OPENAI_VIDEOS_PATH,
-            data={"model": "doubao-seedance-1-0-lite-i2v-250428", "prompt": "p",
+            data={"model": "minimaxH3", "prompt": "p",
                   "seconds": "5", "size": "adaptive",
                   "input_reference": '["https://x/a.png","https://x/b.png"]'},
             headers={"Authorization": "Bearer x", "x-avm-dry-run": "1"},
@@ -451,7 +451,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
         """帧字段拿到数组 ⇒ 400（不许静默丢素材）。"""
         r = self.client.post(
             OPENAI_VIDEOS_PATH,
-            data={"model": "m", "prompt": "p", "first_frame_image": '["https://x/f.png"]'},
+            data={"model": "minimaxH3", "prompt": "p", "first_frame_image": '["https://x/f.png"]'},
             headers={"Authorization": "Bearer x", "x-avm-dry-run": "1"},
         )
         self.assertEqual(r.status_code, 400, r.text)
@@ -463,7 +463,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
         files.append(("input_reference", ("", "https://files.test/u.png")))
         r = self.client.post(
             OPENAI_VIDEOS_PATH,
-            data={"model": "m", "prompt": "p"},
+            data={"model": "minimaxH3", "prompt": "p"},
             files=files,
             headers={"Authorization": "Bearer x", "x-avm-dry-run": "1"},
         )
@@ -476,7 +476,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
         many = [("input_reference", (f"r{i}.png", png_bytes(), "image/png")) for i in range(3)]
         many += [("input_reference", ("", f"https://files.test/{n}.png")) for n in ("u", "v")]
         r2 = self.client.post(
-            OPENAI_VIDEOS_PATH, data={"model": "m", "prompt": "p"}, files=many,
+            OPENAI_VIDEOS_PATH, data={"model": "minimaxH3", "prompt": "p"}, files=many,
             headers={"Authorization": "Bearer x", "x-avm-dry-run": "1"},
         )
         self.assertEqual(len(r2.json()["web_params"]["referenceImageUrls"]), 4, "上限 4 张")
@@ -493,7 +493,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
         """
         r = self.client.post(
             OPENAI_VIDEOS_PATH,
-            data={"model": "m", "prompt": "p"},
+            data={"model": "minimaxH3", "prompt": "p"},
             headers={"Authorization": "Bearer x", "x-avm-dry-run": "1", "x-base-url": "volc"},
         )
         self.assertEqual(r.status_code, 200, r.text)
@@ -502,7 +502,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
 
         r2 = self.client.post(
             OPENAI_VIDEOS_PATH,
-            data={"model": "m", "prompt": "p"},
+            data={"model": "minimaxH3", "prompt": "p"},
             headers={"Authorization": "Bearer x", "x-avm-dry-run": "1"},
         )
         self.assertFalse(
@@ -513,7 +513,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
     def test_dry_run_creates_nothing(self):
         r = self.client.post(
             OPENAI_VIDEOS_PATH,
-            data={"model": "doubao-seedance-1-0-lite_480p", "prompt": "p"},
+            data={"model": "minimaxH3_480p", "prompt": "p"},
             headers={"X-Avm-Dry-Run": "1"},
         )
         self.assertEqual(r.status_code, 200)
@@ -523,7 +523,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
 
     def test_query_returns_exactly_the_six_contract_fields(self):
         vid = self.client.post(
-            OPENAI_VIDEOS_PATH, json={"model": "m", "prompt": "p"}
+            OPENAI_VIDEOS_PATH, json={"model": "minimaxH3", "prompt": "p"}
         ).json()["id"]
         r = self.client.get(f"{OPENAI_VIDEOS_PATH}/{vid}")
         self.assertEqual(r.status_code, 200)
@@ -542,7 +542,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
         fake = FakeClient(record={"id": "t1", "taskStatus": "processing", "aiModel": "minimax-h3"})
         app = _app_with_fake(fake)
         client = TestClient(app)
-        vid = client.post(OPENAI_VIDEOS_PATH, json={"model": "m", "prompt": "p"}).json()["id"]
+        vid = client.post(OPENAI_VIDEOS_PATH, json={"model": "minimaxH3", "prompt": "p"}).json()["id"]
         j = client.get(f"{OPENAI_VIDEOS_PATH}/{vid}").json()
         self.assertEqual(j["status"], "in_progress")
         self.assertEqual(j["progress"], 0)
@@ -555,13 +555,13 @@ class TestOpenaiHttpLayer(unittest.TestCase):
 
     def test_invalid_size_is_400(self):
         r = self.client.post(
-            OPENAI_VIDEOS_PATH, data={"model": "m", "prompt": "p", "size": "5:4"}
+            OPENAI_VIDEOS_PATH, data={"model": "minimaxH3", "prompt": "p", "size": "5:4"}
         )
         self.assertEqual(r.status_code, 400)
         self.assertEqual(r.json()["error"]["code"], "InvalidParameter")
 
     def test_missing_prompt_is_400(self):
-        r = self.client.post(OPENAI_VIDEOS_PATH, data={"model": "m"})
+        r = self.client.post(OPENAI_VIDEOS_PATH, data={"model": "minimaxH3"})
         self.assertEqual(r.status_code, 400)
         self.assertEqual(r.json()["error"]["code"], "InvalidParameter")
 
@@ -574,14 +574,14 @@ class TestOpenaiGate(unittest.TestCase):
         self.client = TestClient(self.app)
 
     def test_missing_token_is_401(self):
-        r = self.client.post(OPENAI_VIDEOS_PATH, data={"model": "m", "prompt": "p"})
+        r = self.client.post(OPENAI_VIDEOS_PATH, data={"model": "minimaxH3", "prompt": "p"})
         self.assertEqual(r.status_code, 401)
         self.assertEqual(r.json()["error"]["code"], "AuthenticationError")
 
     def test_correct_token_passes(self):
         r = self.client.post(
             OPENAI_VIDEOS_PATH,
-            data={"model": "m", "prompt": "p"},
+            data={"model": "minimaxH3", "prompt": "p"},
             headers={"Authorization": "Bearer sk-secret"},
         )
         self.assertEqual(r.status_code, 200)

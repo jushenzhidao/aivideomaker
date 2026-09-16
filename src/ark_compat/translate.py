@@ -29,20 +29,36 @@ import datetime as _dt
 import re
 from typing import Any, Mapping
 
+from .channel_options import procedure_for_slot, resolve_model
 from .errors import ParamError
 
 ARK_RATIOS = frozenset({"16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"})
 ARK_RESOLUTIONS = frozenset({"480p", "720p", "1080p"})
 
+# 🔴 2026-09-16 **顶部更正：本表对 `480p` 是错的**（真实提交实测，报告 `E2E-AVM-016`）
+#
+#   站点对 **480p 只收离散的 `5 / 10 / 15 / 20`**。站点原话（真实提交被拒时返回）：
+#       `ai.minimaxH3: 480p supports 5s, 10s, 15s, or 20s duration.`
+#   ⇒ 下面那段"三分辨率都是连续区间"的结论**只对 720p 成立**，对 480p 不成立。
+#   ⇒ 本表 `"480p": list(range(5, 21))` 与站点不符，且 `snap_duration()` 认为 8s 合法故
+#      **不吸附** ⇒ 480p 的 6/7/8/9/11..14/16..19s 会**原样发出并 502**（已实测 480p/8s）。
+#   ⚠️ 当年"把 480p 改成连续区间"是为了避免"吸附跨进计费区"，但那个推断建立在
+#      **错误的 8s 免费线**上：旧 Node 层的 `[5,10,15,20]` 表会把 8s 吸附到 **10s**，
+#      而 10s 本身就在免费线内 ⇒ 并不会"变贵"。
+#   ❗ **修法尚未实施**（属对外时长口径变更，需先拍板）：480p 改回离散表 + 让
+#      `snap_duration()` 吸附并留痕。**1080p 是否同为离散档位尚未测**，别顺手一起改。
+#
+# ---- 以下为原文（存史；**关于 480p 的结论已被上述更正推翻**）--------------------------
 # 站点侧时长约束 = **连续秒数 + 上限**，不是离散档位。依据（全部零成本取证）：
 #   1. 站点 UI 文案 `videoDurationMaxWarnTip` = "Video duration must not exceed {seconds} seconds."
 #      ⇒ 站点自己描述的是"不得超过 N 秒"，而非"只能取某几个值"；
 #   2. 站点侧实测：720p 的 5/6/7/8/9/10/11/14 秒**全部成功**（连续整数，见 TESTCASES §10）；
 #   3. 计费文案按秒计（"15/20 秒按 3 积分/秒"），进一步说明时长是连续量。
 #
-# ⚠️ 曾经把 480p 写成 `[5, 10, 15, 20]`（一张来源不明的"档位表"）—— 那会让 `480p/8s`
-#    （本就在免费线内）被就近吸附到 **10s**，从而**跨进计费区**。这类"静默改档 + 变贵"
-#    正是适配层最该避免的。已按站点真实行为改成连续区间。
+# ⚠️ 曾经把 480p 写成 `[5, 10, 15, 20]` —— **【2026-09-16 更正：那张表是站点真行为，本段
+#    推断已失效，见本块顶部】**。原文如下：那会让 `480p/8s`（本就在免费线内）被就近吸附到
+#    **10s**，从而**跨进计费区**。这类"静默改档 + 变贵"正是适配层最该避免的。已按站点
+#    真实行为改成连续区间。
 DURATION_ALLOWED: dict[str, list[int]] = {
     "480p": list(range(5, 21)),
     "720p": list(range(5, 21)),
@@ -53,9 +69,10 @@ FREE_MAX_DURATION = 10  # 免费窗口的上界：turbo 且不超过它就不计
 #   任务记录为 `taskStatus=succeed` + **`paid=False`**（余额未动）⇒ 10s 仍在免费区。
 #   三分辨率都是**连续区间** `[5, 20]`（见 `DURATION_ALLOWED`）⇒ 免费档统一为
 #   5~10s 的**任意整数秒**，不只是 5s 与 10s。
-#   ⚠️ **别把「480p 只有 5/10/15/20」写回来** —— 那是已被推翻的档位表（见上）。
-#      照它吸附会把 6s 拉成 5s 或 10s（静默改时长）、把 11s 拉成 10s（跨回免费区），
-#      两者都属「不报错、但结果不是调用方要的」，正是本文件最该防的一类。
+#   ⚠️ **别把「480p 只有 5/10/15/20」写回来** —— **【2026-09-16 更正：这句反了，见本文件
+#      `DURATION_ALLOWED` 上方的顶部更正；站点实测确实只收这四个值】**。原文如下：那是已被
+#      推翻的档位表（见上）。照它吸附会把 6s 拉成 5s 或 10s（静默改时长）、把 11s 拉成
+#      10s（跨回免费区），两者都属「不报错、但结果不是调用方要的」。
 
 # Seedance 2.5 的「全能参考」任务类型。
 #   auto / reference  普通全模态生成与参考驱动 —— 站点侧有对应能力
@@ -230,13 +247,21 @@ def _as_bool(value: Any) -> bool | None:
     return None
 
 
-def translate_create(body: Mapping[str, Any]) -> dict:
+def translate_create(
+    body: Mapping[str, Any], *, channel_options: Mapping[str, Any] | None = None
+) -> dict:
     """Ark 创建任务请求体 → 完整翻译结果（纯函数，不联网）。
 
     返回 requested / effective / warnings / unsupported / incompatible / web_params。
 
     `incompatible` 装的是**上游明确不具备的能力**（例如 2.5 的视频编辑）。
     它们不影响纯翻译与 dry-run，但真实提交前必须被拒 —— 见 `app.py`。
+
+    `channel_options`：渠道级选项头 `X-Channel-Options` 解析出来的 dict（**读头在 app 层**，
+    本函数保持纯函数）。这里只消费模型相关键 —— `model`（渠道钉住槽位）与 `model_map`
+    （调用方名 → 上游槽位，别名 `upstream_model_map`），**默认 = 上游 model 透传**；
+    解析规则、值与冲突处理全在 `channel_options.resolve_model`，本函数只把它接到
+    `effective.model` / `effective.model_source` 与 `web_params["procedure"]` 上。
     """
     if not isinstance(body, Mapping):
         raise ParamError("body must be a JSON object")
@@ -245,9 +270,19 @@ def translate_create(body: Mapping[str, Any]) -> dict:
     unsupported: list[str] = []
     incompatible: list[str] = []
 
+    # `model` 决定**上游槽位**（= 站点 procedure 名里那一段）。判定顺序：
+    #   ① 渠道映射表精确命中 → ② 名字本身是已知上游槽位（**默认透传**）→ ③ 渠道钉住值 → ④ 400。
+    # 规则、值域与冲突处理见 `channel_options.resolve_model`（与视频适配层同一套键与语义）。
+    # ⚠️ 它**不进上游请求体** —— 站点创建体的键是白名单（没有 model 字段），站点把模型编在
+    #    procedure 路径上 ⇒ "落到哪个模型"在这里表现为**换 procedure**（`web_params["procedure"]`）。
+    #    改模型 = 换计费档位，所以这一步**绝不静默**：每次命中都留告警与证据字段。
     model = str(body.get("model") or "").strip()
     if not model:
         raise ParamError("model is required", "model")
+    # ⚠️ 变量名必须避开 `resolution` —— 那个名字在本函数里是**站点分辨率**（`720p` 之类），
+    #    两者共用一个名字会让模型解析结果被分辨率覆盖掉（实测踩中，症状是 `str` 没有 `.slot`）。
+    model_resolution = resolve_model(model, channel_options)
+    warnings.extend(model_resolution.warnings)
 
     items = body.get("content")
     if not isinstance(items, list) or not items:
@@ -285,6 +320,16 @@ def translate_create(body: Mapping[str, Any]) -> dict:
 
     raw_duration = body.get("duration")
     duration = None
+    # ⚠️ **已知缺陷（2026-09-16 实测；用户口径：先不修，登记备查）**：下面两处 `float()`
+    #    抛出的 `TypeError` / `ValueError` **没有捕获**，而 app 只注册了 ArkError /
+    #    ParamError / WebApiError 三个处理器 ⇒ 非法**类型**的入参返回 **500** 而不是
+    #    400 `InvalidParameter`（把"客户端传错参数"伪装成"服务端故障"）。
+    #    受影响：`{"duration": "abc" | [] | {}}`、`{"frames": "abc" | [] | {}}`，
+    #    以及 `{"frames": ""}` —— 后者还多一层：`duration` 把 `""` 当"没传"，
+    #    而 `frames` 只判 `is not None` ⇒ **两条平行解析路径的空值口径并不一致**。
+    #    🔴 当时 **758 条测试全绿**也照漏：用例集合里断言的是合法输入的正确输出，
+    #    非法**类型**从来不在里面。要修就得**同时**补门禁（断言状态码 4xx），
+    #    否则修了也会被下一个字段重新长出来。完整实测矩阵见 `README.md`「已知缺陷」。
     if raw_duration not in (None, ""):
         d = float(raw_duration)
         if d == -1:
@@ -476,12 +521,20 @@ def translate_create(body: Mapping[str, Any]) -> dict:
             # 上游实际产出的容器（站点实测成片一律 .mp4），不是请求值
             "output_format": UPSTREAM_OUTPUT_FORMAT,
             "billed": params["tier"] == "base" or duration > FREE_MAX_DURATION,
+            # 模型解析结果 —— 与 `requested.model`（调用方写的）**并列**：一个是请求值，
+            # 一个是真发出去的值。`model_source` ∈ model_map | passthrough | pinned：
+            # 没有它就说不出"名字是怎么变成上游槽位的"，而这条链直接决定计费档位。
+            "model": model_resolution.slot,
+            "model_source": model_resolution.source,
+            "model_verified": model_resolution.verified,
         },
         "warnings": warnings,
         "unsupported": sorted(set(unsupported)),
         # 上游明确不具备的能力：dry-run 下照常返回（零成本可见），真实提交前必须被拒
         "incompatible": incompatible,
-        "web_params": params,
+        # 上游 procedure 在这里落定（站点把模型编在路径上，创建体里没有 model 字段）：
+        # `web_client.create` 只读这个键，读不到才回落默认常量。
+        "web_params": {**params, "procedure": procedure_for_slot(model_resolution.slot)},
         "captcha_token": extra.get("aivideomaker_captcha_token"),
     }
 

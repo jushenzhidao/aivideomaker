@@ -92,6 +92,7 @@ from .observability import (
     upstream_exchanges,
 )
 from .media_proxy import MediaProxy, MediaSourceError
+from .channel_options import CHANNEL_OPTIONS_HEADER, parse_channel_options
 from .settings import Settings
 from .openai_videos import OPENAI_VIDEOS_PATH, ark_body_from_openai, openai_task_view
 from .sniff import sniff_file
@@ -576,6 +577,30 @@ def _strip_media_ext(name: str) -> str:
     if dot and 1 <= len(ext) <= 5 and ext.isascii() and ext.isalnum():
         return base
     return str(name or "")
+
+
+def _billing_check(app: FastAPI) -> dict:
+    """计费自查的**权威口径**（`/healthz` 的 `billing_check` 字段）。
+
+    存在的理由很具体（livetest 报告 E2E-AVM-015 的 config_warning）：0.0.27 起对外任务
+    视图按官方 schema **收窄掉了 `usage`**，于是「看任务记录里的 `paid=False`」这条用了
+    很久的判据**静默失效** —— 而它失效的样子不是报错，是"响应里没有这个字段"，
+    极易被读成"本次没计费"（结论正好相反）。
+
+    这里只回答一个问题：**想确认某条任务花没花钱，该看哪里**。数值本身要靠 `?deep=1`
+    那一步（它会打上游取余额；浅探活刻意不打，避免存活探针把上游当依赖）。
+    """
+    return {
+        # 恒 False。写成**字段**而不是文档里的一句话：调用方与巡检可以断言它，
+        # 而不是靠人去读注释 —— 哪天 usage 回来了，这里也会跟着变。
+        "usage_in_task_response": False,
+        "how": (
+            "GET /healthz?deep=1 取 balance：提交前记一次、出片后再记一次，差值即该条任务的"
+            "花费（免费组合差 0）；或读 Logfire 的 ark.task.fetch span 属性 paid"
+        ),
+        # 仅 `?deep=1` 时填（要打上游）。浅探活恒为 None。
+        "balance": None,
+    }
 
 
 def _media_summary(app: FastAPI) -> dict:
@@ -1070,6 +1095,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # 成片出口：对外给的是不是本服务自己的地址（脱敏到底生没生效）。
             # 只报形态，**不含任何凭据**；未配置时 `enabled=False`（= 原样透传上游链接）。
             "media_proxy": _media_summary(request.app),
+            # ★ 计费自查口径（2026-09-16 依 livetest 报告 E2E-AVM-015 的告警加）：
+            #   0.0.27 起对外任务视图**不含 `usage`**（官方 schema 白名单，
+            #   见 `translate.ARK_TASK_FIELDS`）⇒「这条任务花没花钱」**不能**从
+            #   `GET /tasks/{id}` 读。把口径直接挂在运维端点上，省得每个人去翻文档、
+            #   或更糟 —— 误以为"没给 usage 就是没计费"。
+            "billing_check": _billing_check(request.app),
         }
         default = pool.get("web")
         if default is not None and getattr(default, "queue", None) is not None:
@@ -1088,6 +1119,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 try:
                     with span("ark.healthz.upstream", upstream=upstream.kind):
                         info.update(await asyncio.to_thread(upstream.health))
+                    # 把刚取到的余额也挂进自查块：一个字段读完，不必在响应里找两处。
+                    # 放在 update 之后、try 之内 —— 探上游失败时它保持 None（如实"没取到"，
+                    # 不编一个 0：0 会被读成"余额为零"这种完全相反的事实）。
+                    info["billing_check"]["balance"] = info.get("balance")
                 except Exception as e:  # noqa: BLE001
                     info["upstream_error"] = str(e)
         return info
@@ -1111,7 +1146,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 不该先拿到"参数不合法"这种更像配置问题的错误。
         upstream, credential = _upstream_and_credential_for(request)
 
-        plan = translate_create(body)
+        # 渠道级选项头（模型相关键）：`model` 钉住槽位 / `model_map` 映射，**默认上游 model
+        # 透传**。读头只在这一层（translate 保持纯函数）；坏掉的头**拒绝**而不是当成没配 ——
+        # 当成没配会静默按透传跑掉，而运维以为自己的映射生效了。
+        channel_options = parse_channel_options(request.headers.get(CHANNEL_OPTIONS_HEADER))
+        plan = translate_create(body, channel_options=channel_options)
         eff, warns = billing_view(plan)
         if extra_warnings:
             warns = [*warns, *extra_warnings]
@@ -1124,6 +1163,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "ark.create.dry_run",
                 upstream=upstream.kind,
                 ark_model=plan["requested"]["model"],
+                # 模型解析证据：请求名 → 上游槽位（判据是槽位，不是请求名）
+                upstream_slot=eff["model"],
+                model_source=eff["model_source"],
+                model_verified=eff["model_verified"],
                 resolution=eff["resolution"],
                 duration=eff["duration"],
                 billed=eff["billed"],
@@ -1132,9 +1175,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 request=body,
             ):
                 logger.info(
-                    "dry-run upstream={} ark_model={} res={} dur={}s billed={}",
+                    "dry-run upstream={} ark_model={} slot={}({}) res={} dur={}s billed={}",
                     upstream.kind,
                     plan["requested"]["model"],
+                    eff["model"],
+                    eff["model_source"],
                     eff["resolution"],
                     eff["duration"],
                     eff["billed"],
@@ -1158,6 +1203,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # ark_id 先于提交生成并一起上报：出问题时能拿它去 Logfire 反查整条链路
             ark_id=ark_id,
             ark_model=plan["requested"]["model"],
+            # 模型解析证据（请求名 → 上游槽位）：换模型 = 换计费档位，这条链必须能事后复盘
+            upstream_slot=eff["model"],
+            model_source=eff["model_source"],
+            model_verified=eff["model_verified"],
             resolution=eff["resolution"],
             duration=eff["duration"],
             billed=eff["billed"],

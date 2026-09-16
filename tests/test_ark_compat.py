@@ -22,7 +22,10 @@ from ark_compat.app import TASKS_PATH, create_app  # noqa: E402
 from ark_compat.errors import ParamError  # noqa: E402
 from ark_compat.settings import Settings  # noqa: E402
 
-ARK_MODEL = "doubao-seedance-2-5-260628"
+# 夹具用**已知上游槽位**：`model` 现在参与路由（未命中 ⇒ 400，见 `channel_options.py`）。
+# 路由/映射本身由 `test_channel_model_map_wildcard.py` 覆盖，本模块的用例不该因为
+# "随手写了个 Ark 官方 ID"而红（那是**契约变更**，不是本模块的主题）。
+ARK_MODEL = "minimaxH3"
 DEAD_UPSTREAM = "http://127.0.0.1:9"  # discard 端口，保证不出网
 
 

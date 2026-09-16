@@ -30,7 +30,8 @@ from ark_compat.translate import (  # noqa: E402
     translate_create,
 )
 
-MODEL = "doubao-seedance-2-5-260628"
+# 已知上游槽位（`model` 参与路由，未命中 ⇒ 400）；本模块只关心计费措辞。
+MODEL = "minimaxH3"
 TRANSLATE_PY = ROOT / "src" / "ark_compat" / "translate.py"
 
 

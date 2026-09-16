@@ -34,7 +34,8 @@ from ark_compat.settings import Settings  # noqa: E402
 from ark_compat.upstreams import _build_web, build_web_for_cookie  # noqa: E402
 from ark_compat.web_client import WebClient  # noqa: E402
 
-ARK_MODEL = "doubao-seedance-2-5-260628"
+# 已知上游槽位（`model` 参与路由，未命中 ⇒ 400）；本模块只关心凭据透传。
+ARK_MODEL = "minimaxH3"
 DEAD_UPSTREAM = "http://127.0.0.1:9"
 TOKEN_A = "a" * 40
 TOKEN_B = "b" * 40

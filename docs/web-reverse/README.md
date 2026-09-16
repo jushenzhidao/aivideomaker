@@ -93,6 +93,19 @@ SubscriptionStatus  { TRIALING, ACTIVE, PAUSED, CANCELED, PAST_DUE, UNPAID,
 - [x] 建立登录态并抓取 app 侧 JS chunk。
 - [x] 定位内部接口（tRPC over `/api`）。
 - [ ] 从 app 侧 chunk 中提取 tRPC router 的**完整** procedure 清单（当前靠 grep 关键字，可能不全）。
+- [ ] **补记（2026-09-16 核查）**：上一条**没有现成资产可用** —— `captured/app-js/` 只是
+      **路由级**的 chunk 集合（`layout-*` / `main-app-*` / `page-*`），
+      `grep -r` 在里面搜 `minimaxH3` / `needsCaptcha` / `getModel` / `listModel`
+      **全部为空** ⇒ 它不含 `/zh/ai-video-generator` 生成页的懒加载 route chunk。
+      要拿清单必须按**登录态重抓该 route** 的 chunk（现有 34 个 app-js 里没有）。
+- [ ] **模型映射的前置**：站点 11 个模型各自对应哪条 procedure、哪种 web_params 形态
+      （键名见 [`model-inventory.md`](./model-inventory.md)）。
+      **2026-09-17 更新**：落点已定且**实现已落地**（`X-Channel-Options.model` / `.model_map`，
+      语义见 `docs/channel-options-model.md`，代码见 `src/ark_compat/channel_options.py`）。
+      **这条清单仍是待办，但它已不再是"能不能做"的阻塞** —— 现在缺它只影响两件事：
+      ① 把 `ai.<槽位>` 这个**推断**换成实测表（当前映射到非 `minimaxH3` 槽位时证据里标
+      `model_verified=false` 并告警）；② 补 per-model 的 `duration` / `resolution` 合法域
+      （各模型上限不同，见 `src/ark_compat/README.md`「模型映射」）。
 - [ ] 验证网页端未开放模型（`kling3`、`veo31Fast`、`seedance25` 等）的生成调用链。
 - [x] ~~实测 `auth_session` 的实际 TTL~~ —— **已解出，无需 watch**：
       浏览器导出的 cookie jar 里带 `expirationDate` 字段，`auth_session` 为

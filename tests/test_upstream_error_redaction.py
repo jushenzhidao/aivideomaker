@@ -254,7 +254,7 @@ class RedactionCase(unittest.TestCase):
         self.app_with(client)
         r = self.client.post(
             OPENAI_VIDEOS_PATH,
-            json={"model": "doubao-seedance-1-0-lite-t2v-250428", "prompt": "p", "seconds": 5, "size": "adaptive"},
+            json={"model": "minimaxH3", "prompt": "p", "seconds": 5, "size": "adaptive"},
             headers={"Authorization": f"Bearer {GATE}"},
         )
         self.assertEqual(r.status_code, 502, r.text)
@@ -266,7 +266,7 @@ class RedactionCase(unittest.TestCase):
         （否则调用方拿不到"哪个字段错了"），只是补一个 Request ID。"""
         self.app_with(make_client(self.site))
         r = self.post({
-            "model": "doubao-seedance-1-0-lite-t2v-250428",
+            "model": "minimaxH3",
             "content": [{"type": "text", "text": "p"}],
             "ratio": "bogus",          # 不在 ratio 枚举里 ⇒ translate 层给 400
         })

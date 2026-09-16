@@ -554,7 +554,10 @@ def web_settings(**kw) -> Settings:
 
 def ark_body(**kw) -> dict:
     b = {
-        "model": "doubao-seedance-2-5-260628",
+        # 已知上游槽位：`model` 现在参与路由（未命中 ⇒ 400，见 `ark_compat.channel_options`）。
+        # 夹具改用真槽位 ⇒ 本模块的用例测的仍是它们各自的主题；路由/映射另立门禁
+        # （`test_channel_model_map_wildcard.py`）。
+        "model": "minimaxH3",
         "content": [{"type": "text", "text": "a cat"}],
         "ratio": "16:9",
         "resolution": "480p",
@@ -757,6 +760,21 @@ class TestWebOnlyUpstream(unittest.TestCase):
         # 已移除的官方线不该在健康检查里留下任何字段
         for gone in ("switch_via", "max_credits", "default_model", "passthrough_key"):
             self.assertNotIn(gone, j, f"{gone} 属于已移除的 official 线")
+
+    def test_healthz_publishes_the_billing_check_channel(self):
+        """计费自查口径必须**挂在运维端点上**（livetest E2E-AVM-015 的告警）。
+
+        0.0.27 起对外任务视图收窄掉了 `usage` ⇒「看任务记录 `paid`」这条判据**静默失效**，
+        而它失效的样子不是报错，是"响应里没有这个字段"，极易被读成"本次没计费"
+        （结论正好相反）。这个字段存在的唯一目的，就是让人不必翻文档也知道该看哪里。
+        """
+        j = self.client.get("/healthz").json()
+        bc = j["billing_check"]
+        self.assertFalse(bc["usage_in_task_response"], "对外任务视图确实不含 usage")
+        self.assertIn("/healthz?deep=1", bc["how"])
+        self.assertIn("paid", bc["how"])
+        # 浅探活**不打上游** ⇒ 余额如实为 None（不编 0：0 会被读成"余额为零"，正好相反）
+        self.assertIsNone(bc["balance"])
 
     def test_dry_run_is_always_tagged_web(self):
         body = ark_body(extra_body={"aivideomaker_dry_run": True})

@@ -271,7 +271,7 @@ class TestSpanContract(unittest.TestCase):
     def test_create_span_records_the_ark_model_and_billing_line(self):
         self.post_task(ark_body(extra_body={"aivideomaker_tier": "base"}))
         attrs = self.attrs("ark.create.submit")
-        self.assertEqual(attrs["ark_model"], "doubao-seedance-2-5-260628")
+        self.assertEqual(attrs["ark_model"], "minimaxH3")
         self.assertTrue(attrs["billed"], "tier=base 在 web 线一律计费")
 
     def test_create_span_keeps_exchanges_when_the_upstream_rejects(self):

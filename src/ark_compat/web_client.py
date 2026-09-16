@@ -36,8 +36,20 @@ from .sniff import image_dimensions, sniff_file
 PAGE = "/zh/ai-video-generator"
 LIST_PAGE = "/zh/generations"
 DEFAULT_VISITOR_ID = "f29ee26edcb4e8b96ee17e277a384f6f"
-# 建任务用的 procedure。单列成常量：trace 里要据此把「这次调用的返回值就是 taskId」
-# 认出来（`trpc` 是通用的，不看 procedure 就得猜）。
+# 建任务 procedure 的**默认值 / 回落目标**。单列成常量有两个用处：
+#   ① 没有渠道配置时用它（有配置时由 `channel_options` 解析出的槽位覆盖，见 `create`）；
+#   ② `channel_options.VERIFIED_SLOTS` 以它为唯一来源 —— 它是**唯一已实测存在**的生成
+#      procedure（三次真实提交的成片 URL 里一律是 `minimax_h3`，报告 AVM12-OPEN-UPSTREAM）。
+#
+# 上游模型名 → procedure 的**映射由渠道声明**（`X-Channel-Options.model` 钉住 /
+# `.model_map` 映射），**默认 = 调用方模型名透传**。站点把模型编在 procedure 路径上
+# （`ai.<槽位>`），创建体里没有 model 字段 ⇒ "换模型"就是"换 procedure"。
+# ⚠️ 其余 10 个站点模型键的 procedure 名**尚未取得**（现有抓包只是路由级 chunk，搜不到），
+#    现按同一命名形态推断，并在告警与证据字段里标注 `model_verified=false`。
+#    清单待办（`docs/web-reverse/README.md`）与补表落点见 `README.md`「模型映射」。
+#    ⚠️ 补表时必须**一并带上 per-model 的 `duration` / `resolution` 合法域**：各模型上限不同
+#    （`veo31Fast` 支持 4K、`seedance20` 上限 15s、`wan27` 只给 720P/1080P），只换 procedure
+#    会把越界值**静默**发给上游。
 CREATE_PROCEDURE = "ai.minimaxH3"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -179,8 +191,13 @@ class WebClient:
 
     def trpc(self, procedure: str, inp: Any = None, *, method: str = "GET",
              referer: str = PAGE, meta: dict | None = None,
-             timeout: float | None = None, retries: int | None = None) -> Any:
+             timeout: float | None = None, retries: int | None = None,
+             returns_task_id: bool = False) -> Any:
         """调一个 tRPC procedure，解开 `result.data.json`；出错抛 `WebApiError`。
+
+        `returns_task_id=True`：这次调用的返回值**就是**站点 taskId —— 由它决定要不要把返回值
+        贴到 `note_upstream(task_id=…)` 上（`trpc` 是通用的，不看这个标记就只能按 procedure 名去猜，
+        而 procedure 现在是**按渠道解析出来的**，不再是一个常量）。
 
         `json.dumps` 用紧凑分隔符：tRPC 的 input 会被百分号编码进 query，
         紧凑写法避免空格被编码成 `+`／`%20` 的歧义。
@@ -288,7 +305,7 @@ class WebClient:
             upstream="web",
             request=req_view,
             response={"http_status": r.status_code, "body": parsed},
-            task_id=str(value) if procedure == CREATE_PROCEDURE and value else None,
+            task_id=str(value) if returns_task_id and value else None,
             duration_ms=elapsed,
         )
         return value
@@ -428,7 +445,11 @@ class WebClient:
             "visitorId": self.visitor_id,
             "token": token,
         }
-        task_id = self.trpc(CREATE_PROCEDURE, body, method="POST")
+        # 上游模型体现在 **procedure 路径**上（`ai.<槽位>`），创建体里没有 model 字段。
+        # 槽位由 `channel_options.resolve_model` 解析后放进 `params["procedure"]`；读不到才
+        # 回落 `CREATE_PROCEDURE`（唯一已实测的 procedure，也是没有渠道配置时的透传目标）。
+        procedure = str(params.get("procedure") or "").strip() or CREATE_PROCEDURE
+        task_id = self.trpc(procedure, body, method="POST", returns_task_id=True)
         if not task_id and self._minter_configured():
             # 站点用**空串**表示拒绝（不报错）。两种常见成因：
             #   ① 手上这个 token 已过期/已被用过（池子里的 token 会自然老死）；
@@ -438,13 +459,13 @@ class WebClient:
             fresh = self._mint_token_from_service()
             if fresh:
                 body["token"] = fresh
-                task_id = self.trpc(CREATE_PROCEDURE, body, method="POST")
+                task_id = self.trpc(procedure, body, method="POST", returns_task_id=True)
                 if task_id:
                     logger.info("用新铸的 token 重试成功（上一个 token 已过期/已用，或闸门刚被顶开）")
         if not task_id:
             # 站点用空串表示"拒绝"，不报错 —— 必须当成显式失败
             raise WebApiError(
-                CREATE_PROCEDURE,
+                procedure,
                 "create returned no task id — the request was rejected (captcha gate or invalid parameters)",
             )
         return str(task_id)

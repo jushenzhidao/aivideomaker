@@ -165,6 +165,13 @@ schema）。⚠️ 三者**不受** `AVM_AUTH` 保护（闸门模式下也无需
 再核一遍，见下方「部署」）。
 env 同步可复验：`python3 tools/env_sync_check.py`（`.env` ⇄ `.env.example` 的结构 / 取值 /
 消费方三件事；**只在有 `.env` 的机器上跑** —— 该文件不入库，故它进不了 CI）。
+
+> 🔴 **真实环境（生产机器）的测试报告不在本仓库**：历史与最新的都在 **livetest-ai 项目**的
+> `reports/aivideomaker/` 下（文件名 `<时间戳>-E2E-AVM-NNN-avmNNN.{json,md,html}`，
+> `ls | sort -r | head -1` 取最新 —— 别按 mtime，报告会被批量重渲染刷平）。
+> 每个版本发布后由 livetest-ai 在**生产机器**上实测，报告里记录了被测镜像 digest 与
+> version label，**与源码版本的对应关系以那份报告为准**（如 v0.0.27 ↔ `E2E-AVM-015`）。
+
 完整说明见 [`src/ark_compat/README.md`](src/ark_compat/README.md)。
 
 ## 部署
@@ -384,4 +391,9 @@ stderr 日志不受影响。名单可用 `AVM_LOGFIRE_EXCLUDED_PATHS` 覆盖：*
   `{AVM_PUBLIC_BASE}/v/{ark_id}.mp4` 并改由本服务流式回源（响应头白名单化）。
   这是**对外破坏性变更**（主机变了），留空则不启用。详见
   [`src/ark_compat/README.md`](src/ark_compat/README.md) 的「成片对外出口」一节。
+- **交互式文档（`/docs` `/redoc` `/openapi.json`）是公开端点**，不受 `AVM_AUTH` 约束。
+  2026-09-16 决定**保持公开**（便于不带凭据调试），可见范围因此**由部署层负责** ——
+  实例要对外时，在反向代理上处置这三条。
+- 0.0.27 起 `GET /tasks/{id}` **不含 `usage`**：计费自查改看 `/healthz?deep=1` 的
+  `balance` 前后差（`/healthz` 的 `billing_check` 字段会自述该口径）。
 - `docs/web-reverse/captured/` 中为公开页面的抓取快照，仅用于离线分析。
