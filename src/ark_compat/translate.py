@@ -627,6 +627,20 @@ _WEB_STATUS_TO_ARK = {
 }
 
 
+def to_ark_status(raw: Any) -> str:
+    """站点 `taskStatus` → Ark **归一化**状态词。
+
+    🔴 **指标标签必须走这里**，不然同一个指标会被劈成两套词汇：轮询路径（`source=poll`）
+    写归一化词、盯梢路径（`source=watcher`）曾直接写站点原词 ⇒
+    `avm.task.wait_seconds{final_status="succeeded"}` 与 `{final_status="succeed"}` 是两条
+    时间序列，按 `succeeded` 过滤的看板/告警会**漏掉盯梢那一半**（CI 2026-09-17 就是这样红的）。
+
+    ⚠️ 本函数只做**词表**映射，**不做** `normalize_web_task` 里那条"succeeded 但没有产出 URL
+    ⇒ failed"的降级 —— 那是任务对象语义，不是状态词表（指标标签要的是"站点说了什么状态"）。
+    """
+    return _WEB_STATUS_TO_ARK.get(str(raw or "").strip().lower(), "queued")
+
+
 def normalize_web_task(raw: Mapping[str, Any] | None) -> dict:
     """站点任务记录 → Ark 任务对象。
 
@@ -636,7 +650,7 @@ def normalize_web_task(raw: Mapping[str, Any] | None) -> dict:
     """
     raw = raw if isinstance(raw, Mapping) else {}
     status = str(raw.get("taskStatus") or "submitted").lower()
-    ark_status = _WEB_STATUS_TO_ARK.get(status, "queued")
+    ark_status = to_ark_status(status)
     # ⚠️ 站点会把**没有产出 URL** 的任务也留在 `succeed`（`taskStatusMsg="not found url"`）。
     # 照搬映射会让调用方看到"succeeded 但 content.video_url 为 null"这种自相矛盾的状态，
     # 下游据此判成功、拿到空链接 ⇒ 直接按失败处理，原因沿用 `taskStatusMsg`。

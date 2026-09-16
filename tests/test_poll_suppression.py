@@ -463,12 +463,16 @@ class TestPollMetrics(InboundBudgetCase):
         self.get_task(tid)
         self.get_task(tid)  # 同状态：不许再记一次
 
-        waits = self.named("avm.task.wait_seconds")
-        self.assertTrue(waits, "跃迁进终态必须记一次等待时长")
+        # ⚠️ 必须**只取 poll 那一路**：`post_task` 会起盯梢线程，它也可能观测到终态并记一次
+        #    （`source=watcher`）。本用例测的是**轮询路径**的跃迁记账；不筛 source 就等于
+        #    依赖"谁先记"这个竞态（CI 2026-09-17 就是这样红的：读到了盯梢那一条）。
+        waits = [r for r in self.named("avm.task.wait_seconds")
+                 if r[2].get("source") == "poll"]
+        self.assertTrue(waits, "轮询看到跃迁进终态必须记一次等待时长")
         _name, (total, count), attrs = waits[0]
         self.assertEqual(count, 1, "只记一次（同状态轮询不许重复计数）")
         self.assertGreaterEqual(total, 0.0)
-        self.assertEqual(attrs.get("final_status"), "succeeded")
+        self.assertEqual(attrs.get("final_status"), "succeeded", "指标标签用归一化词")
         self.assertEqual(attrs.get("source"), "poll")
 
 
@@ -525,6 +529,27 @@ class TestWatcherBudget(unittest.TestCase):
         self.assertEqual(attrs["task.final_status"], "succeed")
         self.assertEqual(attrs["upstream"], "web")
         self.assertNotIn("error", attrs)
+
+    def test_metric_labels_use_the_normalized_vocabulary(self):
+        """🔴 **指标标签只有一个词汇表**：盯梢记的那一条也必须写 `succeeded`。
+
+        回归门禁（2026-09-17 CI 红的那条）：盯梢曾直接写站点原词 `succeed`，而轮询路径
+        （`app.py`）写归一化词 `succeeded` ⇒ 同一个指标被劈成两条时间序列，
+        按 `succeeded` 过滤的看板/告警会**漏掉盯梢那一半**。
+        span 属性保留原词（逐任务证据，可用来与站点记录对账），**指标标签必须归一化**。
+        """
+        recorded = []
+        with mock.patch(
+            "ark_compat.web_queue.record_wait",
+            side_effect=lambda **kw: recorded.append(kw),
+        ):
+            self.watch(["queueing", "processing", "succeed"])
+        self.assertTrue(recorded, "盯梢到终态要记一次等待时长")
+        self.assertEqual(
+            recorded[-1]["final_status"], "succeeded",
+            "盯梢写成了站点原词？指标会被劈成两套词汇（按归一化词过滤的看板会漏掉一半）",
+        )
+        self.assertEqual(recorded[-1]["source"], "watcher")
 
     def test_status_transitions_are_recorded_as_events(self):
         """跃迁用**事件**：3 次跃迁（含首见）⇒ 3 个 `status_change`，而不是 5 条 span。"""

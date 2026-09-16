@@ -27,6 +27,7 @@ from typing import Callable
 
 from .errors import WebApiError
 from .observability import count_poll, describe_error, record_wait, span
+from .translate import to_ark_status
 
 
 class WebSubmitQueue:
@@ -136,7 +137,8 @@ class WebSubmitQueue:
                         polls["last"] = status
                     count_poll(
                         upstream=self._upstream,
-                        status=status,
+                        # 🔴 指标标签用**归一化**词（站点原词只在上面那个 span 事件里 —— 那是逐任务的证据）
+                        status=to_ark_status(status),
                         reported=False,
                         source="watcher",
                     )
@@ -158,12 +160,19 @@ class WebSubmitQueue:
                 sp.set_attribute("task.last_status", polls["last"])
                 if res is not None:
                     final_status = str(res.get("status") or "")
+                    # span 属性保留**站点原词**：逐任务证据，便于与站点记录对账
+                    # （门禁 `test_five_polls_produce_exactly_one_span` 就钉着它）
                     sp.set_attribute("task.final_status", final_status)
                     sp.set_attribute("task.done", bool(res.get("done")))
                     sp.set_attribute("task.watch_ms", res.get("ms"))
                     record_wait(
                         upstream=self._upstream,
-                        final_status=final_status,
+                        # ⚠️ 但**指标标签**必须归一化，且与轮询路径（`app.py`，标 source=poll）
+                        #    用同一套词表 —— 否则 `{final_status="succeed"}` 与
+                        #    `{final_status="succeeded"}` 会劈成两条时间序列，按归一化词过滤的
+                        #    看板/告警会**漏掉盯梢这一半**。
+                        #    （2026-09-17 CI 红的那条就是它：'succeed' != 'succeeded'）
+                        final_status=to_ark_status(final_status),
                         seconds=float(res.get("ms") or 0) / 1000.0,
                         source="watcher",
                     )
