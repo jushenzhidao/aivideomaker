@@ -382,7 +382,7 @@ AVM_TASK_STORE=memory      # 显式开发/测试开关：重启即丢
 
 | Ark 字段 | 处理 |
 |---|---|
-| `model` | **参与路由**（决定上游 procedure）。判定顺序：渠道映射表精确命中 → 名字本身是上游槽位（**默认透传**）→ 渠道映射表通配命中 → 渠道钉住值 → **400**。键与语义见 `docs/channel-options-model.md`；值**不进上游请求体**（站点把模型编在 procedure 路径上）—— 唯一另有副作用的是 `/v1/videos` 面的 `_480p`/`_720p`/`_1080p` 后缀（解析成 `resolution`，**先剥掉再比对槽位**）。**未命中不再静默落到 `ai.minimaxH3`**（迁移见下方「模型映射」） |
+| `model` | **参与路由**（决定上游 procedure）。判定顺序：渠道映射表精确命中 → 名字本身是上游槽位（**默认透传**）→ 映射表的 **`*` 兜底** → **400**（`model` 钉住键已撤除，遗留即报错）。键与语义见 `docs/channel-options-model.md`；值**不进上游请求体**（站点把模型编在 procedure 路径上）—— 唯一另有副作用的是 `/v1/videos` 面的 `_480p`/`_720p`/`_1080p` 后缀（解析成 `resolution`，**先剥掉再比对槽位**）。**未命中不再静默落到 `ai.minimaxH3`**（迁移见下方「模型映射」） |
 | `content[].type=text` | 多条用 `\n` 连接 → `content` |
 | `content[].type=image_url` | `role=first_frame`/`last_frame` 走帧通道；`reference_image` 或无 role 进 `referenceImageUrls` |
 | `content[].type=video_url` | → `referenceVideoUrl`（单槽位） |
@@ -406,13 +406,16 @@ AVM_TASK_STORE=memory      # 显式开发/测试开关：重启即丢
 X-Channel-Options: {"model_map": {"doubao-seedance-2-0-260128": "seedance20",   // 精确键：逐条写
                                   "doubao-seedance-2-5-260628": "seedance25",
                                   "*": "minimaxH3"}}                            // 唯一兜底（可选）
-X-Channel-Options: {"model": "minimaxH3"}      // 钉住：表外名字落这一档
 ```
 
-判定顺序：① 映射**精确**命中 → ② 名字本身是上游槽位（**默认透传**）→ ③ 映射的 **`*` 兜底**
-（只在 ①② 都没命中时轮到它）→ ④ 渠道**钉住** → ⑤ **400**（报文给出已知槽位与表里已声明的键）。
-每一步都进 `warnings`，并留下证据字段 `effective.model` / `.model_source` / `.model_verified`、
-`web_params.procedure`、span `ark.create.submit` 的 `upstream_slot`。
+判定顺序：① 映射**精确**命中 → ② 映射的 **`*` 兜底**（**覆盖一切**未被精确列出的名字，
+含调用方写出的真槽位名）→ ③ 名字本身是上游槽位（**默认透传**）→ ④ **400**（报文给出已知槽位与
+表里已声明的键）。每一步都进 `warnings`，并留下证据字段 `effective.model` / `.model_source` /
+`.model_verified`、`web_params.procedure`、span `ark.create.submit` 的 `upstream_slot`。
+
+🔴 **`model`（钉住）键已撤除**（2026-09-17，与 video-adapter 一致）：遗留它 ⇒ **渠道配置错误**，
+不静默忽略。⇒ 要"这个渠道只跑某一档"，**用兜底**：`{"model_map": {"*": "minimaxH3"}}`
+（改写会留痕，不静默）；想让某个名字走别的槽位，就把它写进**精确表**（精确优先于兜底）。
 
 🔴 **通配已降级为"唯一一条 `*` 兜底"**（2026-09-17）：任何**非 `*`** 却含 `*` 的键
 （`doubao-seedance-*`）⇒ **渠道配置错误**，报文给出两条出路（逐条写精确键，或保留唯一的 `*`）。
@@ -421,7 +424,7 @@ X-Channel-Options: {"model": "minimaxH3"}      // 钉住：表外名字落这一
 
 🔴 **这是对外契约变更**：改动前"任意模型名都通过（一律走 `ai.minimaxH3`）"，现在
 **未命中即 400**（且发生在任何上游请求之前）。要恢复旧行为，给渠道配
-`{"model": "minimaxH3"}` 或 `{"model_map": {"*": "minimaxH3"}}`。
+`{"model_map": {"*": "minimaxH3"}}`（**不要**再用 `{"model": "minimaxH3"}` —— 该键已撤除）。
 
 **仍未做完的前置（本实现的一处已知假设）：**
 

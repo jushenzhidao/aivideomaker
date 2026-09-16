@@ -14,7 +14,7 @@
 ## 现在钉什么
 
 1. `*` 是**唯一**被识别的通配形态，且**至多一条**；任何**非 `*` 却含 `*`** 的键 ⇒ 渠道配置错误；
-2. 判定顺序：**精确** > 名字本身是槽位 > **`*` 兜底** > **钉住** > 400；
+2. 判定顺序：**精确** > **`*` 兜底** > 名字本身是槽位 > **400**（`model` 钉住键已撤除）；
 3. `*` 兜底**不改写**已知槽位名（**已决定的规则**，见模块 docstring —— 不是缺口）；
 4. 值域 / 空键 / 重复键（含大小写折叠）/ 别名冲突 / 后缀与 `provider/` 剥离。
 
@@ -54,12 +54,10 @@ from ark_compat.channel_options import (  # noqa: E402
 from ark_compat.errors import ParamError  # noqa: E402
 
 
-def resolve(model, table=None, pin=None):
-    opts = {}
+def resolve(model, table=None, extra=None):
+    opts = dict(extra or {})
     if table is not None:
         opts[MODEL_MAP_KEY] = table
-    if pin is not None:
-        opts["model"] = pin
     return resolve_model(model, opts)
 
 
@@ -71,21 +69,23 @@ class TestCatchAllOnly(unittest.TestCase):
         self.assertEqual(r.slot, "wan27")
         self.assertEqual(r.source, SOURCE_MODEL_MAP)
 
-    def test_catchall_only_fires_when_nothing_else_matches(self):
-        """精确键优先于兜底 —— 同一条请求命中精确键时，兜底不许插手。"""
+    def test_exact_key_beats_the_catchall(self):
+        """精确键优先于兜底 —— 想放行某个名字，就把它写进精确表。"""
         r = resolve("doubao-seedance-2-0-260128", {"doubao-seedance-2-0-260128": "wan27",
                                                    CATCH_ALL: "seedance20"})
         self.assertEqual(r.slot, "wan27")
 
-    def test_catchall_does_not_rewrite_a_slot_name(self):
-        """已知槽位名优先于兜底（**已决定的规则**）。
+    def test_catchall_rewrites_even_a_slot_name(self):
+        """**兜底覆盖一切**（2026-09-17 用户裁定）—— 连调用方写出的真槽位名也改写。
 
-        ⚠️ 这条是刻意选的代价：配了 `{"*": X}` 也**不会**改写调用方明确写出的槽位名。
-        想强制一档 ⇒ 别让调用方写槽位名，或改用 `model` 钉住（那时冲突会**报错**）。
+        理由：兜底＝渠道声明"除我明确列出的以外，一律落这一档"；不覆盖的话，运维
+        "这个渠道只跑某一档"的意图就落空。这也是 `model` 钉住键撤除后**唯一**的强制手段。
+        代价必须由证据兜住：改写进 `warnings` + `model_source=model_map`，**不静默**。
         """
         r = resolve("seedance20", {CATCH_ALL: "wan27"})
-        self.assertEqual(r.slot, "seedance20", "槽位名被兜底改写了？那是规则变了")
-        self.assertEqual(r.source, SOURCE_PASSTHROUGH)
+        self.assertEqual(r.slot, "wan27", "兜底没覆盖槽位名？那是规则变了")
+        self.assertEqual(r.source, SOURCE_MODEL_MAP)
+        self.assertTrue(any("fallback" in w for w in r.warnings), "改写必须留痕")
 
     def test_catchall_is_warned(self):
         """兜底改写了模型值 ⇒ 必须留痕（静默改模型的账单差异是本项目最贵的一类缺陷）。"""
@@ -102,21 +102,24 @@ class TestCatchAllOnly(unittest.TestCase):
 
 
 class TestPrecedence(unittest.TestCase):
-    """精确 > 槽位名 > 兜底 > 钉住 > 400。"""
+    """精确 > 兜底 > 槽位名 > 400（`model` 钉住已撤除，不再参与判定）。"""
 
     def test_exact_beats_everything(self):
-        r = resolve("a-foo", {"a-foo": "wan27", CATCH_ALL: "seedance20"}, pin=None)
+        r = resolve("a-foo", {"a-foo": "wan27", CATCH_ALL: "seedance20"})
         self.assertEqual(r.slot, "wan27")
 
-    def test_pin_applies_when_nothing_matches(self):
-        r = resolve("nope-1", None, pin="wan27")
-        self.assertEqual(r.slot, "wan27")
+    def test_removed_pin_key_is_rejected(self):
+        """`model` 键已撤除 ⇒ **任何**取值都报错（连"与解析结果一致"也不例外）。
 
-    def test_pin_conflict_is_a_channel_error(self):
-        """钉住与解析结果不同 ⇒ 报错，**不静默改模型**。"""
-        with self.assertRaises(ParamError) as ctx:
-            resolve("seedance20", None, pin="wan27")
-        self.assertEqual(ctx.exception.param, "X-Channel-Options")
+        一致时也放行是上一版的行为（它当时只在冲突时报错）；撤除后它整体没有语义了，
+        再放行就会让运维以为它还在生效。
+        """
+        for value in ("wan27", "seedance20"):
+            with self.subTest(pin=value):
+                with self.assertRaises(ParamError) as ctx:
+                    resolve(value, None, extra={"model": value})
+                self.assertEqual(ctx.exception.param, "X-Channel-Options")
+                self.assertIn("removed", str(ctx.exception))
 
     def test_unknown_without_any_fallback_is_the_callers_fault(self):
         with self.assertRaises(ParamError) as ctx:

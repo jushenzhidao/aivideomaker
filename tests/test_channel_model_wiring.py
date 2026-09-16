@@ -112,14 +112,20 @@ class TestModelResolutionIsWired(unittest.TestCase):
         )
         self.assertEqual(self.procedures_hit(), [], "拒绝必须发生在上游调用之前")
 
-    def test_pinned_slot_is_used_when_nothing_matches(self):
-        """渠道钉住 + 调用方写了个表外的名字 ⇒ 落钉住值。"""
-        r = self.post(ark_body("doubao-seedance-2-5-260628"), '{"model": "wan27"}')
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(self.procedures_hit(), ["/api/ai.wan27"])
+    def test_removed_pin_key_is_refused_not_ignored(self):
+        """`model` 钉住键**已撤除**（2026-09-17）⇒ 响亮失败，不静默忽略、不发上游请求。
+
+        静默忽略是更坏的选择：那个键的语义是"本渠道只服务某个槽位"，运维据此以为
+        "调用方传错名字会被拦住" —— 一旦它不再生效却仍被接受，那层保护就无声消失了。
+        """
+        r = self.post(ark_body("wan27"), '{"model": "wan27"}')
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertEqual(r.json()["error"]["param"], CHANNEL_OPTIONS_HEADER)
+        self.assertIn("removed", r.json()["error"]["message"], "报文要说清这是被撤除的键")
+        self.assertEqual(self.procedures_hit(), [], "拒绝必须发生在上游调用之前")
 
     def test_unknown_model_is_refused_before_any_upstream_call(self):
-        """未命中且没有钉住 ⇒ 400，且**一个上游请求都不发**（带上凭据的请求不浪费）。"""
+        """表外名字且没有兜底 ⇒ 400，且**一个上游请求都不发**（带上凭据的请求不浪费）。"""
         r = self.post(ark_body("doubao-seedance-2-5-260628"))
         self.assertEqual(r.status_code, 400, r.text)
         self.assertEqual(r.json()["error"]["param"], "model", "调用方的错，param 必须指向 model")
@@ -139,11 +145,17 @@ class TestModelResolutionIsWired(unittest.TestCase):
                 self.assertEqual(self.procedures_hit(), [])
 
     def test_pin_conflict_is_a_channel_configuration_error(self):
-        """渠道钉 `wan27` 而请求明确指名 `minimaxH3` ⇒ 报错，**不静默改模型**。"""
-        r = self.post(ark_body("minimaxH3"), '{"model": "wan27"}')
-        self.assertEqual(r.status_code, 400, r.text)
-        self.assertEqual(r.json()["error"]["param"], CHANNEL_OPTIONS_HEADER)
-        self.assertEqual(self.procedures_hit(), [])
+        """撤除后的 `model` 键：**任何**取值都被拒（连"与解析结果一致"也不例外）。
+
+        与上一版不同 —— 那时它只在**冲突**时报错、一致时放行；撤除后它整体不再有语义，
+        所以"一致"也不再是免死牌（否则运维会以为它还在生效）。
+        """
+        for value in ("wan27", "minimaxH3"):
+            with self.subTest(pin=value):
+                r = self.post(ark_body(value), f'{{"model": "{value}"}}')
+                self.assertEqual(r.status_code, 400, r.text)
+                self.assertEqual(r.json()["error"]["param"], CHANNEL_OPTIONS_HEADER)
+                self.assertEqual(self.procedures_hit(), [])
 
 
 class TestResolutionEvidence(unittest.TestCase):
@@ -186,15 +198,20 @@ class TestResolutionEvidence(unittest.TestCase):
             "未验证槽位不告警 = 允许但不静默",
         )
 
-    def test_known_slot_name_is_not_overridden_by_a_wildcard(self):
-        """调用方**指名**了一个真槽位时，`"*"` 兜底不许改写它（② 优先于 ③，刻意）。
+    def test_catchall_overrides_even_a_slot_name(self):
+        """**兜底覆盖一切**（2026-09-17 用户裁定）：连调用方写出的真槽位名也改写。
 
-        代价是：想"这个渠道一律跑某一档"不能靠 `"*"` 覆盖槽位名，要用 `model` 钉住
-        （钉住与指名冲突会报渠道配置错误 —— 见 `TestModelResolutionIsWired`）。
+        理由：兜底＝渠道声明"除我明确列出的以外，一律落这一档"；不覆盖的话，运维
+        "这个渠道只跑某一档"的意图就会落空 —— 而 `model` 钉住键已撤除，
+        兜底是**唯一**的强制手段。代价由证据兜住：改写进 `warnings`，
+        证据字段标 `model_source=model_map`，**不静默**。
         """
         j = self.dry_run(ark_body("minimaxH3"), '{"model_map": {"*": "seedance25"}}')
-        self.assertEqual(j["effective"]["model"], "minimaxH3")
-        self.assertEqual(j["effective"]["model_source"], "passthrough")
+        self.assertEqual(j["effective"]["model"], "seedance25", "兜底没覆盖槽位名？那是规则变了")
+        self.assertEqual(j["effective"]["model_source"], "model_map")
+        self.assertTrue(
+            any("fallback" in w for w in j["warnings"]), "改写必须留痕（不静默换模型）"
+        )
 
     def test_resolution_is_warned_not_silent(self):
         """命中映射/钉住都要有告警 —— 静默改模型的账单差异是本项目最贵的一类缺陷。"""

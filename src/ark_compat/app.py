@@ -1146,8 +1146,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 不该先拿到"参数不合法"这种更像配置问题的错误。
         upstream, credential = _upstream_and_credential_for(request)
 
-        # 渠道级选项头（模型相关键）：`model` 钉住槽位 / `model_map` 映射，**默认上游 model
-        # 透传**。读头只在这一层（translate 保持纯函数）；坏掉的头**拒绝**而不是当成没配 ——
+        # 渠道级选项头：`model_map` 映射（精确键 + 至多一条 `*` 兜底），**默认上游 model
+        # 透传**；`model`（钉住）**已撤除**，遗留即拒绝（见 channel_options）。
+        # 读头只在这一层（translate 保持纯函数）；坏掉的头**拒绝**而不是当成没配 ——
         # 当成没配会静默按透传跑掉，而运维以为自己的映射生效了。
         channel_options = parse_channel_options(request.headers.get(CHANNEL_OPTIONS_HEADER))
         plan = translate_create(body, channel_options=channel_options)

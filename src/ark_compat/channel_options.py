@@ -1,4 +1,4 @@
-"""渠道级选项头 `X-Channel-Options` 的**模型**键：钉住槽位 / 模型映射 / 默认透传。
+"""渠道级选项头 `X-Channel-Options` 的**模型**键：模型映射 / 默认透传。
 
 本模块是这几个键的**唯一解析点**。键名与语义与视频适配层（`video-adapter`，
 `docs/decisions/ADR-012-model-name-passthrough.md`）**逐字同形** —— 两边共用一套口径，
@@ -6,8 +6,8 @@
 
 | 键 | 语义 |
 | --- | --- |
-| `model` | 渠道级**钉住槽位**：请求名解析不出槽位时以它为准；解析得出**且与它不同** ⇒ 渠道配置错误（不静默改模型） |
 | `model_map` | 模型名 → 上游槽位 的映射表：**精确键**（要覆盖一族名字就逐条写）+ **至多一条 `*` 兜底**。别名 `upstream_model_map`（两个都写且不同 ⇒ 拒绝） |
+| ~~`model`~~ | 🔴 **已撤除**（2026-09-17）：原先的"渠道钉住槽位"。遗留它 ⇒ 渠道配置错误，**不静默忽略**（见 `_reject_removed_keys`） |
 
 **默认 = 上游 model 透传**：不配任何键时，调用方写的名字**原样当作上游槽位**。本站的"上游槽位"
 就是站点 procedure 名里那一段（`ai.minimaxH3` ⇒ 槽位 `minimaxH3`）—— 站点把模型编进了
@@ -15,21 +15,22 @@ procedure 路径，创建请求体里**没有** model 字段（`web_client.creat
 
 🔴 **不留任何名字猜测表**：曾经有一张"名字里含 seedance 就走 seedance20"的正则表，它把 5 个不同
 代次的原生 ID 静默压进同一个槽位且不回告警（实测账单差 7.3 倍）。已删除，**不要加回来** ——
-"哪个名字落哪个槽位"是**控制面知识**，只能由渠道用 `model_map` / `model` 声明。
+"哪个名字落哪个槽位"是**控制面知识**，只能由渠道用 `model_map` 声明。
 
 ## 判定顺序
 
-    ① 映射表**精确**键命中            → slot = 表值                 source=model_map
-    ② 名字本身是已知上游槽位（剥后缀后）→ slot = 名字（**逐字透传**）   source=passthrough
-    ③ 映射表的 **`*` 兜底**命中        → slot = 表值                 source=model_map
-    ④ 都没命中、但渠道**钉住**了槽位    → slot = 钉住值               source=pinned
-    ⑤ 其余                            → **400**（报文列出已知槽位 + 表里已声明的键 + 怎么改）
+    ① 映射表**精确**键命中            → slot = 表值                source=model_map
+    ② 映射表的 **`*` 兜底**命中        → slot = 表值                source=model_map
+    ③ 名字本身是已知上游槽位（剥后缀后）→ slot = 名字（**逐字透传**）  source=passthrough
+    ④ 其余                            → **400**（报文列出已知槽位 + 表里已声明的键 + 怎么改）
 
-**② 排在 ③ 前面是刻意的**：调用方**指名**了一个真槽位时，不该被兜底规则改写。
-代价是"配了兜底、调用方又写槽位名"时兜底**不会生效** —— 这是**已决定的规则**，不是缺口：
-想强制一档就别让调用方写槽位名（或改用 ④ 钉住 —— 那时两者冲突会**报错**，而不是静默择一）。
+**② 排在 ③ 前面是刻意的**（2026-09-17 用户裁定）：**兜底＝渠道声明"除我明确列出的以外，一切名字都落这一档"**
+⇒ 它**要**能覆盖调用方写出的槽位名，否则运维"这个渠道只跑某一档"的意图会落空。
+这也是本层**唯一**的"强制一档"手段（`model` 钉住键已撤除）：**要强制就配兜底**。
+代价：调用方点名别的模型会被改写 —— 因此每次改写都进 `warnings` 并留 `model_source=model_map` 证据，
+**不静默**；调用方若真要别的模型，运维得把那个名字放进**精确表**（① 优先于 ②）。
 
-## 通配：**降级为唯一一条 `*` 兜底**（2026-09-17）
+## 通配：**唯一一条 `*` 兜底**（2026-09-17 降级）
 
 原先支持任意通配模式（`doubao-seedance-*`），于是需要"多命中怎么排"的规则，而两个项目在这一点上
 各写了一套（`docs/channel-options-wildcard-compare.md` 记了那场对比）。现在**整套多模式机制拆掉**：
@@ -40,6 +41,16 @@ procedure 路径，创建请求体里**没有** model 字段（`web_client.creat
   已知的（官方模型 ID 就那几个），所以这不是负担；
 - 校验：任何**非 `*` 却含 `*`** 的键（`doubao-seedance-*` / `a*b`）一律 `channel_config_error`，
   报文给出两条出路（逐条写精确键，或保留唯一的 `*` 兜底）。
+
+## `model`（钉住）为什么撤除，以及"强制一档"怎么办
+
+它当时只做一致性断言（与本次解析结果不一致就报错），**不承担任何名字转换** —— 与 `model_map`
+职责重复。撤除之后"强制一档"**由 `*` 兜底承接**（② 优先于 ③，见上）：渠道配 `{"*": X}`
+就是"本渠道一律跑 X"。⚠️ 语义与钉住**不等价**：兜底是**改写**（请求照样放行，命中写进
+`model_source` 与 `warnings`），钉住是**拦下请求**。
+
+⚠️ 遗留 `model` 键**必须响亮失败**，不能静默忽略：以为它还生效的运维会以为这个渠道只跑某个槽位，
+而实际上调用方写的任何合法槽位名都会被逐字发到上游。
 
 ⚠️ 两处必须知道的边界：
 
@@ -64,13 +75,17 @@ from .errors import ParamError
 #: 头名。Starlette 的 `request.headers` 查表大小写不敏感，这里给规范写法。
 CHANNEL_OPTIONS_HEADER = "X-Channel-Options"
 
-PIN_KEY = "model"
 MODEL_MAP_KEY = "model_map"
 #: `model_map` 的别名：`docs/03_引擎架构.md` §4.2 早先登记过这个名字（当时并未实现），
 #: 运维可能照那份文档配 —— 两个名字都接受，但**不替配置方挑一个**（见 `_model_map`）。
 MODEL_MAP_ALIAS = "upstream_model_map"
 
-_SUPPORTED_KEYS = (PIN_KEY, MODEL_MAP_KEY, MODEL_MAP_ALIAS)
+_SUPPORTED_KEYS = (MODEL_MAP_KEY, MODEL_MAP_ALIAS)
+
+#: **撤除过**的渠道键：出现即报错（见 `_reject_removed_keys`），**不静默忽略**。
+#: `model` 曾经的语义是"渠道钉住槽位"（一致性断言，不承担翻译）——
+#: 以为它还生效的运维会以为这个渠道只跑某个槽位，而实际上调用方写的任何合法槽位名都会被逐字发出。
+_REMOVED_KEYS = ("model",)
 
 #: **唯一**被识别的通配形态（兜底键）。2026-09-17 起不再支持其它模式，见模块 docstring。
 CATCH_ALL = "*"
@@ -110,7 +125,6 @@ _RESOLUTION_SUFFIX_RE = re.compile(r"_(480p|720p|1080p)\s*$", re.I)
 #: 解析来源，进证据字段（`effective.model_source`）。
 SOURCE_MODEL_MAP = "model_map"
 SOURCE_PASSTHROUGH = "passthrough"
-SOURCE_PINNED = "pinned"
 
 
 @dataclass(frozen=True)
@@ -142,7 +156,7 @@ def bare_model_name(model: Any) -> str:
 
 
 def parse_channel_options(raw: Any) -> dict[str, Any]:
-    """头原文 → dict。**只做结构校验**，语义校验在 `_model_map` / `_pinned`。
+    """头原文 → dict。**只做结构校验**，语义校验在 `_reject_removed_keys` / `_model_map`。
 
     空串 = 没配。非 JSON / 非对象一律拒绝 —— 一个坏掉的头不该被当成"没配"（那会静默
     用默认透传跑掉，而运维以为自己的映射生效了）。
@@ -157,7 +171,7 @@ def parse_channel_options(raw: Any) -> dict[str, Any]:
     except ValueError as exc:
         raise _config_error(
             f"X-Channel-Options is not valid JSON ({exc}); it must be a JSON object, e.g. "
-            '{"model": "minimaxH3"} or {"model_map": {"doubao-seedance-2-0-260128": "seedance20"}}'
+            '{"model_map": {"doubao-seedance-2-0-260128": "seedance20"}}'
         ) from exc
     if not isinstance(obj, dict):
         raise _config_error(
@@ -165,6 +179,22 @@ def parse_channel_options(raw: Any) -> dict[str, Any]:
             f"{type(obj).__name__} — supported keys: {', '.join(_SUPPORTED_KEYS)}"
         )
     return obj
+
+
+def _reject_removed_keys(options: Mapping[str, Any]) -> None:
+    """撤除过的渠道键一旦出现 ⇒ 渠道配置错误（**不静默忽略**）。
+
+    静默忽略是更坏的选择：那个键的语义是"本渠道只服务某个槽位"，运维据此认为
+    "调用方传错名字会被拦住"；一旦它不再生效却仍被接受，那层保护就无声消失了。
+    """
+    for key in _REMOVED_KEYS:
+        if key in options:
+            raise _config_error(
+                f"X-Channel-Options.{key} was removed on 2026-09-17: the channel-level pinned slot "
+                "is gone. Use model_map instead — either an exact key (the name the caller sends → "
+                'the upstream slot name) or the single "*" catch-all — or have callers send the slot '
+                f'name verbatim. Remove the "{key}" key from the channel configuration.'
+            )
 
 
 def _model_map(options: Mapping[str, Any]) -> dict[str, str]:
@@ -224,41 +254,23 @@ def _model_map(options: Mapping[str, Any]) -> dict[str, str]:
     return out
 
 
-def _pinned(options: Mapping[str, Any]) -> str:
-    """`X-Channel-Options.model` —— 渠道钉住的槽位（空串 = 没钉）。"""
-    raw = options.get(PIN_KEY)
-    if raw is None:
-        return ""
-    pin = str(raw).strip()
-    if not pin:
-        raise _config_error(
-            "X-Channel-Options.model must be a non-empty string (drop the key instead of blanking it)"
-        )
-    if pin not in KNOWN_SLOTS:
-        raise _config_error(
-            f'X-Channel-Options.model="{pin}" is not a known upstream slot (expected one of: '
-            f"{', '.join(KNOWN_SLOTS)})"
-        )
-    return pin
-
-
 def resolve_model(model: Any, options: Mapping[str, Any] | None) -> ModelResolution:
     """调用方模型名 → `(槽位, 来源, 是否已实测, 告警)`。**不猜、不兜底**（判定顺序见模块 docstring）。
 
-    钉住值若与 ①②③ 的结果**不同** ⇒ 渠道配置错误：一个渠道声明"我只跑 X"，而这次请求明确落到了
-    Y，两边有一个是错的。这里**不静默改模型** —— 静默改模型的账单差异，是本项目定义为最贵的一类缺陷。
+    ⚠️ **两条已决定的规则**（不是缺口）：
 
-    ⚠️ **已决定的规则**（不是缺口）：② 命中的名字是**已知槽位**时，`*` 兜底**不会**改写它。
-    于是"配了兜底 + 调用方写槽位名"时兜底静默不生效 —— 想强制一档就别让调用方写槽位名，
-    或改用 ④ 钉住（那时冲突会**报错**，而不是静默择一）。
+    1. **配了 `*` 兜底时，它会覆盖调用方写出的槽位名** —— 兜底＝渠道声明"除我列出的以外
+       一律落这一档"，这正是本层唯一的"强制一档"手段（`model` 钉住键已撤除）。
+       每次改写都进 `warnings` 且留 `model_source=model_map` 证据，**不静默**；
+    2. **精确键永远优先于兜底**（① > ②）—— 想让某个名字走别的槽位，就把它写进精确表。
     """
     options = options or {}
+    _reject_removed_keys(options)
     name = bare_model_name(model)
     if not name:
         raise ParamError("model is required", "model")
 
     table = _model_map(options)
-    pinned = _pinned(options)
     warnings: list[str] = []
 
     if name in table:
@@ -266,20 +278,14 @@ def resolve_model(model: Any, options: Mapping[str, Any] | None) -> ModelResolut
         warnings.append(
             f'model "{name}" → upstream slot "{slot}" (exact hit in the channel model_map)'
         )
-    elif name in KNOWN_SLOTS:
-        slot, source = name, SOURCE_PASSTHROUGH
     elif CATCH_ALL in table:
         slot, source = table[CATCH_ALL], SOURCE_MODEL_MAP
         warnings.append(
-            f'model "{name}" is not an upstream slot; the channel\'s model_map "{CATCH_ALL}" '
-            f'fallback maps it to upstream slot "{slot}"'
+            f'model "{name}" → upstream slot "{slot}" (the channel\'s model_map "{CATCH_ALL}" '
+            "fallback overrides every name it does not list explicitly)"
         )
-    elif pinned:
-        slot, source = pinned, SOURCE_PINNED
-        warnings.append(
-            f'model "{name}" is not an upstream slot; the channel pins upstream slot "{pinned}" '
-            "(X-Channel-Options.model)"
-        )
+    elif name in KNOWN_SLOTS:
+        slot, source = name, SOURCE_PASSTHROUGH
     else:
         hint = (
             f" The channel model_map declares: {', '.join(sorted(table))}."
@@ -289,16 +295,8 @@ def resolve_model(model: Any, options: Mapping[str, Any] | None) -> ModelResolut
         raise ParamError(
             f'unknown model "{name}". This layer forwards the model name verbatim, so it must be '
             f"one of the upstream slots: {', '.join(KNOWN_SLOTS)}.{hint} Add an exact entry (or a "
-            f'single "{CATCH_ALL}" catch-all) to the channel\'s X-Channel-Options.model_map, or pin '
-            "one slot with X-Channel-Options.model.",
+            f'single "{CATCH_ALL}" catch-all) to the channel\'s X-Channel-Options.model_map.',
             "model",
-        )
-
-    if pinned and slot != pinned:
-        raise _config_error(
-            f'X-Channel-Options.model pins "{pinned}" but this request resolves to upstream slot '
-            f'"{slot}" (source={source}); fix the channel pin or the caller\'s model — this layer '
-            "will not silently substitute one model for another"
         )
 
     verified = slot in VERIFIED_SLOTS

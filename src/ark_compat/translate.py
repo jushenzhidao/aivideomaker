@@ -258,9 +258,9 @@ def translate_create(
     它们不影响纯翻译与 dry-run，但真实提交前必须被拒 —— 见 `app.py`。
 
     `channel_options`：渠道级选项头 `X-Channel-Options` 解析出来的 dict（**读头在 app 层**，
-    本函数保持纯函数）。这里只消费模型相关键 —— `model`（渠道钉住槽位）与 `model_map`
-    （调用方名 → 上游槽位，别名 `upstream_model_map`），**默认 = 上游 model 透传**；
-    解析规则、值与冲突处理全在 `channel_options.resolve_model`，本函数只把它接到
+    本函数保持纯函数）。这里只消费 `model_map`（调用方名 → 上游槽位，别名
+    `upstream_model_map`；**精确键 + 至多一条 `*` 兜底**），**默认 = 上游 model 透传**；
+    解析规则与冲突处理全在 `channel_options.resolve_model`，本函数只把它接到
     `effective.model` / `effective.model_source` 与 `web_params["procedure"]` 上。
     """
     if not isinstance(body, Mapping):
@@ -271,7 +271,9 @@ def translate_create(
     incompatible: list[str] = []
 
     # `model` 决定**上游槽位**（= 站点 procedure 名里那一段）。判定顺序：
-    #   ① 渠道映射表精确命中 → ② 名字本身是已知上游槽位（**默认透传**）→ ③ 渠道钉住值 → ④ 400。
+    #   ① 渠道映射表精确命中 → ② 名字本身是已知上游槽位（**默认透传**）→ ③ `*` 兜底 → ④ 400。
+    # `X-Channel-Options.model`（钉住）**已撤除**（2026-09-17）⇒ 本层刻意不提供"强制一档"：
+    #   `*` 兜底也不改写调用方点名的槽位名（请求值 = 执行值）。要强制请在上层统一名字。
     # 规则、值域与冲突处理见 `channel_options.resolve_model`（与视频适配层同一套键与语义）。
     # ⚠️ 它**不进上游请求体** —— 站点创建体的键是白名单（没有 model 字段），站点把模型编在
     #    procedure 路径上 ⇒ "落到哪个模型"在这里表现为**换 procedure**（`web_params["procedure"]`）。
@@ -522,7 +524,7 @@ def translate_create(
             "output_format": UPSTREAM_OUTPUT_FORMAT,
             "billed": params["tier"] == "base" or duration > FREE_MAX_DURATION,
             # 模型解析结果 —— 与 `requested.model`（调用方写的）**并列**：一个是请求值，
-            # 一个是真发出去的值。`model_source` ∈ model_map | passthrough | pinned：
+            # 一个是真发出去的值。`model_source` ∈ model_map | passthrough：
             # 没有它就说不出"名字是怎么变成上游槽位的"，而这条链直接决定计费档位。
             "model": model_resolution.slot,
             "model_source": model_resolution.source,

@@ -41,8 +41,9 @@ DEFAULT_VISITOR_ID = "f29ee26edcb4e8b96ee17e277a384f6f"
 #   ② `channel_options.VERIFIED_SLOTS` 以它为唯一来源 —— 它是**唯一已实测存在**的生成
 #      procedure（三次真实提交的成片 URL 里一律是 `minimax_h3`，报告 AVM12-OPEN-UPSTREAM）。
 #
-# 上游模型名 → procedure 的**映射由渠道声明**（`X-Channel-Options.model` 钉住 /
-# `.model_map` 映射），**默认 = 调用方模型名透传**。站点把模型编在 procedure 路径上
+# 上游模型名 → procedure 的**映射由渠道声明**（`X-Channel-Options.model_map`：精确键 +
+# 至多一条 `*` 兜底；`model` 钉住键 2026-09-17 已撤除），**默认 = 调用方模型名透传**。
+# 站点把模型编在 procedure 路径上
 # （`ai.<槽位>`），创建体里没有 model 字段 ⇒ "换模型"就是"换 procedure"。
 # ⚠️ 其余 10 个站点模型键的 procedure 名**尚未取得**（现有抓包只是路由级 chunk，搜不到），
 #    现按同一命名形态推断，并在告警与证据字段里标注 `model_verified=false`。
