@@ -1,13 +1,13 @@
 """渠道级选项头 `X-Channel-Options` 的**模型**键：钉住槽位 / 模型映射 / 默认透传。
 
 本模块是这几个键的**唯一解析点**。键名与语义与视频适配层（`video-adapter`，
-`docs/decisions/ADR-012-model-name-passthrough.md`、`docs/04_能力映射与降级.md`）**逐字同形**
-—— 两边共用一套口径，改这里必须同步改那边（约定原文见本仓库 `docs/channel-options-model.md`）。
+`docs/decisions/ADR-012-model-name-passthrough.md`）**逐字同形** —— 两边共用一套口径，
+改这里必须同步改那边（约定原文见本仓库 `docs/channel-options-model.md`）。
 
 | 键 | 语义 |
 | --- | --- |
 | `model` | 渠道级**钉住槽位**：请求名解析不出槽位时以它为准；解析得出**且与它不同** ⇒ 渠道配置错误（不静默改模型） |
-| `model_map` | 调用方模型名 → 上游槽位 的映射表。**精确键优先；通配键（`*`）按特异性最长匹配**。别名 `upstream_model_map`（两个都写且不同 ⇒ 拒绝） |
+| `model_map` | 模型名 → 上游槽位 的映射表：**精确键**（要覆盖一族名字就逐条写）+ **至多一条 `*` 兜底**。别名 `upstream_model_map`（两个都写且不同 ⇒ 拒绝） |
 
 **默认 = 上游 model 透传**：不配任何键时，调用方写的名字**原样当作上游槽位**。本站的"上游槽位"
 就是站点 procedure 名里那一段（`ai.minimaxH3` ⇒ 槽位 `minimaxH3`）—— 站点把模型编进了
@@ -17,27 +17,29 @@ procedure 路径，创建请求体里**没有** model 字段（`web_client.creat
 代次的原生 ID 静默压进同一个槽位且不回告警（实测账单差 7.3 倍）。已删除，**不要加回来** ——
 "哪个名字落哪个槽位"是**控制面知识**，只能由渠道用 `model_map` / `model` 声明。
 
-## 判定顺序（与视频适配层同序）
+## 判定顺序
 
     ① 映射表**精确**键命中            → slot = 表值                 source=model_map
-    ② 名字本身是已知上游槽位（含剥后缀后）→ slot = 名字（**逐字透传**）  source=passthrough
-    ③ 映射表**通配**键命中（特异性最长） → slot = 表值                 source=model_map
+    ② 名字本身是已知上游槽位（剥后缀后）→ slot = 名字（**逐字透传**）   source=passthrough
+    ③ 映射表的 **`*` 兜底**命中        → slot = 表值                 source=model_map
     ④ 都没命中、但渠道**钉住**了槽位    → slot = 钉住值               source=pinned
-    ⑤ 其余                            → 400，报文列出已知槽位 + 表里已声明的键
+    ⑤ 其余                            → **400**（报文列出已知槽位 + 表里已声明的键 + 怎么改）
 
-② 排在 ③ 前面是刻意的：调用方**明确写了一个上游槽位名**时，不该被一条 `"*"` 兜底规则改写。
-要"这个渠道只跑某一档"，用 ④ 钉住（并接受"调用方另有指名时按配置错误报"）。
+**② 排在 ③ 前面是刻意的**：调用方**指名**了一个真槽位时，不该被兜底规则改写。
+代价是"配了兜底、调用方又写槽位名"时兜底**不会生效** —— 这是**已决定的规则**，不是缺口：
+想强制一档就别让调用方写槽位名（或改用 ④ 钉住 —— 那时两者冲突会**报错**，而不是静默择一）。
 
-## 通配键
+## 通配：**降级为唯一一条 `*` 兜底**（2026-09-17）
 
-`"*"` 匹配任意字符（含空），可出现在键的任意位置，例如：
+原先支持任意通配模式（`doubao-seedance-*`），于是需要"多命中怎么排"的规则，而两个项目在这一点上
+各写了一套（`docs/channel-options-wildcard-compare.md` 记了那场对比）。现在**整套多模式机制拆掉**：
+`*` 是**唯一**被识别的通配形态、**至多一条**，其余键一律当精确键。
 
-    {"doubao-seedance-*": "seedance20", "*": "minimaxH3"}
-
-同一名字被多个通配键命中时，取**特异性最高**的那个：先比"模式里非通配字符的个数"，再比模式串本身
-（字典序，大者胜）—— 保证结果**与书写顺序无关**（JSON 对象顺序不该决定计费档位）。
-匹配**区分大小写**（与精确键一致），但**同一模式的大小写变体视为重复**（JSON 同名键会静默覆盖，
-而"哪一条生效"直接决定账单）。
+- 好处：**不可能出现重叠** ⇒"优先级 / 最长匹配 / 歧义报错"这一整类问题消失；
+- 代价：要覆盖一族名字（`doubao-seedance-*`）**必须逐条写精确键** —— 而那些名字是有限的、
+  已知的（官方模型 ID 就那几个），所以这不是负担；
+- 校验：任何**非 `*` 却含 `*`** 的键（`doubao-seedance-*` / `a*b`）一律 `channel_config_error`，
+  报文给出两条出路（逐条写精确键，或保留唯一的 `*` 兜底）。
 
 ⚠️ 两处必须知道的边界：
 
@@ -55,7 +57,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from .errors import ParamError
 
@@ -70,9 +72,8 @@ MODEL_MAP_ALIAS = "upstream_model_map"
 
 _SUPPORTED_KEYS = (PIN_KEY, MODEL_MAP_KEY, MODEL_MAP_ALIAS)
 
-#: 通配符。只支持 `*`（匹配任意字符）—— 不做正则（正则能表达的东西太宽，
-#: 一条写错的正则会把所有模型静默指到同一个槽位，正是本项目最怕的一类缺陷）。
-WILDCARD = "*"
+#: **唯一**被识别的通配形态（兜底键）。2026-09-17 起不再支持其它模式，见模块 docstring。
+CATCH_ALL = "*"
 
 #: 站点 procedure 的命名前缀（`ai.minimaxH3` ⇒ `ai.`）。前端两条线共用同一个站点。
 PROCEDURE_PREFIX = "ai."
@@ -96,7 +97,7 @@ SITE_MODEL_KEYS: tuple[str, ...] = (
 #: 已**实测**存在 procedure 的槽位。唯一证据：三次真实提交的成片 URL 里一律是 `minimax_h3`，
 #: 且 `ai.minimaxH3` 是唯一被观测到的生成 procedure（报告 AVM12-OPEN-UPSTREAM）。
 #: 🔴 本集合必须与 `web_client.CREATE_PROCEDURE` 的模型段一致 —— 门禁：
-#:    `tests/test_channel_model_options.py::TestVerifiedSlotMatchesProcedureConstant`。
+#:    `tests/test_channel_model_map_wildcard.py::TestVerifiedSlotMatchesProcedureConstant`。
 VERIFIED_SLOTS: frozenset[str] = frozenset({"minimaxH3"})
 
 #: 槽位值域 = 站点模型键 ∪ 已实测槽位（保序去重）。
@@ -166,24 +167,15 @@ def parse_channel_options(raw: Any) -> dict[str, Any]:
     return obj
 
 
-def _glob_regex(pattern: str) -> re.Pattern[str]:
-    """`*` → `.*`，其余字符**逐字转义**（不做正则）。整串匹配。"""
-    body = "".join(".*" if ch == WILDCARD else re.escape(ch) for ch in pattern)
-    return re.compile(body + r"\Z", re.S)
-
-
-def _specificity(pattern: str) -> tuple[int, str]:
-    """通配键的特异性：**非通配字符多者胜**，同长再比模式串（保证与书写顺序无关）。"""
-    return (len(pattern.replace(WILDCARD, "")), pattern)
-
-
-def _model_map(options: dict[str, Any]) -> dict[str, str]:
-    """渠道声明的映射表 `{"<调用方写的名字或通配模式>": "<上游槽位>"}`。
+def _model_map(options: Mapping[str, Any]) -> dict[str, str]:
+    """渠道声明的映射表 `{"<调用方写的名字或 *>": "<上游槽位>"}`。
 
     · 别名 `upstream_model_map` 等价；两个都写且内容不同 ⇒ 拒绝（自相矛盾的配置不该由我们挑一个）；
     · 值必须落在 `KNOWN_SLOTS` 里：给一个上游不认识的槽位，等于把 400 推到**已经带上凭据的**
       上游请求之后；
-    · 重复键（含大小写折叠）⇒ 拒绝：JSON 同名键会**静默覆盖**，而"哪一条生效"直接决定计费。
+    · 重复键（含大小写折叠）⇒ 拒绝：JSON 同名键会**静默覆盖**，而"哪一条生效"直接决定计费；
+    · **通配只认字面 `*`、且至多一条**（2026-09-17 降级）：其它含 `*` 的模式一律拒绝，
+      报文给出两条出路 —— 这让"多命中怎么排"这一整类问题**不可能发生**。
     """
     raw = options.get(MODEL_MAP_KEY)
     alias = options.get(MODEL_MAP_ALIAS)
@@ -209,6 +201,13 @@ def _model_map(options: dict[str, Any]) -> dict[str, str]:
             raise _config_error(
                 f"model_map entries must be non-empty strings (got {key!r}: {value!r})"
             )
+        if "*" in name and name != CATCH_ALL:
+            raise _config_error(
+                f"model_map key {name!r} uses a wildcard pattern; only the bare "
+                f'"{CATCH_ALL}" catch-all is supported (at most one entry). Write the names out as '
+                'exact keys (e.g. "doubao-seedance-2-0-260128"), or keep a single '
+                f'"{CATCH_ALL}" entry as the fallback for names the table does not list.'
+            )
         if slot not in KNOWN_SLOTS:
             raise _config_error(
                 f"model_map[{name!r}]={slot!r} is not a known upstream slot (expected one of: "
@@ -225,22 +224,7 @@ def _model_map(options: dict[str, Any]) -> dict[str, str]:
     return out
 
 
-def _wildcard_hit(table: dict[str, str], name: str) -> tuple[str, str] | None:
-    """通配键命中：返回 `(模式, 槽位)`，按特异性最高者。无命中返回 `None`。"""
-    best: tuple[str, str] | None = None
-    best_score: tuple[int, str] | None = None
-    for pattern, slot in table.items():
-        if WILDCARD not in pattern:
-            continue
-        if not _glob_regex(pattern).match(name):
-            continue
-        score = _specificity(pattern)
-        if best_score is None or score > best_score:
-            best, best_score = (pattern, slot), score
-    return best
-
-
-def _pinned(options: dict[str, Any]) -> str:
+def _pinned(options: Mapping[str, Any]) -> str:
     """`X-Channel-Options.model` —— 渠道钉住的槽位（空串 = 没钉）。"""
     raw = options.get(PIN_KEY)
     if raw is None:
@@ -258,15 +242,15 @@ def _pinned(options: dict[str, Any]) -> str:
     return pin
 
 
-def resolve_model(model: Any, options: dict[str, Any] | None) -> ModelResolution:
+def resolve_model(model: Any, options: Mapping[str, Any] | None) -> ModelResolution:
     """调用方模型名 → `(槽位, 来源, 是否已实测, 告警)`。**不猜、不兜底**（判定顺序见模块 docstring）。
 
     钉住值若与 ①②③ 的结果**不同** ⇒ 渠道配置错误：一个渠道声明"我只跑 X"，而这次请求明确落到了
     Y，两边有一个是错的。这里**不静默改模型** —— 静默改模型的账单差异，是本项目定义为最贵的一类缺陷。
 
-    ⚠️ **已登记的缺口**：①② 命中时，若有通配键**本可**匹配同一个名字、却给了不同槽位，
-    目前**不留痕**。当前行为被 `tests/test_channel_model_map_wildcard.py::TestShadowingGap`
-    钉住（刻意让"保持沉默"成为一个被做过的决定，而不是漂移出来的）。
+    ⚠️ **已决定的规则**（不是缺口）：② 命中的名字是**已知槽位**时，`*` 兜底**不会**改写它。
+    于是"配了兜底 + 调用方写槽位名"时兜底静默不生效 —— 想强制一档就别让调用方写槽位名，
+    或改用 ④ 钉住（那时冲突会**报错**，而不是静默择一）。
     """
     options = options or {}
     name = bare_model_name(model)
@@ -284,12 +268,11 @@ def resolve_model(model: Any, options: dict[str, Any] | None) -> ModelResolution
         )
     elif name in KNOWN_SLOTS:
         slot, source = name, SOURCE_PASSTHROUGH
-    elif (hit := _wildcard_hit(table, name)) is not None:
-        pattern, slot = hit
-        source = SOURCE_MODEL_MAP
+    elif CATCH_ALL in table:
+        slot, source = table[CATCH_ALL], SOURCE_MODEL_MAP
         warnings.append(
-            f'model "{name}" → upstream slot "{slot}" (matched the channel model_map pattern '
-            f'"{pattern}")'
+            f'model "{name}" is not an upstream slot; the channel\'s model_map "{CATCH_ALL}" '
+            f'fallback maps it to upstream slot "{slot}"'
         )
     elif pinned:
         slot, source = pinned, SOURCE_PINNED
@@ -305,9 +288,9 @@ def resolve_model(model: Any, options: dict[str, Any] | None) -> ModelResolution
         )
         raise ParamError(
             f'unknown model "{name}". This layer forwards the model name verbatim, so it must be '
-            f"one of the upstream slots: {', '.join(KNOWN_SLOTS)}.{hint} Add an exact or wildcard "
-            'entry (e.g. "*") to the channel\'s X-Channel-Options.model_map, or pin one slot with '
-            "X-Channel-Options.model.",
+            f"one of the upstream slots: {', '.join(KNOWN_SLOTS)}.{hint} Add an exact entry (or a "
+            f'single "{CATCH_ALL}" catch-all) to the channel\'s X-Channel-Options.model_map, or pin '
+            "one slot with X-Channel-Options.model.",
             "model",
         )
 

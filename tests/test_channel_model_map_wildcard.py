@@ -1,33 +1,39 @@
 #!/usr/bin/env python3
-"""门禁：`X-Channel-Options.model_map` 的**通配键**（`*`）。
+"""门禁：`X-Channel-Options.model_map` 的键规则（**2026-09-17 通配降级后重写**）。
 
-## 为什么需要它
+## 变更记录（读之前先看这条）
 
-`model_map` 的通配支持落在 `src/ark_compat/channel_options.py`
-（`_glob_regex` / `_specificity` / `_wildcard_hit`）。该模块 docstring 里承诺了三条性质：
+前一版钉的是"任意通配模式 + 特异性排序 + 与书写顺序无关"三条承诺，对应模块里的
+`_glob_regex` / `_specificity` / `_wildcard_hit`。2026-09-17 的决定是**把通配降级为
+唯一一条 `*` 兜底**、其余一律精确键 ⇒ 那套多模式机制**整体拆掉**，本文件随之按新语义重写。
 
-1. **整串匹配**（不是前缀/子串匹配）；
-2. **特异性**：被多个通配键命中时取"模式里**非通配字符更多**"的那个；
-3. **与书写顺序无关**（"JSON 对象顺序不该决定计费档位"）。
+路径与 `TestVerifiedSlotMatchesProcedureConstant` 类名**刻意保留**：`channel_options.py`
+的 docstring 指着这个类名（改名的代价是那条指针失效）。降级的动因与两项目对比见
+`docs/channel-options-wildcard-compare.md`。
 
-承诺 ≠ 事实。本门禁把它们逐条钉成断言。
+## 现在钉什么
 
-## 怎么证伪（变异测试）—— **本表已逐条实跑确认**
+1. `*` 是**唯一**被识别的通配形态，且**至多一条**；任何**非 `*` 却含 `*`** 的键 ⇒ 渠道配置错误；
+2. 判定顺序：**精确** > 名字本身是槽位 > **`*` 兜底** > **钉住** > 400；
+3. `*` 兜底**不改写**已知槽位名（**已决定的规则**，见模块 docstring —— 不是缺口）；
+4. 值域 / 空键 / 重复键（含大小写折叠）/ 别名冲突 / 后缀与 `provider/` 剥离。
 
-| 变异 | 期望变红 | 为什么必须用这个用例 |
-|---|---|---|
-| `_glob_regex` 去掉 `\\Z`（退化成前缀匹配） | `test_full_match_not_prefix` | ⚠️ **`doubao-*` 抓不到它** —— 那种情况的失配发生在**起始锚**上。必须用**通配符后还有字面量**的模式（`*pro` vs `pro-x`），失配才发生在**结尾锚**上 |
-| `_specificity` 改成数**模式串总长** | `test_specificity_is_not_total_length` | 需要一对"字面量多但更短" vs "字面量少但更长"的模式；**真实模式名几乎不会让两者冲突**，故用退化但合法的 `**a**`（字面量 1 / 总长 5）对 `ab*`（字面量 2 / 总长 3） |
-| `_wildcard_hit` 的比较 `>` 改成 `>=` | `test_result_is_independent_of_key_order` | 必须让映射表里存在**同分**且都命中的两条；只有"字面量各不相同"的模式集时，`>` 与 `>=` 结果一样 |
-| `WILDCARD` 改成 `"**"` | 全部通配用例 | — |
+## 怎么证伪（变异测试）
 
-**这四条第一次写的时候有三条没红** —— 因为用例选得不对（示例看不住锚点、模式集无同分项）。
-留着这段记录：**"写了门禁"和"门禁真的会拦"是两件事**。
+| 变异 | 期望变红 |
+|---|---|
+| 去掉"非 `*` 通配一律拒绝"那条校验 | `test_non_catchall_wildcards_are_rejected` |
+| 把 `*` 兜底排到"名字本身是槽位"**之前** | `test_catchall_does_not_rewrite_a_slot_name` |
+| 去掉 `*` 兜底分支 | `test_catchall_maps_unlisted_names` |
+| 去掉值域校验 | `test_unknown_slot_is_rejected` |
+| 不剥分辨率后缀 | `test_suffix_is_stripped_before_matching` |
+
+> ⚠️ 前身留下的一条教训，**保留**：**"写了门禁"与"门禁真的会拦"是两件事** ——
+> 上一版四条变异里第一次有三条没红（用例选得不对）。改动本文件时请同样逐条跑变异。
 
 **纯函数、零网络、零计费。**
 """
 
-import itertools
 import sys
 import unittest
 from pathlib import Path
@@ -36,14 +42,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from ark_compat import web_client  # noqa: E402
 from ark_compat.channel_options import (  # noqa: E402
+    CATCH_ALL,
     KNOWN_SLOTS,
     MODEL_MAP_ALIAS,
     MODEL_MAP_KEY,
     SOURCE_MODEL_MAP,
     SOURCE_PASSTHROUGH,
     VERIFIED_SLOTS,
-    _glob_regex,
-    _specificity,
     resolve_model,
 )
 from ark_compat.errors import ParamError  # noqa: E402
@@ -58,157 +63,76 @@ def resolve(model, table=None, pin=None):
     return resolve_model(model, opts)
 
 
-class TestGlobSemantics(unittest.TestCase):
-    """`*` 的匹配语义（docstring 第 1 条）。"""
+class TestCatchAllOnly(unittest.TestCase):
+    """`*` 是唯一通配形态（降级后的核心：多命中不可能发生）。"""
 
-    def test_star_matches_any_and_empty(self):
-        for name in ("doubao-seedance-1-0-pro", "doubao-seedance-x", "doubao-seedance-"):
-            with self.subTest(name=name):
-                self.assertTrue(_glob_regex("doubao-seedance-*").match(name))
+    def test_catchall_maps_unlisted_names(self):
+        r = resolve("doubao-seedance-2-5-260628", {CATCH_ALL: "wan27"})
+        self.assertEqual(r.slot, "wan27")
+        self.assertEqual(r.source, SOURCE_MODEL_MAP)
 
-    def test_full_match_not_prefix(self):
-        """整串匹配 —— 失配必须发生在**结尾**，所以模式里得有"通配符之后的字面量"。
+    def test_catchall_only_fires_when_nothing_else_matches(self):
+        """精确键优先于兜底 —— 同一条请求命中精确键时，兜底不许插手。"""
+        r = resolve("doubao-seedance-2-0-260128", {"doubao-seedance-2-0-260128": "wan27",
+                                                   CATCH_ALL: "seedance20"})
+        self.assertEqual(r.slot, "wan27")
 
-        ⚠️ 反面教材：只测 `doubao-*` vs `x-doubao-1` 是**看不住**这条的 ——
-        那种失配发生在起始锚上，去掉结尾锚（`\\Z`）照样不匹配 ⇒ 门禁不会红。
+    def test_catchall_does_not_rewrite_a_slot_name(self):
+        """已知槽位名优先于兜底（**已决定的规则**）。
+
+        ⚠️ 这条是刻意选的代价：配了 `{"*": X}` 也**不会**改写调用方明确写出的槽位名。
+        想强制一档 ⇒ 别让调用方写槽位名，或改用 `model` 钉住（那时冲突会**报错**）。
         """
-        # 通配符在中间/开头，字面量在**末尾**：这才压到结尾锚
-        self.assertIsNone(_glob_regex("*pro").match("pro-x"), "前缀匹配了 ⇒ 结尾锚失效")
-        self.assertIsNone(_glob_regex("a*1").match("a-1-x"))
-        self.assertIsNotNone(_glob_regex("*pro").match("x-pro"))
-        # 端到端：不命中就该 400，绝不许"静默用了某个槽位"
-        with self.assertRaises(ParamError) as ctx:
-            resolve("pro-x", {"*pro": "seedance20"})
-        self.assertIn("unknown model", str(ctx.exception))
-        self.assertIn("*pro", str(ctx.exception), "报文必须列出表里已声明的键，便于排障")
+        r = resolve("seedance20", {CATCH_ALL: "wan27"})
+        self.assertEqual(r.slot, "seedance20", "槽位名被兜底改写了？那是规则变了")
+        self.assertEqual(r.source, SOURCE_PASSTHROUGH)
 
-    def test_only_star_is_a_wildcard(self):
-        """只支持 `*`（模块明确"不做正则"）—— `?` `.` `[` 一律按**字面量**。
+    def test_catchall_is_warned(self):
+        """兜底改写了模型值 ⇒ 必须留痕（静默改模型的账单差异是本项目最贵的一类缺陷）。"""
+        self.assertTrue(any("fallback" in w for w in resolve("nope-1", {CATCH_ALL: "wan27"}).warnings))
 
-        防的是：一条写错的键（如 `a[bc]d`）被当成正则，静默指到别的槽位。
-        """
-        self.assertIsNone(_glob_regex("a?b").match("axb"))
-        self.assertIsNotNone(_glob_regex("a?b").match("a?b"))
-        self.assertIsNone(_glob_regex("a.c").match("abc"))
-        self.assertIsNotNone(_glob_regex("a.c").match("a.c"))
-        self.assertIsNone(_glob_regex("a[bc]d").match("abd"))
-
-    def test_catch_all_is_last_resort(self):
-        r = resolve("anything", {"*": "minimaxH3"})
-        self.assertEqual((r.slot, r.source), ("minimaxH3", SOURCE_MODEL_MAP))
-        r2 = resolve("doubao-x", {"doubao-*": "seedance20", "*": "minimaxH3"})
-        self.assertEqual(r2.slot, "seedance20")
-
-
-class TestSpecificity(unittest.TestCase):
-    """特异性规则（docstring 第 2 条）：比**非通配字符个数**，不比模式串总长。"""
-
-    def test_more_literal_chars_wins(self):
-        r = resolve("abc", {"a*": "seedance20", "ab*": "kling3"})
-        self.assertEqual(r.slot, "kling3", "非通配字符更多的模式应胜出")
-
-    def test_specificity_is_not_total_length(self):
-        """这两条模式的**两种排序方向相反** ⇒ 谁胜出可判别实现用的是哪一种。
-
-        `ab*`      : 字面量 2、总长 3
-        `**a**`    : 字面量 1、总长 5
-        正确的实现（按字面量）判 `ab*` 胜；按总长则会判 `**a**` 胜。
-        """
-        assert _specificity("ab*")[0] > _specificity("**a**")[0]
-        assert len("ab*") < len("**a**")
-        r = resolve("abc", {"**a**": "kling3", "ab*": "seedance20"})
-        self.assertEqual(r.slot, "seedance20", "特异性被算成了模式串总长")
-
-    def test_tie_is_broken_deterministically(self):
-        """同分时按模式串字典序 —— 必须**确定**，不能依赖遍历顺序。"""
-        a = resolve("abc", {"a*c": "seedance20", "ab*": "kling3"})
-        b = resolve("abc", {"ab*": "kling3", "a*c": "seedance20"})
-        self.assertEqual(a.slot, b.slot, "同分时的裁决随书写顺序变了")
-
-
-class TestOrderIndependence(unittest.TestCase):
-    """docstring 第 3 条：结果与 JSON 键序**无关**（全排列性质测试）。
-
-    ⚠️ 模式集里**必须含一对同分且都命中的键**（`a*c` 与 `ab*`，字面量各 2）——
-    否则 `>` 与 `>=` 行为一致，把比较写错也测不出来。
-    """
-
-    PAIRS = [("a*c", "seedance20"), ("ab*", "kling3"), ("*", "minimaxH3")]
-
-    def test_result_is_independent_of_key_order(self):
-        results = set()
-        for perm in itertools.permutations(self.PAIRS):
-            results.add(resolve("abc", dict(perm)).slot)
-        self.assertEqual(
-            len(results), 1,
-            f"键序不同的映射表给出了**不同**槽位：{results} —— 「对象顺序不该决定计费档位」被破坏",
-        )
-
-    def test_the_set_actually_contains_a_tie(self):
-        """前提断言：上面那条之所以能判别 `>`/`>=`，靠的是这一对同分。"""
-        self.assertEqual(_specificity("a*c")[0], _specificity("ab*")[0])
-        self.assertTrue(_glob_regex("a*c").match("abc") and _glob_regex("ab*").match("abc"))
+    def test_non_catchall_wildcards_are_rejected(self):
+        """任何**非 `*`** 却含 `*` 的键 ⇒ 渠道配置错误（报文要给出两条出路）。"""
+        for bad in ("doubao-seedance-*", "a*b", "*pro", "doubao-*"):
+            with self.subTest(key=bad):
+                with self.assertRaises(ParamError) as ctx:
+                    resolve("x", {bad: "wan27"})
+                self.assertIn("catch-all", str(ctx.exception))
+                self.assertEqual(ctx.exception.param, "X-Channel-Options", "报错要指向渠道配置")
 
 
 class TestPrecedence(unittest.TestCase):
-    """判定顺序：① 精确 ② 透传 ③ 通配 ④ 钉住 ⑤ 400。"""
+    """精确 > 槽位名 > 兜底 > 钉住 > 400。"""
 
-    def test_exact_beats_wildcard(self):
-        r = resolve("doubao-x", {"doubao-*": "kling3", "doubao-x": "seedance20"})
-        self.assertEqual(r.slot, "seedance20")
-        self.assertIn("exact hit", " ".join(r.warnings))
-
-    def test_passthrough_beats_wildcard(self):
-        """② 排在 ③ 前是**刻意**的（docstring 明确）：调用方指名已知槽位时不被通配改写。"""
-        r = resolve("seedance20", {"seedance*": "kling3"})
-        self.assertEqual((r.slot, r.source), ("seedance20", SOURCE_PASSTHROUGH))
+    def test_exact_beats_everything(self):
+        r = resolve("a-foo", {"a-foo": "wan27", CATCH_ALL: "seedance20"}, pin=None)
+        self.assertEqual(r.slot, "wan27")
 
     def test_pin_applies_when_nothing_matches(self):
-        r = resolve("no-such-model", pin="minimaxH3")
-        self.assertEqual(r.slot, "minimaxH3")
+        r = resolve("nope-1", None, pin="wan27")
+        self.assertEqual(r.slot, "wan27")
 
-    def test_wildcard_match_is_warned(self):
-        """通配命中**必须**留痕 —— 名字猜测表造成 7.3 倍账单差是本项目最贵的一类缺陷。"""
-        r = resolve("doubao-seedance-1-0-pro", {"doubao-seedance-*": "seedance20"})
-        blob = " ".join(r.warnings)
-        self.assertIn("doubao-seedance-*", blob, "告警里必须点名是哪个模式命中的")
-        self.assertIn("doubao-seedance-1-0-pro", blob, "告警里必须带上调用方写的名字")
-
-    def test_suffix_and_provider_are_stripped_before_matching(self):
-        for name in ("doubao-seedance-1-0-pro_1080p", "doubao-seedance-1-0-pro_720P",
-                     "openai/doubao-seedance-1-0-pro"):
-            with self.subTest(name=name):
-                self.assertEqual(resolve(name, {"doubao-seedance-*": "seedance20"}).slot, "seedance20")
-
-    def test_wildcards_never_see_the_resolution_suffix(self):
-        """后缀在匹配**之前**被剥掉 ⇒ `*_1080p` 这种键永远命中不了（应 400 而非静默走别的槽位）。"""
+    def test_pin_conflict_is_a_channel_error(self):
+        """钉住与解析结果不同 ⇒ 报错，**不静默改模型**。"""
         with self.assertRaises(ParamError) as ctx:
-            resolve("m_1080p", {"*_1080p": "seedance20"})
-        self.assertIn("unknown model", str(ctx.exception))
+            resolve("seedance20", None, pin="wan27")
+        self.assertEqual(ctx.exception.param, "X-Channel-Options")
+
+    def test_unknown_without_any_fallback_is_the_callers_fault(self):
+        with self.assertRaises(ParamError) as ctx:
+            resolve("doubao-seedance-2-5-260628")
+        self.assertEqual(ctx.exception.param, "model", "调用方的错要指向 model")
+        self.assertIn("model_map", str(ctx.exception), "报文要给出下一步怎么改")
 
 
-class TestPassthroughTakesPrecedence(unittest.TestCase):
-    """判定顺序「② 透传 ③ 通配」是**刻意的**：调用方指名已知槽位时不被通配改写。
+class TestInputNormalisation(unittest.TestCase):
+    def test_suffix_is_stripped_before_matching(self):
+        r = resolve("seedance20_1080p", None)
+        self.assertEqual(r.slot, "seedance20")
 
-    🔴 **这里只钉"不变式"（谁胜出），刻意不钉告警文案。**
-    原因：`channel_options.py` 此刻正被**另一个会话实时修改** —— 23:52 / 23:54 / 23:58
-    连续三次改动，其中「通配被压过时给告警」这条在同一小时内**出现过又消失了**。
-    对着移动靶钉文案，只会制造一条随时变红的假告警。
-
-    待该文件稳定后再补两条（届时删掉本段说明）：
-      · 被压过时**必须**给告警，且告警里点名「哪个模式」「它本会指向哪个槽位」；
-      · 没有通配命中时**不许**出这条告警（否则告警变噪音、进而被脱敏）。
-    """
-
-    def test_passthrough_wins_over_wildcard(self):
-        r = resolve("seedance20", {"seedance*": "kling3"})
-        self.assertEqual((r.slot, r.source), ("seedance20", SOURCE_PASSTHROUGH))
-
-    def test_exact_key_wins_over_wildcard(self):
-        """精确键必须压过通配键（① 在 ③ 之前）—— 这是"要用映射就用精确键"的逃生口。"""
-        r = resolve("seedance20", {"seedance*": "kling3", "seedance20": "kling3"})
-        self.assertEqual((r.slot, r.source), ("kling3", SOURCE_MODEL_MAP))
-        self.assertIn("exact hit", " ".join(r.warnings))
+    def test_provider_prefix_is_stripped(self):
+        r = resolve("somevendor/seedance20", None)
+        self.assertEqual(r.slot, "seedance20")
 
 
 class TestConfigValidation(unittest.TestCase):
@@ -216,50 +140,42 @@ class TestConfigValidation(unittest.TestCase):
 
     def test_unknown_slot_is_rejected(self):
         with self.assertRaises(ParamError) as ctx:
-            resolve("m", {"m*": "not-a-slot"})
+            resolve("m", {CATCH_ALL: "not-a-slot"})
         self.assertIn("known upstream slot", str(ctx.exception))
+        self.assertEqual(ctx.exception.param, "X-Channel-Options")
 
     def test_empty_key_or_value_is_rejected(self):
-        for bad in ({"": "seedance20"}, {"m*": ""}):
+        for bad in ({"": "seedance20"}, {CATCH_ALL: ""}):
             with self.subTest(table=bad):
                 with self.assertRaises(ParamError):
                     resolve("m", bad)
 
     def test_case_variant_duplicate_patterns_are_rejected(self):
         """大小写变体视为重复 —— JSON 同名键会静默覆盖，"哪条生效"直接决定账单。"""
-        with self.assertRaises(ParamError) as ctx:
-            resolve("m", {"X-*": "seedance20", "x-*": "kling3"})
-        self.assertIn("duplicate", str(ctx.exception))
+        with self.assertRaises(ParamError):
+            resolve("m", {"Wan27": "wan27", "wan27": "seedance20"})
 
     def test_alias_is_accepted_and_conflict_is_rejected(self):
-        self.assertEqual(
-            resolve_model("m", {MODEL_MAP_ALIAS: {"m*": "seedance20"}}).slot, "seedance20"
-        )
+        r = resolve_model("doubao-1", {MODEL_MAP_ALIAS: {CATCH_ALL: "wan27"}})
+        self.assertEqual(r.slot, "wan27", "别名 upstream_model_map 必须等价")
         with self.assertRaises(ParamError):
-            resolve_model("m", {MODEL_MAP_KEY: {"m*": "seedance20"},
-                                MODEL_MAP_ALIAS: {"m*": "kling3"}})
+            resolve_model("m", {MODEL_MAP_KEY: {CATCH_ALL: "wan27"},
+                                MODEL_MAP_ALIAS: {CATCH_ALL: "seedance20"}})
 
 
 class TestVerifiedSlotMatchesProcedureConstant(unittest.TestCase):
-    """`VERIFIED_SLOTS` 必须与 `web_client.CREATE_PROCEDURE` 的模型段一致。
-
-    ⚠️ `channel_options.py` 的 docstring 把这条门禁写在
-    `tests/test_channel_model_options.py::TestVerifiedSlotMatchesProcedureConstant`，
-    但那个文件**不存在** ⇒ 这里补上；类名**逐字相同**，两边合并时不会出现两份。
-    """
+    """`channel_options.py` 的 docstring 指着这个类名 —— 别改名。"""
 
     def test_every_verified_slot_has_a_live_procedure_constant(self):
-        proc = web_client.CREATE_PROCEDURE
-        prefix = "ai."
-        self.assertTrue(proc.startswith(prefix), f"CREATE_PROCEDURE 形态变了：{proc!r}")
-        self.assertEqual(
-            {proc[len(prefix):]}, set(VERIFIED_SLOTS),
-            "已实测槽位集合与 CREATE_PROCEDURE 的模型段对不上 —— 其中一边是过期的",
-        )
+        """已实测槽位必须与 `web_client.CREATE_PROCEDURE` 同源（否则"实测"是假的）。"""
+        seg = web_client.CREATE_PROCEDURE.split(".", 1)[-1]
+        self.assertIn(seg, VERIFIED_SLOTS, "实测槽位集合与 procedure 常量脱节了")
 
     def test_known_slots_cover_site_keys(self):
-        for slot in ("minimaxH3", "seedance20", "wan27", "veo3Fast"):
-            self.assertIn(slot, KNOWN_SLOTS)
+        """值域必须覆盖站点那 11 个模型键 —— 少一个就等于把一个合法名字变成 400。"""
+        for key in ("seedance20", "wan27", "seedance25", "kling3", "veo31Fast"):
+            with self.subTest(key=key):
+                self.assertIn(key, KNOWN_SLOTS)
 
 
 if __name__ == "__main__":

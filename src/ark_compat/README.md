@@ -403,16 +403,21 @@ AVM_TASK_STORE=memory      # 显式开发/测试开关：重启即丢
 
 ```jsonc
 // 渠道级头（逐渠道声明"哪个名字落哪个槽位"）
-X-Channel-Options: {"model_map": {"doubao-seedance-2-0-260128": "seedance20",
-                                  "doubao-seedance-*": "seedance25",
-                                  "*": "minimaxH3"}}
+X-Channel-Options: {"model_map": {"doubao-seedance-2-0-260128": "seedance20",   // 精确键：逐条写
+                                  "doubao-seedance-2-5-260628": "seedance25",
+                                  "*": "minimaxH3"}}                            // 唯一兜底（可选）
 X-Channel-Options: {"model": "minimaxH3"}      // 钉住：表外名字落这一档
 ```
 
-判定顺序：① 映射**精确**命中 → ② 名字本身是上游槽位（**默认透传**）→ ③ 映射**通配**命中
-（特异性最长、与书写顺序无关）→ ④ 渠道**钉住** → ⑤ **400**（报文给出已知槽位与表里已声明的键）。
+判定顺序：① 映射**精确**命中 → ② 名字本身是上游槽位（**默认透传**）→ ③ 映射的 **`*` 兜底**
+（只在 ①② 都没命中时轮到它）→ ④ 渠道**钉住** → ⑤ **400**（报文给出已知槽位与表里已声明的键）。
 每一步都进 `warnings`，并留下证据字段 `effective.model` / `.model_source` / `.model_verified`、
 `web_params.procedure`、span `ark.create.submit` 的 `upstream_slot`。
+
+🔴 **通配已降级为"唯一一条 `*` 兜底"**（2026-09-17）：任何**非 `*`** 却含 `*` 的键
+（`doubao-seedance-*`）⇒ **渠道配置错误**，报文给出两条出路（逐条写精确键，或保留唯一的 `*`）。
+要覆盖一族名字就逐条写 —— 那些名字是有限的、已知的。**多模式机制拆掉之后，"多命中怎么排"
+这一整类问题不可能发生**，两个项目在这点上曾各写一套的分歧也随之消失（`docs/channel-options-model.md` §3/§9）。
 
 🔴 **这是对外契约变更**：改动前"任意模型名都通过（一律走 `ai.minimaxH3`）"，现在
 **未命中即 400**（且发生在任何上游请求之前）。要恢复旧行为，给渠道配

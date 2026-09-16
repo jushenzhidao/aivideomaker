@@ -93,10 +93,24 @@ class TestModelResolutionIsWired(unittest.TestCase):
         self.assertEqual(self.site.calls("ai.minimaxH3"), [], "落回了默认 procedure ⇒ 接线断了")
 
     def test_wildcard_catch_all_retargets_the_procedure(self):
-        """`{"*": ...}` 兜底：调用方写任何名字都落到钉住的槽位（这也是旧行为的迁移路）。"""
+        """`{"*": ...}` 兜底：调用方写任何表外名字都落到那一档（也是旧行为的迁移路）。"""
         r = self.post(ark_body("doubao-seedance-2-5-260628"), '{"model_map": {"*": "wan27"}}')
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self.procedures_hit(), ["/api/ai.wan27"])
+
+    def test_non_catchall_wildcard_is_refused_before_any_upstream_call(self):
+        """**非 `*` 的通配模式已被拆掉**（2026-09-17 降级）⇒ 渠道配置错误，一个上游请求都不发。
+
+        这条钉的是"校验发生在**配置层**而不是请求命中层"：多模式机制拆掉之后，
+        "多命中怎么排"这一整类问题在**解析配置时**就不可能出现。
+        """
+        r = self.post(ark_body("doubao-x"), '{"model_map": {"doubao-*": "wan27"}}')
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertEqual(
+            r.json()["error"]["param"], CHANNEL_OPTIONS_HEADER,
+            "这是渠道配置错误，不能指向调用方的 model",
+        )
+        self.assertEqual(self.procedures_hit(), [], "拒绝必须发生在上游调用之前")
 
     def test_pinned_slot_is_used_when_nothing_matches(self):
         """渠道钉住 + 调用方写了个表外的名字 ⇒ 落钉住值。"""
