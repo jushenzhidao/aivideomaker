@@ -347,9 +347,10 @@ master 下发除数为 worker 数，由 worker 内探测到的账号额度按 ÷
 
 **接待能力的真天花板是容器 fd，不是 worker 数。** 容器默认 `ulimit -n=1024`，单 worker 的
 并发接待被钉在 **~1000**（超出即客户端 `URLError`）——此时把 `AVM_GUNICORN_WORKER_CONNECTIONS`
-调到 8000 也**毫无改善**（实测已证伪）。放开方式（compose 层）：
-`services.<svc>.ulimits.nofile.{soft,hard}=65536`；放开后单 worker 实测 **1000 / 2000 / 4000
-并发全部成功**（约 200 req/s）⇒ **不必靠加 worker 来换接待能力**。
+调到 8000 也**毫无改善**（实测已证伪）。**已内置**在 `docker-compose.yml`：`ark-compat` 与
+`minter` 两个服务都设了 `ulimits.nofile.{soft,hard}=65536`（部署后用
+`docker exec <容器> sh -c 'ulimit -n'` 应看到 65536）；放开后单 worker 实测
+**1000 / 2000 / 4000 并发全部成功**（约 200 req/s）⇒ **不必靠加 worker 来换接待能力**。
 ⚠️ 同机压测时**客户端也要放开 fd**（脚本内 `resource.setrlimit`），否则测出来的是客户端的墙。
 ⚠️ 另：闸门是进程内的 ⇒ **同一账号不能同时被两个实例/副本使用**（合计超额度 ⇒ 提交全 502；
 实测停掉第二个实例后同一账号立刻恢复 200）。多实例只能按**账号**分流，不能按请求轮询。

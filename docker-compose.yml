@@ -85,6 +85,17 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+    # fd 上限。🔴 **容器默认 `ulimit -n=1024`，它才是并发接待的真天花板**：单 worker 会被
+    # 钉在 ~1000 并发（超出即客户端 `URLError`），此时把 `AVM_GUNICORN_WORKER_CONNECTIONS`
+    # 调到 8000 也**毫无改善**（2026-09-17 实测已证伪）。放开后单 worker 实测接待
+    # 1000 / 2000 / 4000 并发**全部成功**（约 200 req/s）⇒ 接待能力**不必靠加 worker 来换**
+    # （加 worker 只会把每个账号的槽位切碎，见 README「多 worker 是这里唯一的坑」）。
+    # ⚠️ 同机压测时**客户端进程也要放开 fd**（`resource.setrlimit`），否则测到的是客户端的墙。
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
     environment:
       # 容器内必须绑 0.0.0.0 —— 绑回环会让端口映射失效
       ARK_HOST: 0.0.0.0
@@ -427,6 +438,14 @@ services:
     #    `-i br-+` / `-i docker0` 放行 ⇒ 与子网无关，换地址池也命中；ufw 主机则枚举真实
     #    网段。幂等放行 + 容器内实测 + 探测不过就回滚；不带 --apply 时全程只读）。
     # （host 网络下没有端口映射，`expose` 是死配置，已删——服务直接监听宿主 8899）
+
+    # fd 上限：Chrome 每开一个页面/连接都要占 fd，池位多、并发铸造时容易撞上
+    # 「Too many open files」而**静默失败**（表现为铸造失败率上升）。与 ark-compat 同样放开。
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
     environment:
       # 监听端口。🔴 挪端口时**必须同时**改 `AVM_MINTER_URL`（宿主侧地址）—— host 网络下
       #    两者是同一个数字，分叉的后果与 E2E-AVM-008 同族（服务全好、包却到不了）；
