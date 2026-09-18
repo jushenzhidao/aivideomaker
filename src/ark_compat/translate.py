@@ -34,15 +34,28 @@ from typing import Any, Mapping
 from .channel_options import procedure_for_slot, resolve_model
 from .errors import ParamError
 
-# ratio 枚举的**有序**真源 —— `nearest_ratio()` 靠它做平手时的确定性 tie-break。
-# `ARK_RATIOS` 由它派生：两处各写一份清单是必然漂移的写法。
-RATIO_ORDER: tuple[str, ...] = ("16:9", "4:3", "1:1", "3:4", "9:16", "21:9")
-ARK_RATIOS = frozenset(RATIO_ORDER) | {"adaptive"}
-ARK_RESOLUTIONS = frozenset({"480p", "720p", "1080p"})
+# 🔴 比例 / 像素映射的**唯一真源**已迁到 `ratio` 模块 —— 档位表可按上游替换
+#    （`RatioSpec`）、输入形态走 resolver 链、像素尺寸只认实测值。本文件只做
+#    re-export：再在这里写一份枚举/正则，两份必然漂移。
+from .ratio import (  # noqa: F401  （re-export：调用方与本文件都要用）
+    MEASURED_PIXELS,
+    WXH_RE,
+    RatioSpec,
+    ResolveOptions,
+    SITE_UI_SPEC,
+    UnknownRatioError,
+    parse_proportion,
+    pixels_for,
+    ratio_of,
+    ratio_value as _ratio_value,
+    resolve,
+    simplify_wxh,
+)
 
-# 宽 x 高（OpenAI Sora / 图像 API 风格的 size，如 `1920x1080`、`1024x1792`）。
-# ⚠️ 唯一真源：`openai_videos.size_to_ratio()` 也从这里取（两处各写一份必然漂移）。
-WXH_RE = re.compile(r"^(\d{1,6})\s*[xX×*]\s*(\d{1,6})$")
+# 枚举由 spec 派生 —— 不在这里另写一份清单。
+RATIO_ORDER: tuple[str, ...] = SITE_UI_SPEC.order
+ARK_RATIOS = SITE_UI_SPEC.all_values
+ARK_RESOLUTIONS = frozenset({"480p", "720p", "1080p"})
 
 # 超过这个偏差就**升级告警措辞**（百分比，以落点为分母），但**不拒绝**。
 #
@@ -148,146 +161,64 @@ PASSTHROUGH_UNSUPPORTED = (
 _REF_TOKEN_RE = re.compile(r"@\s*(图像|视频|音频)\s*(\d+)")
 
 
-def _ratio_value(ratio: str) -> float:
-    """`16:9` → 1.777…（供**远近比较**用，不参与对外输出）。"""
-    w, _, h = str(ratio).partition(":")
-    return float(w) / float(h)
+# `_ratio_value` / `simplify_wxh` / `parse_proportion` 的**实现**都在 `ratio` 模块，
+# 本节上方已 re-export。这里刻意不留本地副本 —— 两处各写一份必然漂移。
 
 
-def simplify_wxh(text: Any) -> str | None:
-    """`1920x1080` → `16:9`；`1024x1792` → `4:7`。非 WxH 形态返回 None。"""
-    m = WXH_RE.match(str(text or "").strip())
-    if not m:
-        return None
-    w, h = int(m.group(1)), int(m.group(2))
-    if w <= 0 or h <= 0:
-        return None
-    f = Fraction(w, h)
-    return f"{f.numerator}:{f.denominator}"
+#: 认不出比例时落到的档位。**由 spec 派生**，不在这里另写常量。
+RATIO_FALLBACK = SITE_UI_SPEC.fallback
 
 
-#: 认不出比例时落到的档位（`fallback` 模式的默认值）。取 **16:9** 的依据是站点 UI 的
-#  `Aspect Ratio` 选择器里它被默认选中（截图取证，2026-09-18）⇒ 与上游默认一致，
-#  兜底不会制造"调用方什么也没写、出片却比上游默认更意外"的落差。
-RATIO_FALLBACK = "16:9"
-
-# `W:H` 形态的**比例串**（`5:4`、`9:21`、`2.35:1`）。与上面 `WXH_RE` 的分工必须分清：
-#   · `WXH_RE` 认的是**尺寸**（`1920x1080` = 像素宽高）⇒ 先约分，再拿约分结果比枚举；
-#   · 本正则认的是**比例本身**（`5:4` ⇒ 1.25）⇒ 直接拿数值比远近，不需要约分。
-# 两者不重叠：`x` / `×` / `*` 归前者，`:` 归后者。
-# 允许小数是必要的：`2.35:1`（宽银幕）是真实写法，强行约分只会得出怪分数而无益。
-_PROPORTION_RE = re.compile(r"^\s*(\d{1,6}(?:\.\d+)?)\s*:\s*(\d{1,6}(?:\.\d+)?)\s*$")
-
-
-def parse_proportion(text: Any) -> float | None:
-    """`5:4` → 1.25；非「数值:数值」形态（`abc`、`16`、`16:9:1`、`16/9`）返回 None。
-
-    只认**冒号两侧都是正数**的形态：`0:9` / `16:0` 返回 None —— 它们不是比例，是坏
-    输入；放行会让除零/无穷把任意值都吸到同一档（`inf` 的最近邻恒为 `21:9`）。
-    """
-    m = _PROPORTION_RE.match(str(text or ""))
-    if not m:
-        return None
-    w, h = float(m.group(1)), float(m.group(2))
-    if w <= 0 or h <= 0:
-        return None
-    return w / h
-
-
-def nearest_ratio(value: float) -> str:
-    """把任意宽高比吸附到 `RATIO_ORDER` 里**相对距离**最近的一档。
-
-    用相对距离（对数差）而不是绝对差：比例域跨越 0.56~2.33，横屏那一端的绝对差
-    天然被放大（同一档的相对偏差在 21:9 上看着比在 9:16 上大一个量级），只有乘性
-    比较才能让横屏与竖屏共用一把尺子。平手时取 `RATIO_ORDER` 里靠前者 ⇒ 结果确定。
-    """
-    return min(
-        RATIO_ORDER,
-        key=lambda r: (abs(math.log(_ratio_value(r) / value)), RATIO_ORDER.index(r)),
-    )
-
-
-def _snap_ratio(label: str, raw: str, value: float, as_text: str = "") -> tuple[str, list[str]]:
-    """把比例值吸附到 `RATIO_ORDER` 最近一档，并把「有损」这件事写进说明。
-
-    deviation 必须写出来：吸附是**有损**的，差 1.6%（`4:7` → `9:16`）几乎看不出来，
-    差 25%（`3:1` → `21:9`）则是完全不同的画面。只说"改了"不说"改了多少"，调用方
-    无法判断该接受还是该换尺寸 —— 把数字给他，由他定，我们不当这个裁量者。
-    偏差以**落点**为分母 ⇒ 语义是"实际出的比你想要的窄/宽 X%"，比用较小值做
-    分母（`exp(|log 差|)-1`，会系统性高估）更贴近肉眼感受。
-    """
-    snapped = nearest_ratio(value)
-    v_out = _ratio_value(snapped)
-    drift = abs(value - v_out) / v_out * 100
-    #  `as_text` 只在"原始写法与约分结果不同"时才给（`1024x1792` (4:7)）；比例串
-    #  自己就是比例文本（`5:4`），再括一遍会是 `size="5:4" (5:4)` 这种赘述。
-    shown = f" ({as_text})" if as_text else ""
-    #  越过软阈值也**不拒绝**，只把话说重并给一条能用的替代写法（口径见
-    #  `RATIO_SNAP_WARN_DRIFT` 的注释：能提交成功就行 —— 出一档相近的片，远好过
-    #  让整个请求 400）。曾经按"超线就 400"实现过一轮，被该口径推翻，别改回去。
-    if drift > RATIO_SNAP_WARN_DRIFT:
-        tail = (
-            f'supported ratio "{snapped}" (differs by {drift:.1f}%, well beyond '
-            f'{RATIO_SNAP_WARN_DRIFT:g}%) — the output will look noticeably different; '
-            f'consider "{RATIO_EXAMPLES[snapped]}" instead'
-        )
-    else:
-        tail = (
-            f'supported ratio "{snapped}" (differs by {drift:.1f}%) — the output aspect ratio '
-            f'will not be exactly what you asked for'
-        )
-    return snapped, [
-        f'{label}="{raw}"{shown} is not one of the upstream ratios; snapped to the nearest ' + tail
-    ]
+def nearest_ratio(value: float, spec: RatioSpec = SITE_UI_SPEC) -> str:
+    """把任意宽高比吸附到档位表里**相对距离**最近的一档（实现见 `RatioSpec.snap`）。"""
+    return spec.snap(value)
 
 
 def normalize_ratio(
-    raw: Any, label: str = "ratio", fallback: str | None = None
+    raw: Any, label: str = "ratio", fallback: str | None = None,
+    presets: Mapping[str, str] | None = None,
 ) -> tuple[str, list[str]]:
     """ratio / size 入参 → 上游枚举值 + 映射说明（**凡改写必留痕**）。
 
-    两条线的差别**只**在这一个参数上：
+    `presets` 是调用方想额外认的**语义词**（`portrait` → `9:16` 一类）。默认不认
+    任何一种 —— 方舟线是官方契约，不往里加非标准值；OpenAI 面的 `size` 会传
+    `ratio.SIZE_PRESETS`。加词只需往那张表里加一项。）。
 
-      · `fallback=None`（默认 = Ark `/tasks` 线）：认不出的一律 `ParamError` ⇒ 400。
+    🔴 判定逻辑**只有一份**，在 `ratio.resolve()`（resolver 链：枚举 / 别名 / 预设 /
+    `WxH` / `W:H` / 就近吸附 / 兜底）。本函数只做翻译层自己的三件事：
+      ① 把"两条线"的差别翻译成 `ResolveOptions`；
+      ② 把 `UnknownRatioError` 翻译成本服务的 `ParamError`；
+      ③ 给说明补上 `label=` 前缀（`size="…"` / `ratio="…"`）。
+
+    两条线的差别**只**在 `fallback`：
+
+      · `fallback=None`（默认 = Ark `/tasks` 线）：认不出 ⇒ `ParamError` ⇒ 400。
         对认不出的字符串不静默放行（那正是本层最贵的一类缺陷：调用方以为生效了，
         实际被丢或被改）。
-      · `fallback="16:9"`（`/v1/videos` 线）：认不出的**不报错**，落到兜底档。
-        该端点的调用方是 OpenAI SDK 用户，能拿到的只有"请求失败了"这一个结果，
-        改尺寸重试的成本远高于拿到一档相近的画面；而兜底**照样写 warning**，
-        所以并没有退化成"静默改写"。
+      · `fallback="16:9"`（`/v1/videos` 线）：认不出 ⇒ 落兜底档。该端点的调用方是
+        OpenAI SDK 用户，能拿到的只有"请求失败了"这一个结果，改尺寸重试的成本远
+        高于拿到一档相近的画面；而兜底**照样写 warning**，不是静默改写。
 
-    认四种写法 —— 前三种两线一致，第四种自 2026-09-18 起也两线一致：
-      1. 枚举本身：`16:9` … `21:9` / `adaptive` ⇒ 原样；
-      2. `WxH`（`1920x1080`、`16x9`）约分后**正好在**枚举里 ⇒ 用它；
-      3. `WxH` 约分后**不在**枚举里（`1024x1792` → `4:7`）⇒ **就近吸附**并留痕；
-      4. `W:H` 数值比例（`5:4`、`9:21`、`2.35:1`）⇒ 就近吸附并留痕。
-         ⚠️ **两线都认**（用户口径"等比 或者按比例 传都可以"）。此前只在 `fallback`
-         模式认、Ark 线一律 400 —— 那条门槛是本层自己加的（记在 TESTCASES §A3），
-         并非上游约束，已撤；`5:4` 现在在 Ark 线同样吸附到 `4:3`。
+    `W:H` 比例串（`5:4`、`9:21`、`2.35:1`）**两线都认**（2026-09-18 用户口径：
+    "等比 或者按比例 传都可以"）—— 调用方写哪种形态不该由我们挑。
     """
-    s = str(raw or "").strip()
-    if not s:
-        return "", []
-    if s in ARK_RATIOS:
-        return s, []
-    wxh = simplify_wxh(s)
-    if wxh is not None:
-        if wxh in ARK_RATIOS:
-            return wxh, [f'{label}="{s}" normalized to ratio="{wxh}"']
-        return _snap_ratio(label, s, _ratio_value(wxh), as_text=wxh)
-    #  `W:H` 比例串（`5:4`、`4:7`、`2.35:1`）**两线都认**（2026-09-18 用户口径：
-    #  "等比 或者按比例 传都可以"）。之前只在 `fallback` 模式认、Ark 线一律 400，
-    #  那是本层自己加的门槛 —— 调用方写哪种形态不该由我们挑，两种都收、都吸附、都留痕。
-    value = parse_proportion(s)
-    if value is not None:
-        return _snap_ratio(label, s, value)
-    if fallback is None:
-        raise ParamError(f'{label}: invalid enum value "{s}"', label)
-    return fallback, [
-        f'{label}="{s}" is not a recognized aspect ratio (expected one of '
-        f'{"/".join(RATIO_ORDER)}, "adaptive", a WxH size like 1920x1080, or a W:H '
-        f'proportion like 16:9); fell back to "{fallback}"'
-    ]
+    spec = SITE_UI_SPEC if fallback is None else SITE_UI_SPEC.with_fallback(fallback)
+    opt = ResolveOptions(
+        strict=(fallback is None),
+        allow_proportion=True,          # 两线都认（见上）
+        presets=presets or {},
+        warn_drift=RATIO_SNAP_WARN_DRIFT,
+        examples=RATIO_EXAMPLES,
+    )
+    try:
+        got = resolve(raw, spec, opt)
+    except UnknownRatioError:
+        raise ParamError(
+            f'{label}: invalid enum value "{str(raw or "").strip()}"', label
+        ) from None
+    if got.silent:
+        return got.ratio, []
+    return got.ratio, [f"{label}={got.note}"] if got.note else []
 
 
 def snap_duration(duration: Any, resolution: str, prefer_free: bool = False) -> int:

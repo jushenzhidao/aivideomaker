@@ -162,10 +162,18 @@ class TestArkBodyFromOpenai(unittest.TestCase):
         self.assertEqual(body["ratio"], "16:9")
         self.assertTrue(any("1920x1080" in n and "16:9" in n for n in notes))
 
-    def test_unknown_size_falls_through_to_translate_validation(self):
-        body, _ = ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "size": "5:4"})
-        with self.assertRaises(ParamError):
-            translate_create(body)
+    def test_unknown_size_falls_back_instead_of_400(self):
+        """本端点的 `size` 认不出时**兜底 16:9**（不再是"原样透传 → 下游 400"）。
+
+        口径与 `translate_create` 的严格校验分家：Ark 线仍拒 `5:4`，这里是 OpenAI SDK
+        用户，写错一个字符不该让整请求失败。详见 `tests/test_ratio_normalize.py`。
+        """
+        body, notes = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "size": "5:4"})
+        self.assertEqual(body["ratio"], "4:3", "可读的比例串走就近吸附")
+        self.assertTrue(any("5:4" in n for n in notes), "吸附必须留痕")
+        # 且这条 body 在下游是**可提交**的（不再被 translate_create 挡下）
+        plan = translate_create(body)
+        self.assertEqual(plan["web_params"]["aspectRatio"], "4:3")
 
     def test_input_reference_single_string_and_list(self):
         body, _ = ark_body_from_openai(
@@ -559,12 +567,27 @@ class TestOpenaiHttpLayer(unittest.TestCase):
         self.assertEqual(r.status_code, 404)
         self.assertEqual(r.json()["error"]["code"], "TaskNotFound")
 
-    def test_invalid_size_is_400(self):
+    def test_unreadable_size_falls_back_to_16_9_not_400(self):
+        """`size` 认不出 ⇒ 200 且按 16:9 提交（2026-09-18 起，此前是 400）。
+
+        曾经暴露的问题是：OpenAI SDK 用户把 `size` 写成 `1024x1792` / `5:4` 就整请求
+        失败，而他能拿到的信息只有"请求失败了"。现在改成"最接近的一档 + warnings 里
+        写清差多少"，并且 `5:4` 这类可读比例走就近吸附（→ 4:3）而不是兜底。
+        ⚠️ 兜底**不等于什么都收**：本服务的 Ark 线 `/tasks` 仍然 400（见
+        `test_ratio_normalize.TestArkLineStillRejectsUnknown`）。
+        """
         r = self.client.post(
             OPENAI_VIDEOS_PATH, data={"model": "minimaxH3", "prompt": "p", "size": "5:4"}
         )
-        self.assertEqual(r.status_code, 400)
-        self.assertEqual(r.json()["error"]["code"], "InvalidParameter")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.fake.created_params[-1]["aspectRatio"], "4:3")
+
+    def test_gibberish_size_still_creates_a_task(self):
+        r = self.client.post(
+            OPENAI_VIDEOS_PATH, data={"model": "minimaxH3", "prompt": "p", "size": "banana"}
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.fake.created_params[-1]["aspectRatio"], "16:9")
 
     def test_missing_prompt_is_400(self):
         r = self.client.post(OPENAI_VIDEOS_PATH, data={"model": "minimaxH3"})

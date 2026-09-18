@@ -35,6 +35,7 @@ from typing import Any, Mapping
 
 from .errors import ParamError
 from .sniff import sniff_file
+from .ratio import SIZE_PRESETS
 from .translate import DEFAULT_RESOLUTION, normalize_ratio
 
 OPENAI_VIDEOS_PATH = "/v1/videos"
@@ -62,7 +63,17 @@ PINNED_DURATIONS: dict[str, int] = {"480p": 10, "720p": 8}
 # size 枚举 → Ark ratio。keep_ratio / adaptive 都表示"由输入图决定"，上游不区分二者。
 # ⚠️ 比例清单与 `WxH` 归一化的**唯一真源在 `translate`**（`RATIO_ORDER` /
 # `normalize_ratio`）—— 这里只留 `/v1/videos` 自己的别名，两处各写一份枚举必然漂移。
+#
+# 🔴 `adaptive` / `keep_ratio` **不在**站点 UI 的 `Aspect Ratio` 六档里，但**必须保留**：
+#    它不是"认不出的比例"，而是"不要设 aspectRatio、跟随输入图"这一**上游真实支持的
+#    语义**（截图里的六档是**显式指定比例**时的选项，两者不冲突）。砍掉它会直接破坏三条
+#    路径：`first_frame_image`（上游硬约束要求 ratio=adaptive，见 `translate_create`）、
+#    `last_frame_image`、以及 `omni_reference_task_type=edit`（同样要求 adaptive）。
 _SIZE_ALIASES = {"adaptive": "adaptive", "keep_ratio": "adaptive"}
+
+#: size **认不出**时落到的档位（只对 `/v1/videos` 生效，Ark `/tasks` 线仍 400）。
+#  取 16:9 的依据是站点 UI 里它被默认选中 ⇒ 与上游默认一致。
+_SIZE_FALLBACK = "16:9"
 
 # Ark 状态 → OpenAI 状态词表（OpenAI Videos 家族：queued / in_progress / completed / failed）。
 _STATUS_TO_OPENAI = {
@@ -106,10 +117,16 @@ def decode_media_value(value: str, field: str, b64_mode: bool) -> str:
 def size_to_ratio(size: str) -> tuple[str, list[str]]:
     """size 字段 → Ark ratio，附映射说明（被改写的一定留痕）。
 
-    归一化逻辑（枚举原样 / `WxH` 约分 / 约不进枚举时**就近吸附**）**只有一份**，在
-    `translate.normalize_ratio()`；这里只叠加 `/v1/videos` 自己的 `keep_ratio` 别名。
-    ⚠️ 认不出的值**原样透传**，由 `translate_create` 的 ratio 校验给出 400 —— 不在本层
-    静默吞掉：吞掉的后果是调用方以为自己写的 size 生效了。
+    归一化逻辑（枚举原样 / `WxH` 约分 / 比例串与尺寸约不进枚举时**就近吸附** / 认不出时
+    兜底）**只有一份**，在 `translate.normalize_ratio()`；这里只叠加 `/v1/videos` 自己的
+    `keep_ratio` 别名，以及 `fallback=_SIZE_FALLBACK`。
+
+    🔴 与本服务 Ark 线（`/tasks`）在**同一个函数上的唯一区别**就是这个 `fallback`：
+    这里认不出的值**不 400**，落到 `16:9` 并留痕。两条入口的调用方不同 —— 这条是 OpenAI
+    SDK 用户，`size` 写错一个字符就让整个请求失败，代价远大于拿到一档相近的画面；Ark 线
+    的 `5:4` 是既有对外契约的 400（TESTCASES §A3 第 4 条），**不**随本条一起放宽。
+    ⚠️ 兜底**照样进 warnings**（`notes` 由调用方并进响应），所以它不是静默改写；
+    `_SIZE_FALLBACK` 只在"连比例都读不出来"时才用到，`5:4` 这类可读的比例走就近吸附。
     """
     s = str(size or "").strip()
     if not s:
@@ -121,10 +138,10 @@ def size_to_ratio(size: str) -> tuple[str, list[str]]:
         # keep_ratio → adaptive：两者对上游是同一件事（不设 aspectRatio = 跟随输入图）
         return mapped, [f'size="{s}" mapped to ratio="{mapped}" (the upstream has a single '
                         "image-derived behavior; the distinction does not exist upstream)"]
-    try:
-        return normalize_ratio(s, label="size")
-    except ParamError:
-        return s, []
+    #  语义词（`portrait` / `landscape` / `square` / `ultrawide`）走 `SIZE_PRESETS` ——
+    #  加一个词 = 往那张表里加一项，这里的判定不用动。方舟线不传它（官方契约不收
+    #  非标准值），只有 OpenAI 面认。
+    return normalize_ratio(s, label="size", fallback=_SIZE_FALLBACK, presets=SIZE_PRESETS)
 
 
 def _seconds_to_duration(raw: Any) -> int | None:
