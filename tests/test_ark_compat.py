@@ -199,8 +199,13 @@ class TestBillingView(unittest.TestCase):
             T.translate_create({"model": ARK_MODEL, "content": []})
 
     def test_invalid_ratio_and_resolution_are_rejected(self):
+        """认不出形态的 `ratio` 与非法 `resolution` 仍然 400。
+
+        ⚠️ 这里**曾经**用 `ratio="5:4"` —— 自 2026-09-18 起比例串与 `WxH` 同等对待
+        （`5:4` 吸附到 `4:3`），它已不是非法值；改用真正读不出的 `abc`。
+        """
         with self.assertRaises(ParamError):
-            T.translate_create(body(ratio="5:4"))
+            T.translate_create(body(ratio="abc"))
         with self.assertRaises(ParamError):
             T.translate_create(body(resolution="4k"))
 
@@ -283,7 +288,8 @@ class TestHttpLayer(unittest.TestCase):
         self.assertTrue(r.json()["dry_run"])
 
     def test_invalid_parameter_maps_to_400(self):
-        r = self.client.post(TASKS_PATH, json=body(ratio="5:4", extra_body={"aivideomaker_dry_run": True}))
+        # 同上：`5:4` 已是可读的比例串（吸附到 4:3），不再是非法值 ⇒ 用 `abc` 考 400。
+        r = self.client.post(TASKS_PATH, json=body(ratio="abc", extra_body={"aivideomaker_dry_run": True}))
         self.assertEqual(r.status_code, 400)
         self.assertEqual(r.json()["error"]["code"], "InvalidParameter")
 

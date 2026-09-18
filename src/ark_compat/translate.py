@@ -44,6 +44,26 @@ ARK_RESOLUTIONS = frozenset({"480p", "720p", "1080p"})
 # ⚠️ 唯一真源：`openai_videos.size_to_ratio()` 也从这里取（两处各写一份必然漂移）。
 WXH_RE = re.compile(r"^(\d{1,6})\s*[xX×*]\s*(\d{1,6})$")
 
+# 超过这个偏差就**升级告警措辞**（百分比，以落点为分母），但**不拒绝**。
+#
+# 🔴 **吸附默认一律放行**（2026-09-18 用户口径：能提交成功就行）—— 偏差再大也只是
+#    "留有痕地吸附"，绝不退化成 400：对调用方来说，"出一档相近的片"远好过"整个请求
+#    失败"。代价是可能拿到画面构成明显不同的成片，所以这里**不是不管**，而是把偏差
+#    写清楚、越过本阈值时升级措辞并给出可直接替换的写法，由看的人在告警里察觉。
+#    ⚠️ 曾经按"超过就 400"实现过一轮，被上述口径推翻 —— 别把它改回硬拒。
+RATIO_SNAP_WARN_DRIFT = 15.0
+
+# 各合法比例的一个**可直接替换**的 WxH 写法 —— 报错时给调用方指一条明路，
+# 而不是只说"不支持"（他还得自己回来翻文档）。
+RATIO_EXAMPLES = {
+    "16:9": "1920x1080",
+    "4:3": "1024x768",
+    "1:1": "1024x1024",
+    "3:4": "768x1024",
+    "9:16": "1080x1920",
+    "21:9": "2520x1080",
+}
+
 #: 调用方未点名分辨率时代入的站点档位。**唯一真源**。
 #  `translate_create` 与 `openai_videos` 都要用它：前者靠它定档位，后者靠它算
 #  「写死时长」该按哪个分辨率查表（`/v1/videos` 的 resolution 只可能来自 model 后缀，
@@ -146,6 +166,34 @@ def simplify_wxh(text: Any) -> str | None:
     return f"{f.numerator}:{f.denominator}"
 
 
+#: 认不出比例时落到的档位（`fallback` 模式的默认值）。取 **16:9** 的依据是站点 UI 的
+#  `Aspect Ratio` 选择器里它被默认选中（截图取证，2026-09-18）⇒ 与上游默认一致，
+#  兜底不会制造"调用方什么也没写、出片却比上游默认更意外"的落差。
+RATIO_FALLBACK = "16:9"
+
+# `W:H` 形态的**比例串**（`5:4`、`9:21`、`2.35:1`）。与上面 `WXH_RE` 的分工必须分清：
+#   · `WXH_RE` 认的是**尺寸**（`1920x1080` = 像素宽高）⇒ 先约分，再拿约分结果比枚举；
+#   · 本正则认的是**比例本身**（`5:4` ⇒ 1.25）⇒ 直接拿数值比远近，不需要约分。
+# 两者不重叠：`x` / `×` / `*` 归前者，`:` 归后者。
+# 允许小数是必要的：`2.35:1`（宽银幕）是真实写法，强行约分只会得出怪分数而无益。
+_PROPORTION_RE = re.compile(r"^\s*(\d{1,6}(?:\.\d+)?)\s*:\s*(\d{1,6}(?:\.\d+)?)\s*$")
+
+
+def parse_proportion(text: Any) -> float | None:
+    """`5:4` → 1.25；非「数值:数值」形态（`abc`、`16`、`16:9:1`、`16/9`）返回 None。
+
+    只认**冒号两侧都是正数**的形态：`0:9` / `16:0` 返回 None —— 它们不是比例，是坏
+    输入；放行会让除零/无穷把任意值都吸到同一档（`inf` 的最近邻恒为 `21:9`）。
+    """
+    m = _PROPORTION_RE.match(str(text or ""))
+    if not m:
+        return None
+    w, h = float(m.group(1)), float(m.group(2))
+    if w <= 0 or h <= 0:
+        return None
+    return w / h
+
+
 def nearest_ratio(value: float) -> str:
     """把任意宽高比吸附到 `RATIO_ORDER` 里**相对距离**最近的一档。
 
@@ -159,16 +207,63 @@ def nearest_ratio(value: float) -> str:
     )
 
 
-def normalize_ratio(raw: Any, label: str = "ratio") -> tuple[str, list[str]]:
+def _snap_ratio(label: str, raw: str, value: float, as_text: str = "") -> tuple[str, list[str]]:
+    """把比例值吸附到 `RATIO_ORDER` 最近一档，并把「有损」这件事写进说明。
+
+    deviation 必须写出来：吸附是**有损**的，差 1.6%（`4:7` → `9:16`）几乎看不出来，
+    差 25%（`3:1` → `21:9`）则是完全不同的画面。只说"改了"不说"改了多少"，调用方
+    无法判断该接受还是该换尺寸 —— 把数字给他，由他定，我们不当这个裁量者。
+    偏差以**落点**为分母 ⇒ 语义是"实际出的比你想要的窄/宽 X%"，比用较小值做
+    分母（`exp(|log 差|)-1`，会系统性高估）更贴近肉眼感受。
+    """
+    snapped = nearest_ratio(value)
+    v_out = _ratio_value(snapped)
+    drift = abs(value - v_out) / v_out * 100
+    #  `as_text` 只在"原始写法与约分结果不同"时才给（`1024x1792` (4:7)）；比例串
+    #  自己就是比例文本（`5:4`），再括一遍会是 `size="5:4" (5:4)` 这种赘述。
+    shown = f" ({as_text})" if as_text else ""
+    #  越过软阈值也**不拒绝**，只把话说重并给一条能用的替代写法（口径见
+    #  `RATIO_SNAP_WARN_DRIFT` 的注释：能提交成功就行 —— 出一档相近的片，远好过
+    #  让整个请求 400）。曾经按"超线就 400"实现过一轮，被该口径推翻，别改回去。
+    if drift > RATIO_SNAP_WARN_DRIFT:
+        tail = (
+            f'supported ratio "{snapped}" (differs by {drift:.1f}%, well beyond '
+            f'{RATIO_SNAP_WARN_DRIFT:g}%) — the output will look noticeably different; '
+            f'consider "{RATIO_EXAMPLES[snapped]}" instead'
+        )
+    else:
+        tail = (
+            f'supported ratio "{snapped}" (differs by {drift:.1f}%) — the output aspect ratio '
+            f'will not be exactly what you asked for'
+        )
+    return snapped, [
+        f'{label}="{raw}"{shown} is not one of the upstream ratios; snapped to the nearest ' + tail
+    ]
+
+
+def normalize_ratio(
+    raw: Any, label: str = "ratio", fallback: str | None = None
+) -> tuple[str, list[str]]:
     """ratio / size 入参 → 上游枚举值 + 映射说明（**凡改写必留痕**）。
 
-    认三种写法，**其余一律 400** —— 对认不出的字符串不静默放行（那正是本层最贵的一类
-    缺陷：调用方以为生效了，实际被丢或被改）：
+    两条线的差别**只**在这一个参数上：
+
+      · `fallback=None`（默认 = Ark `/tasks` 线）：认不出的一律 `ParamError` ⇒ 400。
+        对认不出的字符串不静默放行（那正是本层最贵的一类缺陷：调用方以为生效了，
+        实际被丢或被改）。
+      · `fallback="16:9"`（`/v1/videos` 线）：认不出的**不报错**，落到兜底档。
+        该端点的调用方是 OpenAI SDK 用户，能拿到的只有"请求失败了"这一个结果，
+        改尺寸重试的成本远高于拿到一档相近的画面；而兜底**照样写 warning**，
+        所以并没有退化成"静默改写"。
+
+    认四种写法 —— 前三种两线一致，第四种自 2026-09-18 起也两线一致：
       1. 枚举本身：`16:9` … `21:9` / `adaptive` ⇒ 原样；
       2. `WxH`（`1920x1080`、`16x9`）约分后**正好在**枚举里 ⇒ 用它；
-      3. `WxH` 约分后**不在**枚举里（`1024x1792` → `4:7`）⇒ **就近吸附**并留痕。
-         上游只认有限几档，不是任意比例；相比让整个请求 400，落到最近一档并把
-         「实际比例与你要的不同」写进 warning 更有用 —— 调用方能看见，也能据此改。
+      3. `WxH` 约分后**不在**枚举里（`1024x1792` → `4:7`）⇒ **就近吸附**并留痕；
+      4. `W:H` 数值比例（`5:4`、`9:21`、`2.35:1`）⇒ 就近吸附并留痕。
+         ⚠️ **两线都认**（用户口径"等比 或者按比例 传都可以"）。此前只在 `fallback`
+         模式认、Ark 线一律 400 —— 那条门槛是本层自己加的（记在 TESTCASES §A3），
+         并非上游约束，已撤；`5:4` 现在在 Ark 线同样吸附到 `4:3`。
     """
     s = str(raw or "").strip()
     if not s:
@@ -176,23 +271,22 @@ def normalize_ratio(raw: Any, label: str = "ratio") -> tuple[str, list[str]]:
     if s in ARK_RATIOS:
         return s, []
     wxh = simplify_wxh(s)
-    if wxh is None:
+    if wxh is not None:
+        if wxh in ARK_RATIOS:
+            return wxh, [f'{label}="{s}" normalized to ratio="{wxh}"']
+        return _snap_ratio(label, s, _ratio_value(wxh), as_text=wxh)
+    #  `W:H` 比例串（`5:4`、`4:7`、`2.35:1`）**两线都认**（2026-09-18 用户口径：
+    #  "等比 或者按比例 传都可以"）。之前只在 `fallback` 模式认、Ark 线一律 400，
+    #  那是本层自己加的门槛 —— 调用方写哪种形态不该由我们挑，两种都收、都吸附、都留痕。
+    value = parse_proportion(s)
+    if value is not None:
+        return _snap_ratio(label, s, value)
+    if fallback is None:
         raise ParamError(f'{label}: invalid enum value "{s}"', label)
-    if wxh in ARK_RATIOS:
-        return wxh, [f'{label}="{s}" normalized to ratio="{wxh}"']
-    v_req = _ratio_value(wxh)
-    snapped = nearest_ratio(v_req)
-    #  deviation 必须写出来：吸附是**有损**的，差 1.6%（4:7 → 9:16）几乎看不出来，
-    #  差 25%（3:1 → 21:9）则是完全不同的画面。只说"改了"不说"改了多少"，调用方
-    #  无法判断该接受还是该换尺寸 —— 把数字给他，由他定，我们不当这个裁量者。
-    #  偏差以**落点**为分母 ⇒ 语义是"实际出的比你想要的窄/宽 X%"，比用较小值做
-    #  分母（`exp(|log 差|)-1`，会系统性高估）更贴近肉眼感受。
-    v_out = _ratio_value(snapped)
-    drift = abs(v_req - v_out) / v_out * 100
-    return snapped, [
-        f'{label}="{s}" ({wxh}) is not one of the upstream ratios; snapped to the nearest '
-        f'supported ratio "{snapped}" (differs by {drift:.1f}%) — the output aspect ratio '
-        f'will not be exactly what you asked for'
+    return fallback, [
+        f'{label}="{s}" is not a recognized aspect ratio (expected one of '
+        f'{"/".join(RATIO_ORDER)}, "adaptive", a WxH size like 1920x1080, or a W:H '
+        f'proportion like 16:9); fell back to "{fallback}"'
     ]
 
 
