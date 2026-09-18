@@ -26,14 +26,23 @@ dry-run 仍可零成本看到）、只是弱化的进 `warnings`。
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import re
+from fractions import Fraction
 from typing import Any, Mapping
 
 from .channel_options import procedure_for_slot, resolve_model
 from .errors import ParamError
 
-ARK_RATIOS = frozenset({"16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"})
+# ratio 枚举的**有序**真源 —— `nearest_ratio()` 靠它做平手时的确定性 tie-break。
+# `ARK_RATIOS` 由它派生：两处各写一份清单是必然漂移的写法。
+RATIO_ORDER: tuple[str, ...] = ("16:9", "4:3", "1:1", "3:4", "9:16", "21:9")
+ARK_RATIOS = frozenset(RATIO_ORDER) | {"adaptive"}
 ARK_RESOLUTIONS = frozenset({"480p", "720p", "1080p"})
+
+# 宽 x 高（OpenAI Sora / 图像 API 风格的 size，如 `1920x1080`、`1024x1792`）。
+# ⚠️ 唯一真源：`openai_videos.size_to_ratio()` 也从这里取（两处各写一份必然漂移）。
+WXH_RE = re.compile(r"^(\d{1,6})\s*[xX×*]\s*(\d{1,6})$")
 
 #: 调用方未点名分辨率时代入的站点档位。**唯一真源**。
 #  `translate_create` 与 `openai_videos` 都要用它：前者靠它定档位，后者靠它算
@@ -117,6 +126,65 @@ PASSTHROUGH_UNSUPPORTED = (
 # 提示词里的素材占位引用：`@图像1` / `@视频2` / `@音频1`。
 # 编号是 **1-based**，对应 `content[]` 里同类素材的出现顺序。
 _REF_TOKEN_RE = re.compile(r"@\s*(图像|视频|音频)\s*(\d+)")
+
+
+def _ratio_value(ratio: str) -> float:
+    """`16:9` → 1.777…（供**远近比较**用，不参与对外输出）。"""
+    w, _, h = str(ratio).partition(":")
+    return float(w) / float(h)
+
+
+def simplify_wxh(text: Any) -> str | None:
+    """`1920x1080` → `16:9`；`1024x1792` → `4:7`。非 WxH 形态返回 None。"""
+    m = WXH_RE.match(str(text or "").strip())
+    if not m:
+        return None
+    w, h = int(m.group(1)), int(m.group(2))
+    if w <= 0 or h <= 0:
+        return None
+    f = Fraction(w, h)
+    return f"{f.numerator}:{f.denominator}"
+
+
+def nearest_ratio(value: float) -> str:
+    """把任意宽高比吸附到 `RATIO_ORDER` 里**相对距离**最近的一档。
+
+    用相对距离（对数差）而不是绝对差：比例域跨越 0.56~2.33，横屏那一端的绝对差
+    天然被放大（同一档的相对偏差在 21:9 上看着比在 9:16 上大一个量级），只有乘性
+    比较才能让横屏与竖屏共用一把尺子。平手时取 `RATIO_ORDER` 里靠前者 ⇒ 结果确定。
+    """
+    return min(
+        RATIO_ORDER,
+        key=lambda r: (abs(math.log(_ratio_value(r) / value)), RATIO_ORDER.index(r)),
+    )
+
+
+def normalize_ratio(raw: Any, label: str = "ratio") -> tuple[str, list[str]]:
+    """ratio / size 入参 → 上游枚举值 + 映射说明（**凡改写必留痕**）。
+
+    认三种写法，**其余一律 400** —— 对认不出的字符串不静默放行（那正是本层最贵的一类
+    缺陷：调用方以为生效了，实际被丢或被改）：
+      1. 枚举本身：`16:9` … `21:9` / `adaptive` ⇒ 原样；
+      2. `WxH`（`1920x1080`、`16x9`）约分后**正好在**枚举里 ⇒ 用它；
+      3. `WxH` 约分后**不在**枚举里（`1024x1792` → `4:7`）⇒ **就近吸附**并留痕。
+         上游只认有限几档，不是任意比例；相比让整个请求 400，落到最近一档并把
+         「实际比例与你要的不同」写进 warning 更有用 —— 调用方能看见，也能据此改。
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return "", []
+    if s in ARK_RATIOS:
+        return s, []
+    wxh = simplify_wxh(s)
+    if wxh is None:
+        raise ParamError(f'{label}: invalid enum value "{s}"', label)
+    if wxh in ARK_RATIOS:
+        return wxh, [f'{label}="{s}" normalized to ratio="{wxh}"']
+    snapped = nearest_ratio(_ratio_value(wxh))
+    return snapped, [
+        f'{label}="{s}" ({wxh}) is not one of the upstream ratios; snapped to the nearest '
+        f'supported ratio "{snapped}" — the output will not have the aspect ratio you asked for'
+    ]
 
 
 def snap_duration(duration: Any, resolution: str, prefer_free: bool = False) -> int:
@@ -313,9 +381,12 @@ def translate_create(
         if body.get(k) is not None or extra.get(k) is not None:
             unsupported.append(k)
 
-    ratio = str(body.get("ratio") or "").strip()
-    if ratio and ratio not in ARK_RATIOS:
-        raise ParamError(f'ratio: invalid enum value "{ratio}"', "ratio")
+    # `WxH` 形态（如 `1024x1792`）在这里被归一化 / 就近吸附；认不出的仍然 400
+    # （口径见 `normalize_ratio`）。**改写一律进 warnings**，不静默。
+    # `ratio_raw` 留着：`requested` 区块回显的是**调用方写的值**，不是归一化后的值。
+    ratio_raw = body.get("ratio")
+    ratio, ratio_notes = normalize_ratio(ratio_raw)
+    warnings.extend(ratio_notes)
     aspect = None
     if ratio and ratio != "adaptive":
         aspect = ratio
@@ -514,7 +585,10 @@ def translate_create(
         "requested": {
             "model": model,
             "content": items,
-            "ratio": ratio or None,
+            # 调用方**写的值**（可能是 `1024x1792` 这类 WxH），不是归一化后的枚举值 ——
+            # `requested` 区块的语义是"请求了什么"，改写结果看 `effective.aspectRatio`
+            # 与 warnings，两处并列才看得出被改过。
+            "ratio": (str(ratio_raw).strip() or None) if ratio_raw is not None else None,
             "resolution": body.get("resolution"),
             "duration": body.get("duration"),
             "frames": body.get("frames"),

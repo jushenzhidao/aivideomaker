@@ -291,7 +291,8 @@ Seedance」的两份 OpenAPI（[创建](https://oneapis.apifox.cn/369966278e0) /
 
 请求字段映射：`model` 原样保留（`_480p/_720p/_1080p` 后缀决定分辨率档位）；
 `prompt` → 提示词；`size` → 宽高比（`keep_ratio`/`adaptive`
-上游语义相同 = 跟随输入图，映射会留痕）；`first_frame_image` / `last_frame_image` → 首/尾帧
+上游语义相同 = 跟随输入图，映射会留痕；与方舟线共用同一份归一化，故同样接受 `WxH`
+并对约不进枚举的值**就近吸附 + 留痕**）；`first_frame_image` / `last_frame_image` → 首/尾帧
 （**只收单值**：给成数组一律 400 —— 参考素材静默丢失是本项目的红线）；
 `input_reference` → **参考图列表**（≤4 张，超限截断并**点名丢掉哪一张**），三种形态都收：
 
@@ -403,7 +404,7 @@ AVM_TASK_STORE=memory      # 显式开发/测试开关：重启即丢
 | `content[].type=image_url` | `role=first_frame`/`last_frame` 走帧通道；`reference_image` 或无 role 进 `referenceImageUrls` |
 | `content[].type=video_url` | → `referenceVideoUrl`（单槽位） |
 | `content[].type=audio_url` | → `referenceAudioUrls` |
-| `ratio` | → `aspectRatio`（站点字段名）；`adaptive` 表示跟随源图，不设值 |
+| `ratio` | → `aspectRatio`（站点字段名）；`adaptive` 表示跟随源图，不设值。**另接受 `WxH` 写法**（`1920x1080`、`1024x1792`）：约分后正好在枚举里就用它，约不进（如 `1024x1792` → `4:7`）则**就近吸附**到最近一档并**必留告警** —— 上游只有有限几档，与其让整请求 400 不如落到最近档并把差异写出来。认不出的形态（含 `5:4`、`abc`）**仍然 400**；`requested.ratio` 回显调用方**原值**，改写结果看 `effective.aspectRatio` |
 | `resolution` | 严格枚举 `480p`/`720p`/`1080p`，**大小写敏感**（`480P` / `4k` / 数字 `720` 一律 400）；缺省或空串 → **`720p`**；校验通过后原样透传 |
 | `duration` | 站点约束是「**连续秒数 + 上限**」，因此**原样透传**（越界才就近钳制到 `[5, 20]`）；缺省 → **5**；`-1` 落 5s（带告警）；小数**截断**（`7.5`→`7`，不是四舍五入）；`frames` 按 24fps 换算且**优先级低于** `duration` |
 | `frames` | 按 24fps 换算成秒 |

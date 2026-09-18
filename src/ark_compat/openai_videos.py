@@ -16,7 +16,8 @@
     prompt    → content[] 里的 text 项
     seconds   → duration（整数秒）—— ⚠️ **本端点按分辨率写死**（`PINNED_DURATIONS`）：
                 480p 一律 10s、720p 一律 8s；调用方显式传的值会被**覆盖**，且在 warnings 留痕
-    size      → ratio（比例枚举原样；`keep_ratio` 与 `adaptive` 上游语义相同 = 跟随输入图）
+    size      → ratio（比例枚举原样；也接受 `WxH` 如 `1024x1792`，约不进枚举则就近吸附
+                并留痕；`keep_ratio` 与 `adaptive` 上游语义相同 = 跟随输入图）
     input_reference       → content[] 的 reference_image 项（1-4 张的上限截断由 translate 负责）
     first_frame_image     → content[] 的 first_frame 帧通道
     last_frame_image      → content[] 的 last_frame 帧通道
@@ -30,12 +31,11 @@ import base64
 import binascii
 import json
 import re
-from fractions import Fraction
 from typing import Any, Mapping
 
 from .errors import ParamError
 from .sniff import sniff_file
-from .translate import DEFAULT_RESOLUTION
+from .translate import DEFAULT_RESOLUTION, normalize_ratio
 
 OPENAI_VIDEOS_PATH = "/v1/videos"
 
@@ -60,11 +60,9 @@ PINNED_DURATIONS: dict[str, int] = {"480p": 10, "720p": 8}
 # 这种静默改档 —— 本层最该避免的正是它。
 
 # size 枚举 → Ark ratio。keep_ratio / adaptive 都表示"由输入图决定"，上游不区分二者。
-_SIZE_RATIOS = ("16:9", "4:3", "1:1", "3:4", "9:16", "21:9")
+# ⚠️ 比例清单与 `WxH` 归一化的**唯一真源在 `translate`**（`RATIO_ORDER` /
+# `normalize_ratio`）—— 这里只留 `/v1/videos` 自己的别名，两处各写一份枚举必然漂移。
 _SIZE_ALIASES = {"adaptive": "adaptive", "keep_ratio": "adaptive"}
-
-# 宽 x 高（OpenAI Sora 风格的 size，如 1920x1080）→ 最简整数比。
-_WXH_RE = re.compile(r"^(\d{2,5})\s*[xX×]\s*(\d{2,5})$")
 
 # Ark 状态 → OpenAI 状态词表（OpenAI Videos 家族：queued / in_progress / completed / failed）。
 _STATUS_TO_OPENAI = {
@@ -105,26 +103,17 @@ def decode_media_value(value: str, field: str, b64_mode: bool) -> str:
     return s
 
 
-def _ratio_from_wxh(size: str) -> str | None:
-    """`1920x1080` → `16:9`。约不进 size 枚举的（如 12:5）返回 None，由调用方报错。"""
-    m = _WXH_RE.match(size.replace("×", "x"))
-    if not m:
-        return None
-    w, h = int(m.group(1)), int(m.group(2))
-    if w <= 0 or h <= 0:
-        return None
-    f = Fraction(w, h)
-    ratio = f"{f.numerator}:{f.denominator}"
-    return ratio if ratio in _SIZE_RATIOS else None
-
-
 def size_to_ratio(size: str) -> tuple[str, list[str]]:
-    """size 字段 → Ark ratio，附映射说明（被改写的一定留痕）。"""
+    """size 字段 → Ark ratio，附映射说明（被改写的一定留痕）。
+
+    归一化逻辑（枚举原样 / `WxH` 约分 / 约不进枚举时**就近吸附**）**只有一份**，在
+    `translate.normalize_ratio()`；这里只叠加 `/v1/videos` 自己的 `keep_ratio` 别名。
+    ⚠️ 认不出的值**原样透传**，由 `translate_create` 的 ratio 校验给出 400 —— 不在本层
+    静默吞掉：吞掉的后果是调用方以为自己写的 size 生效了。
+    """
     s = str(size or "").strip()
     if not s:
         return "", []
-    if s in _SIZE_RATIOS:
-        return s, []
     if s in _SIZE_ALIASES:
         mapped = _SIZE_ALIASES[s]
         if s == mapped:
@@ -132,10 +121,10 @@ def size_to_ratio(size: str) -> tuple[str, list[str]]:
         # keep_ratio → adaptive：两者对上游是同一件事（不设 aspectRatio = 跟随输入图）
         return mapped, [f'size="{s}" mapped to ratio="{mapped}" (the upstream has a single '
                         "image-derived behavior; the distinction does not exist upstream)"]
-    wxh = _ratio_from_wxh(s)
-    if wxh:
-        return wxh, [f'size="{s}" mapped to ratio="{wxh}"']
-    return s, []  # 未知值原样传入，translate 的 ratio 枚举校验会给出 400
+    try:
+        return normalize_ratio(s, label="size")
+    except ParamError:
+        return s, []
 
 
 def _seconds_to_duration(raw: Any) -> int | None:
