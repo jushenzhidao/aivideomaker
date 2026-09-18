@@ -1,0 +1,44 @@
+sequenceDiagram
+    autonumber
+    participant SYS as 系统任务(async_task_poll, 15s, DB lease)
+    participant H as 宿主 DispatchPlatformUpdate
+    participant P as plugin.js
+    participant UP as aivideomaker API
+    participant K as aivm-keeper
+
+    loop 每 15 秒（单例，UPDATE_TASK=true）
+        SYS->>H: RunTaskPollingOnce
+        H->>H: sweepTimedOutTasks (TASK_TIMEOUT_MINUTES=1440)
+        H->>H: 按 platform 与 channel 分组未完成同步任务
+        H->>P: buildBatchQueryRequest(ctx, tasks)
+        P-->>H: {url: baseUrl/api/v1/tasks, method:GET, headers:{key}}
+        H->>UP: GET /api/v1/tasks（每渠道每周期 1 次）
+        alt 2xx
+            UP-->>H: {tasks:[...]}
+            H->>P: parseBatchResult(ctx, body, resp)
+            Note over P: SUBMITTED/PROGRESS 的 reason 必须为 ""<br/>未知状态一律 UNKNOWN
+            P-->>H: BatchItem[]
+            loop 每个 BatchItem
+                alt 非终态
+                    H->>H: PollFailures = 0，写 data/state，继续轮询
+                else SUCCESS
+                    H->>H: 写 PrivateData.ResultURL + SetData(remoteUrl)
+                    H->>H: AdjustBillingOnComplete → extractUsageOnComplete 按 creditsCharged 结算
+                else FAILURE 或 UNKNOWN 累计达 TASK_POLL_MAX_FAILURES
+                    H->>H: 写 FailReason + RefundTaskQuota 全额退款
+                end
+            end
+        else 429 或 5xx
+            H->>H: 归为 transient，PollFailures++（无退避，靠调高阈值兜底）
+        else 401 或 403
+            H->>H: 归为 auth，保持状态 + PollFailures++（不禁用渠道）
+        else 404 或 410
+            H->>H: 立即终态 FAILURE + 退款（不消耗重试预算）
+        end
+    end
+
+    Note over K,UP: keeper 独立周期 60s，令牌桶 6 req/min
+    K->>UP: GET /api/v1/tasks
+    UP-->>K: COMPLETED 且 idempotencyKey 以 aivm- 开头
+    K->>UP: GET output.url（下载字节）
+    K->>K: 校验大小/摘要 + 写 {prefix}/{publicTaskId}.mp4

@@ -191,6 +191,16 @@ class Settings:
     # 等于该账号的 maxQueueLength —— 不放大（撞上游）也不缩水（额度浪费）。
     concurrency_divisor: int = 1
     poll_interval: float = 10.0
+    # tRPC **主调用**（提交 `ai.minimaxH3` / 任务查询 / `uploads.getPresignedUrl`）的
+    # 单次请求超时（秒，`AVM_UPSTREAM_TIMEOUT`）。
+    # 2026-09-18 之前它是 `WebClient` 里写死的 **30.0**（构造参数默认值，没有任何变量
+    # 能改）⇒ 上游偶发慢于 30s 时（实测 `ReadTimeout: The read operation timed out`），
+    # 运维**只能改代码**，没法按环境调。现在暴露成变量，**默认值仍是 30 ⇒ 行为不变**。
+    # 🔴 与**调用方超时**直接竞争：调大 ⇒ 我们还在等，调用方可能已经放弃；而 POST
+    #   提交**不自动重试**（没有幂等键，重试＝重复建任务），读超时之后上游**可能已经
+    #   把任务建好了**（那笔会计费，但我们拿不到 task id）。只在"上游确实偶发慢于
+    #   30s"时调，并确保调用方超时留足余量（闸门等空槽另占 600s，见 gunicorn 超时）。
+    upstream_timeout: float = 30.0
     # 探测类**只读**请求的超时（秒）：出口代理的 TLS 握手实测抖到 10s+，
     # 一发卡住的探测会占满重试循环（默认 30s），所以探测单独用短超时。
     probe_timeout: float = 8.0
@@ -310,6 +320,7 @@ class Settings:
             max_concurrent=int(env.get("AVM_MAX_CONCURRENT") or 2),
             concurrency_divisor=max(1, int(env.get("AVM_CONCURRENCY_DIVISOR") or 1)),
             poll_interval=float(env.get("AVM_POLL_SECONDS") or 10),
+            upstream_timeout=float(env.get("AVM_UPSTREAM_TIMEOUT") or 30),
             probe_timeout=float(env.get("AVM_PROBE_TIMEOUT") or 8),
             media_fetch_timeout=float(env.get("AVM_MEDIA_FETCH_TIMEOUT") or 30),
             media_rehost_budget=float(env.get("AVM_MEDIA_REHOST_BUDGET") or 120),

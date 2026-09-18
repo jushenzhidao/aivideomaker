@@ -1,0 +1,154 @@
+classDiagram
+    direction LR
+
+    class TaskAdaptor {
+        <<host>>
+        +Init(info)
+        +ValidateRequestAndSetAction(c, info) TaskError
+        +EstimateBilling(c, info) RatioMap
+        +ExtractUsageFactsValidated(c, info) UsageFacts
+        +BuildRequestURL(info) string
+        +BuildRequestBody(c, info) Reader
+        +DoRequest(c, info, body) Response
+        +ParseResponse(c, resp, info) SubmitResponse
+        +FetchBatchTasks(baseURL, key, tasks, proxy) Response
+        +ParseBatchResult(tasks, resp, body) BatchResultMap
+        +ListArtifacts(task) ArtifactList
+        +BuildContentRequest(task, key, req) ContentRequest
+    }
+
+    class AivmPlugin {
+        <<plugin.js>>
+        +meta PluginMeta
+        +decodeRequest(ctx) SubmitIntent
+        +buildSubmitRequest(ctx) RequestDescriptor
+        +parseSubmitResponse(ctx, resp) SubmitResult
+        +buildBatchQueryRequest(ctx, tasks) RequestDescriptor
+        +parseBatchResult(ctx, body, resp) BatchItemList
+        +extractUsage(ctx) UsageFacts
+        +extractUsageOnComplete(taskCtx, info, body) UsageFacts
+        +listArtifacts(taskCtx) ArtifactList
+        +buildContentRequest(ctx) ContentDescriptor
+        +render(ctx, taskView) OpenAIVideo
+    }
+
+    class PluginMeta {
+        +apiVersion int
+        +key string
+        +version string
+        +channelTypes intList
+        +models stringList
+        +fetchMode string
+        +allowedHosts stringList
+        +auth AuthMeta
+        +protocols stringList
+        +usageSchema UsageSchema
+    }
+
+    class MiniMaxH3Request {
+        +content string
+        +duration int
+        +resolution string
+        +tier string
+        +aspectRatio string
+    }
+
+    class UsageFacts {
+        +credits number
+        +resolution string
+        +tier string
+    }
+
+    class BatchItem {
+        +taskId string
+        +status string
+        +progress string
+        +reason string
+        +url string
+        +data TaskData
+        +state TaskState
+    }
+
+    class TaskData {
+        +remoteUrl string
+        +upstreamTaskId string
+        +duration int
+        +resolution string
+        +tier string
+        +estimateCredits int
+        +creditsCharged int
+        +listValueCents int
+    }
+
+    class TaskState {
+        +completedAt int
+        +remoteUrl string
+        +canceled bool
+        +failureCode string
+    }
+
+    class Keeper {
+        <<aivm-keeper>>
+        +config Config
+        +locker Locker
+        +harvester Harvester
+        +gateway Gateway
+        +doctor Doctor
+        +Run(ctx) error
+    }
+
+    class Harvester {
+        +interval Duration
+        +Sweep(ctx) error
+        +archiveOne(ctx, task) error
+    }
+
+    class Gateway {
+        +ServeHTTP(w, r)
+        +resolveOrFetch(ctx, publicTaskId) ObjectRef
+    }
+
+    class Doctor {
+        +interval Duration
+        +Check(ctx) AccountSnapshot
+    }
+
+    class ObjectStore {
+        <<interface>>
+        +Exists(ctx, key) bool
+        +Put(ctx, key, reader, meta) error
+        +Presign(ctx, key, ttl) string
+    }
+
+    class UpstreamClient {
+        +baseURL string
+        +apiKey string
+        +limiter RateLimiter
+        +ListTasks(ctx) TaskList
+        +GetAccount(ctx) Account
+    }
+
+    class RateLimiter {
+        +Allow() bool
+        +Wait(ctx) error
+    }
+
+    TaskAdaptor ..> AivmPlugin : 调用钩子
+    AivmPlugin *-- PluginMeta
+    AivmPlugin ..> MiniMaxH3Request : 构造
+    AivmPlugin ..> UsageFacts : 产出
+    AivmPlugin ..> BatchItem : 产出
+    BatchItem *-- TaskData
+    BatchItem *-- TaskState
+    Keeper *-- Harvester
+    Keeper *-- Gateway
+    Keeper *-- Doctor
+    Keeper *-- UpstreamClient
+    Harvester ..> ObjectStore : 写入
+    Gateway ..> ObjectStore : 读取与写入
+    Harvester ..> UpstreamClient : 批量查询
+    Gateway ..> UpstreamClient : 按需查询
+    Doctor ..> UpstreamClient : 体检
+    UpstreamClient *-- RateLimiter
+    ObjectStore <|-- LocalStore
+    ObjectStore <|-- S3Store

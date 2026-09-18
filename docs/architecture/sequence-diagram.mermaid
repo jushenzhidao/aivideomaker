@@ -1,0 +1,30 @@
+sequenceDiagram
+    autonumber
+    actor U as 终端用户
+    participant H as new-api 宿主
+    participant P as plugin.js
+    participant UP as aivideomaker API
+
+    U->>H: POST /v1/videos (Bearer sk-xxx)
+    H->>H: 鉴权 / 模型权限 / 选渠道(类型 61)
+    H->>P: protocols.openai_video.decodeRequest(ctx)
+    Note over P: 本地校验全在这里<br/>参数/尺寸/互斥/data URI<br/>非法则 throw 到 400
+    P-->>H: {kind:submit, model, action, requestBody}
+    H->>P: extractUsage(ctx, usagePurpose=facts)
+    P-->>H: {credits, resolution, tier}
+    H->>H: 用量表达式求值 + ForcePreConsume 预扣
+    H->>P: buildSubmitRequest(ctx)
+    Note over P: Idempotency-Key = aivm- + publicTaskId<br/>X-Max-Credits = ceil(credits * 1.5) + 5
+    P-->>H: {url, method:POST, headers, body}
+    H->>UP: POST /api/v1/generate/minimax
+    UP-->>H: 200 {status:SUBMITTED, taskId:tv_abc, creditsCharged}
+    H->>P: parseSubmitResponse(ctx, resp)
+    alt 200 且无 errorCode
+        P-->>H: {taskId:tv_abc, taskData:{...}}
+        H->>H: 落库(绑定 upstreamTaskId) + 快照计费上下文
+        H-->>U: 202 {id:task_xxx, status:queued}
+    else 200 但 status FAILED / 4xx / 5xx
+        P-->>H: throw 脱敏错误
+        H->>H: 退款未落库预扣 + 上抛 502
+        H-->>U: 502 通道错误(脱敏)
+    end

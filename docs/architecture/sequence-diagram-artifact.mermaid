@@ -1,0 +1,35 @@
+sequenceDiagram
+    autonumber
+    actor U as 终端用户
+    participant H as new-api 宿主
+    participant P as plugin.js
+    participant K as keeper gateway
+    participant S as 自有对象存储
+    participant UP as 上游 CDN
+
+    U->>H: GET /v1/videos/{task_id}/content
+    H->>P: listArtifacts(taskCtx)
+    P-->>H: [{key:video, type:video, mimeType:video/mp4}]
+    H->>P: buildContentRequest(ctx)
+    Note over P: 恒定返回确定性归档 URL<br/>ARCHIVE_BASE/{publicTaskId}.mp4<br/>credentialless: true
+    P-->>H: {url: 归档URL, method:GET, credentialless:true}
+    H->>H: SSRF 校验 + 环回检测（ARCHIVE_BASE 不可指向自身）
+    H->>K: GET /a/{publicTaskId}.mp4
+
+    alt 已归档（正常路径）
+        K->>S: Exists?
+        S-->>K: yes
+        K-->>H: 302 → 对象存储直链（TTL 900s）
+        H-->>U: 200 video/mp4（24 小时后仍可用）
+    else 未归档（首次取回 / 收割未及时）
+        K->>UP: 查上游（30s 缓存）取 output.url
+        alt 上游仍能取（≤24h）
+            K->>UP: GET output.url
+            K->>S: 边下边写 + 校验
+            K-->>H: 200 直出字节
+            H-->>U: 200 video/mp4
+        else 上游已过期（>24h）
+            K-->>H: 410 Gone
+            H-->>U: 502 artifact_upstream_error + P1 告警
+        end
+    end

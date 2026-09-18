@@ -166,6 +166,7 @@ services:
       # 应用侧（src/ark_compat/settings.py）：
       AVM_SERVICE_NAME: ${AVM_SERVICE_NAME:-}
       AVM_ENVIRONMENT: ${AVM_ENVIRONMENT:-}
+      AVM_UPSTREAM_TIMEOUT: ${AVM_UPSTREAM_TIMEOUT:-}
       AVM_PROBE_TIMEOUT: ${AVM_PROBE_TIMEOUT:-}
       # 参考文件链接的取文件预算（见 .env.example）：单项 / 整个转存阶段的总闸。
       # 容器里这两项比本机更要紧 —— 出口带宽与链路都更差。

@@ -176,6 +176,8 @@ def _build_web(
         user_id="" if passthrough else settings.user_id,
         visitor_id=settings.visitor_id,
         trust_env=settings.trust_env,
+        # 主调用超时：此前吃 WebClient 的硬编码默认 30 ⇒ 上游慢于 30s 时没有出口可调
+        timeout=settings.upstream_timeout,
         probe_timeout=settings.probe_timeout,
         # 取"参考文件链接"的单项预算：调大了就是把调用方的超时甩在后面（见 _fetch_media）
         media_fetch_timeout=settings.media_fetch_timeout,

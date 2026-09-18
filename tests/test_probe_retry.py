@@ -151,6 +151,17 @@ class TestSettings(unittest.TestCase):
         self.assertEqual(Settings.from_env({}).probe_timeout, 8.0)
         self.assertEqual(Settings.from_env({"AVM_PROBE_TIMEOUT": "3"}).probe_timeout, 3.0)
 
+    def test_upstream_timeout_knob(self):
+        """主调用超时：默认仍是 30（行为不变），可由 `AVM_UPSTREAM_TIMEOUT` 放大。
+
+        2026-09-18 之前这一档是 `WebClient` 的硬编码默认 30 —— 上游偶发慢于 30s 时
+        （`ReadTimeout`）没有任何变量能调，只能改代码。
+        """
+        self.assertEqual(Settings.from_env({}).upstream_timeout, 30.0)
+        self.assertEqual(
+            Settings.from_env({"AVM_UPSTREAM_TIMEOUT": "45"}).upstream_timeout, 45.0
+        )
+
     def test_upstream_builder_passes_it_through(self):
         from unittest import mock
 
@@ -160,6 +171,7 @@ class TestSettings(unittest.TestCase):
         s = Settings(
             cookie=COOKIE, base_url="http://127.0.0.1:9",
             trust_env=False, task_store="memory", probe_timeout=1.5,
+            upstream_timeout=12.0,
         )
         seen: dict = {}
         orig = upstreams.WebClient
@@ -172,6 +184,9 @@ class TestSettings(unittest.TestCase):
             up = upstreams.build_web_for_cookie(s, COOKIE)
         self.addCleanup(up.client.close)
         self.assertEqual(seen.get("probe_timeout"), 1.5, "构造上游时必须把探测超时传下去")
+        self.assertEqual(
+            seen.get("timeout"), 12.0, "构造上游时必须把主调用超时传下去（否则配置静默无效）"
+        )
 
 
 if __name__ == "__main__":
