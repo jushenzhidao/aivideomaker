@@ -180,10 +180,19 @@ def normalize_ratio(raw: Any, label: str = "ratio") -> tuple[str, list[str]]:
         raise ParamError(f'{label}: invalid enum value "{s}"', label)
     if wxh in ARK_RATIOS:
         return wxh, [f'{label}="{s}" normalized to ratio="{wxh}"']
-    snapped = nearest_ratio(_ratio_value(wxh))
+    v_req = _ratio_value(wxh)
+    snapped = nearest_ratio(v_req)
+    #  deviation 必须写出来：吸附是**有损**的，差 1.6%（4:7 → 9:16）几乎看不出来，
+    #  差 25%（3:1 → 21:9）则是完全不同的画面。只说"改了"不说"改了多少"，调用方
+    #  无法判断该接受还是该换尺寸 —— 把数字给他，由他定，我们不当这个裁量者。
+    #  偏差以**落点**为分母 ⇒ 语义是"实际出的比你想要的窄/宽 X%"，比用较小值做
+    #  分母（`exp(|log 差|)-1`，会系统性高估）更贴近肉眼感受。
+    v_out = _ratio_value(snapped)
+    drift = abs(v_req - v_out) / v_out * 100
     return snapped, [
         f'{label}="{s}" ({wxh}) is not one of the upstream ratios; snapped to the nearest '
-        f'supported ratio "{snapped}" — the output will not have the aspect ratio you asked for'
+        f'supported ratio "{snapped}" (differs by {drift:.1f}%) — the output aspect ratio '
+        f'will not be exactly what you asked for'
     ]
 
 

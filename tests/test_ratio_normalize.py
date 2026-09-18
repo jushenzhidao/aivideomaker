@@ -87,6 +87,18 @@ class TestWxHSnapping(unittest.TestCase):
         self.assertIn("4:7", notes[0], "要说清约出来的比例，调用方才知道差多少")
         self.assertIn("9:16", notes[0])
 
+    def test_deviation_is_reported_so_the_caller_can_judge(self):
+        """吸附是**有损**的 ⇒ warning 必须写明偏了多少，调用方才知道能不能接受。"""
+        _, notes = T.normalize_ratio("1024x1792")
+        self.assertIn("differs by", notes[0])
+        self.assertIn("1.6%", notes[0])  # 4:7 vs 9:16
+
+    def test_deviation_is_computed_not_hardcoded(self):
+        """换个差得多的尺寸，百分比必须跟着变 —— 防"写死一个百分数"糊过去。"""
+        _, notes = T.normalize_ratio("1170x2532")  # iPhone 竖屏，约 195:422
+        self.assertEqual(T.normalize_ratio("1170x2532")[0], "9:16")
+        self.assertIn("17.9%", notes[0], "偏差应以**落点**为分母：比 9:16 窄 17.9%")
+
     def test_snapping_picks_the_nearest_not_the_first(self):
         for raw, want in [
             ("1440x900", "16:9"),   # 8:5 = 1.6：离 16:9 近，离 4:3 远
