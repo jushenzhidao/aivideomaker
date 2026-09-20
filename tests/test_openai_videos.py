@@ -114,30 +114,58 @@ class TestArkBodyFromOpenai(unittest.TestCase):
     """OpenAI 字段 → Ark 请求体（复用 translate_create 做重活）。"""
 
     def test_minimal_form(self):
+        """最小表单（只给 model + prompt）：这一层把字段落到哪儿。
+
+        ⚠️ `model` 名**不再决定上游槽位**（本面只跑免费档，槽位在 app 层强制），但它带的
+        分辨率后缀仍然决定档位。这里断言的是**本层**的产物；路由见 `test_videos_free_only`。
+        """
         body, notes = ark_body_from_openai(
-            {"model": "minimaxH3_1080p", "prompt": "360度环绕运镜"}
+            {"model": "minimaxH3_480p", "prompt": "360度环绕运镜"}
         )
-        self.assertEqual(body["model"], "minimaxH3_1080p")
+        self.assertEqual(body["model"], "minimaxH3_480p", "本层不改写调用方写下的名字")
         self.assertEqual(body["content"], [{"type": "text", "text": "360度环绕运镜"}])
         # 分辨率来自 model 名的档位后缀
-        self.assertEqual(body["resolution"], "1080p")
-        # seconds 缺省 → 交给 translate 的默认（5s，免费窗口内）
+        self.assertEqual(body["resolution"], "480p")
         plan = translate_create(body)
-        self.assertEqual(plan["web_params"]["duration"], 5)
-        self.assertEqual(notes, [])
+        self.assertEqual(plan["web_params"]["duration"], 10, "480p 被钉到免费区最长档")
+        self.assertEqual(
+            notes,
+            ["seconds omitted — this endpoint pins 480p to 10s"],
+            "补默认值必须留痕，且只该有这一条",
+        )
+
+    def test_1080p_is_downgraded_into_the_free_tier(self):
+        """★ 本面只跑免费档：`_1080p` 先**降级**成 720p，时长再被钉到 8s。
+
+        依据：站点对 1080p **没有**实测免费线（按秒计价）⇒ 不降级就等于"对外承诺只看免费档、
+        实际却在花钱"。2026-09-20 用户口径：「**8s 720p**」。改档必须留痕（两条都留）。
+        """
+        body, notes = ark_body_from_openai(
+            {"model": "minimaxH3_1080p", "prompt": "p", "seconds": 15}
+        )
+        self.assertEqual(body["resolution"], "720p", "1080p 必须降到免费档内的分辨率")
+        self.assertEqual(body["duration"], 8, "降级之后按 720p 钉死在免费区最长档")
+        self.assertTrue(any("downgraded" in n for n in notes), f"降级是改档，必须留痕：{notes}")
+        plan = translate_create(body)
+        self.assertFalse(plan["effective"]["billed"], "降级 + 钉死之后不该再落在计费区")
 
     def test_model_without_resolution_suffix_keeps_translate_default(self):
         body, _ = ark_body_from_openai({"model": "sora-2", "prompt": "p"})
         self.assertNotIn("resolution", body)
 
-    def test_seconds_string_and_int(self):
-        # ⚠️ 载具必须选**未被写死映射覆盖**的分辨率（当前只有 1080p）：本用例考的是
-        #    "字符串/整数都能解析成秒"，而 480p / 720p（含**无后缀** ⇒ 下游按 720p 兜底）
-        #    的时长会被 `PINNED_DURATIONS` 覆盖 ⇒ 拿它们当载具，测的其实是映射、不是解析。
-        #    2026-09-17 实测踩中：`seconds="12"` 在无后缀模型上得到 8 而非 12。
+    def test_seconds_are_parsed_then_pinned(self):
+        """秒数**解析**（字符串 / 整数都认）与**钉死**是两件事 —— 本面只保留后者。
+
+        ⚠️ 旧的"未被钉死的载具"已不存在（2026-09-20：`_1080p` 也降级）⇒ "传 12 得到 12"
+        这一格在本面**不可能**出现。解析本身仍要守住（非法值 400，见下一个用例），所以这里
+        直接测解析函数；本面的**结果**由最后那条断言钉住。
+        """
+        from ark_compat.openai_videos import _seconds_to_duration
+
         for v, want in (("8", 8), (8, 8), ("12", 12)):
-            body, _ = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "seconds": v})
-            self.assertEqual(body["duration"], want)
+            self.assertEqual(_seconds_to_duration(v), want)
+        body, _ = ark_body_from_openai({"model": "minimaxH3_720p", "prompt": "p", "seconds": "12"})
+        self.assertEqual(body["duration"], 8, "任何合法秒数落到本面都进免费区最长档")
 
     def test_seconds_non_integer_is_rejected(self):
         with self.assertRaises(ParamError):
@@ -146,9 +174,11 @@ class TestArkBodyFromOpenai(unittest.TestCase):
             ark_body_from_openai({"model": "minimaxH3", "prompt": "p", "seconds": "5.5"})
 
     def test_size_ratio_passthrough(self):
-        # 载具同上（1080p）：把「size 映射」与**被写死的时长**隔离开。否则 `notes` 里会
-        # 多出一条时长映射说明，`assertEqual(notes, [])` 就不再是在考 size 了。
-        body, notes = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "size": "9:16"})
+        # 静默载具：分辨率在免费档内 + 秒数恰好等于钉死值 ⇒ 本层不产生任何 note，
+        # `assertEqual(notes, [])` 考的才是 size（旧载具 1080p 现在会带一条降级说明）。
+        body, notes = ark_body_from_openai(
+            {"model": "minimaxH3_480p", "prompt": "p", "seconds": 10, "size": "9:16"}
+        )
         self.assertEqual(body["ratio"], "9:16")
         self.assertEqual(notes, [])
 
@@ -360,7 +390,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
     def test_json_create_returns_the_same_shape(self):
         r = self.client.post(
             OPENAI_VIDEOS_PATH,
-            json={"model": "minimaxH3_1080p", "prompt": "一只猫", "size": "adaptive"},
+            json={"model": "minimaxH3_480p", "prompt": "一只猫", "seconds": 10, "size": "adaptive"},
         )
         self.assertEqual(r.status_code, 200)
         j = r.json()
@@ -368,7 +398,7 @@ class TestOpenaiHttpLayer(unittest.TestCase):
         self.assertEqual(j["status"], "queued")
         # 参数真的进了翻译层：adaptive → 不设 aspectRatio
         self.assertIsNone(self.fake.created_params[0].get("aspectRatio"))
-        self.assertEqual(self.fake.created_params[0]["resolution"], "1080p")
+        self.assertEqual(self.fake.created_params[0]["resolution"], "480p")
 
     def test_model_suffix_drives_resolution(self):
         self.client.post(

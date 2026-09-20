@@ -125,6 +125,11 @@ _RESOLUTION_SUFFIX_RE = re.compile(r"_(480p|720p|1080p)\s*$", re.I)
 #: 解析来源，进证据字段（`effective.model_source`）。
 SOURCE_MODEL_MAP = "model_map"
 SOURCE_PASSTHROUGH = "passthrough"
+#: **面级策略**强制落定的槽位（见 `resolve_model(force_slot=...)`）。目前只有一个使用者：
+#: `/v1/videos` 的"只跑免费线"（2026-09-20 用户口径），槽位由 `openai_videos.FREE_ONLY_SLOT` 给出。
+#: ⚠️ 它与已撤除的渠道键 `X-Channel-Options.model` **不是一回事**：那个是**渠道配置**要钉住槽位
+#: （会让"配了不生效"难以察觉），这个是**面自己的对外契约**、由代码传入、每次改写都留痕。
+SOURCE_FREE_ONLY = "free_only"
 
 
 @dataclass(frozen=True)
@@ -254,7 +259,35 @@ def _model_map(options: Mapping[str, Any]) -> dict[str, str]:
     return out
 
 
-def resolve_model(model: Any, options: Mapping[str, Any] | None) -> ModelResolution:
+def _resolve_by_name(name: str, table: Mapping[str, str]) -> tuple[str | None, str, str]:
+    """按名字解析（老规则）→ `(槽位 | None, 来源, 告警文本)`。
+
+    判定顺序：① 映射表**精确**命中 → ② 映射表的 `*` 兜底 → ③ 名字本身是已知上游槽位
+    （**透明转发**）→ ④ `None`（表外、且不是已知槽位；由调用方决定"拒绝"还是"面级策略覆盖"）。
+
+    抽成函数只有一个理由：**面级策略要能如实说出"它改掉了什么"**。判定链写两份必然漂，
+    而这条链的产物直接决定"落到哪个模型"= 计费档位。
+    """
+    if name in table:
+        slot = table[name]
+        return slot, SOURCE_MODEL_MAP, (
+            f'model "{name}" → upstream slot "{slot}" (exact hit in the channel model_map)'
+        )
+    if CATCH_ALL in table:
+        slot = table[CATCH_ALL]
+        return slot, SOURCE_MODEL_MAP, (
+            f'model "{name}" → upstream slot "{slot}" (the channel\'s model_map "{CATCH_ALL}" '
+            "fallback overrides every name it does not list explicitly)"
+        )
+    if name in KNOWN_SLOTS:
+        # 透明转发：请求值 = 执行值，没有可留痕的改写（与老实现一致：不发声）
+        return name, SOURCE_PASSTHROUGH, ""
+    return None, SOURCE_PASSTHROUGH, ""
+
+
+def resolve_model(
+    model: Any, options: Mapping[str, Any] | None, *, force_slot: str | None = None
+) -> ModelResolution:
     """调用方模型名 → `(槽位, 来源, 是否已实测, 告警)`。**不猜、不兜底**（判定顺序见模块 docstring）。
 
     ⚠️ **两条已决定的规则**（不是缺口）：
@@ -263,6 +296,15 @@ def resolve_model(model: Any, options: Mapping[str, Any] | None) -> ModelResolut
        一律落这一档"，这正是本层唯一的"强制一档"手段（`model` 钉住键已撤除）。
        每次改写都进 `warnings` 且留 `model_source=model_map` 证据，**不静默**；
     2. **精确键永远优先于兜底**（① > ②）—— 想让某个名字走别的槽位，就把它写进精确表。
+
+    `force_slot`：**面级策略**（不是渠道配置）要求本次请求只落这一个槽位。给了它，就**跳过**
+    ②③④三条判定 —— 连"不认识的名字"也不会 400（那正是"全部兜底到免费档"的含义）；
+    槽位改写成它、来源标 `source=free_only`，而**调用方的名字一字不改**（`requested.model`
+    仍是原值，证据不丢），凡是没落的就进 `warnings`。唯一的调用者是 `/v1/videos` 的
+    "只跑免费线"（`openai_videos.FREE_ONLY_SLOT`）。
+    ⚠️ **渠道配置的校验（撤除键 / 非法通配）在它之前照旧执行** —— 强制槽位不该让一份坏配置
+    静默通过。它与已撤除的 `X-Channel-Options.model` 不是一回事：那个是渠道配置想钉住槽位，
+    这个是面自己的对外契约（见 `SOURCE_FREE_ONLY`）。
     """
     options = options or {}
     _reject_removed_keys(options)
@@ -272,21 +314,27 @@ def resolve_model(model: Any, options: Mapping[str, Any] | None) -> ModelResolut
 
     table = _model_map(options)
     warnings: list[str] = []
+    # 先算出"**本来**会落到哪"（老规则：映射表精确命中 / `*` 兜底 / 已知槽位透传 / 未命中 ⇒ 拒）。
+    # 抽出来是为了让面级策略能**如实说出它改掉了什么** —— 两处各写一份判定必然漂。
+    intended, intended_source, intended_note = _resolve_by_name(name, table)
 
-    if name in table:
-        slot, source = table[name], SOURCE_MODEL_MAP
-        warnings.append(
-            f'model "{name}" → upstream slot "{slot}" (exact hit in the channel model_map)'
-        )
-    elif CATCH_ALL in table:
-        slot, source = table[CATCH_ALL], SOURCE_MODEL_MAP
-        warnings.append(
-            f'model "{name}" → upstream slot "{slot}" (the channel\'s model_map "{CATCH_ALL}" '
-            "fallback overrides every name it does not list explicitly)"
-        )
-    elif name in KNOWN_SLOTS:
-        slot, source = name, SOURCE_PASSTHROUGH
-    else:
+    if force_slot:
+        slot, source = force_slot, SOURCE_FREE_ONLY
+        if intended != force_slot:
+            # 🔴 覆盖必须留痕，且要说清被覆盖的是**哪一种**：调用方点名的别的槽位、渠道映射
+            #    指到的槽位、还是"本来会被拒"的未知名。运维要靠这条判断"我配的映射为什么
+            #    没生效"（不静默换模型是本项目一贯的口径）。
+            what = (
+                f'would have gone to upstream slot "{intended}"'
+                + (f" ({intended_note})" if intended_note else " (passthrough)")
+                if intended is not None
+                else "would have been refused (unknown upstream slot)"
+            )
+            warnings.append(
+                f'model "{name}" {what}, but this face only runs one upstream slot: the request '
+                f'goes to "{force_slot}" instead'
+            )
+    elif intended is None:
         hint = (
             f" The channel model_map declares: {', '.join(sorted(table))}."
             if table
@@ -298,6 +346,10 @@ def resolve_model(model: Any, options: Mapping[str, Any] | None) -> ModelResolut
             f'single "{CATCH_ALL}" catch-all) to the channel\'s X-Channel-Options.model_map.',
             "model",
         )
+    else:
+        slot, source = intended, intended_source
+        if intended_note:
+            warnings.append(intended_note)
 
     verified = slot in VERIFIED_SLOTS
     if not verified:

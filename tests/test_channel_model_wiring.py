@@ -220,7 +220,12 @@ class TestResolutionEvidence(unittest.TestCase):
 
 
 class TestOpenAiFaceCarriesTheSameSemantics(unittest.TestCase):
-    """两条入口（方舟面 / OpenAI 面）必须走**同一套**模型语义与同一个 procedure。"""
+    """两条入口共用**同一套机制**（同一个解析函数、同一份翻译、同一个 procedure）。
+
+    ⚠️ 但**策略不同**（2026-09-20）：方舟线按判定序走（映射表 → 透传 → 400），
+    `/v1/videos` 则强制落免费档（`translate_create(force_slot=…)`）。机制同源、策略不同 ——
+    本类钉的是"OpenAI 面确实走到同一条管线上"（procedure 恒为 `ai.minimaxH3`）。
+    """
 
     def setUp(self):
         self.site = FakeSite()
@@ -232,20 +237,37 @@ class TestOpenAiFaceCarriesTheSameSemantics(unittest.TestCase):
         }
         self.app = TestClient(app)
 
-    def test_suffix_is_stripped_before_matching_and_the_procedure_follows(self):
-        """`minimaxH3_1080p`：后缀决定分辨率、**不参与槽位比对**，否则合法请求会被拒。"""
+    def test_the_suffix_still_drives_resolution_and_the_slot_is_the_free_one(self):
+        """`minimaxH3_480p`：后缀决定**分辨率**，而槽位由本面的免费档策略固定。
+
+        ⚠️ 旧版断言的是"后缀不参与槽位比对"—— 那条规则现在只对**方舟线**还有意义
+        （本面上槽位恒为 `FREE_ONLY_SLOT`，后缀唯一还起作用的地方就是分辨率）。
+        """
         r = self.app.post(
-            OPENAI_VIDEOS_PATH, json={"model": "minimaxH3_1080p", "prompt": "a cat"}
+            OPENAI_VIDEOS_PATH, json={"model": "minimaxH3_480p", "prompt": "a cat", "seconds": 10}
         )
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(
             sorted({q.url.path for q in self.site.requests if q.method == "POST"}),
             ["/api/ai.minimaxH3"],
+            "本面上槽位恒为免费档（后缀只决定分辨率）",
         )
 
-    def test_unknown_model_on_the_openai_face_is_refused_too(self):
+    def test_unknown_model_on_the_openai_face_lands_on_the_free_slot(self):
+        """🔴 本面**不再因模型名不认识而 400**（2026-09-20 用户口径：「不走付费模型，
+        全部用免费的兜底」）：名字照收下，槽位一律落免费档。
+
+        旧行为（未命中 ⇒ 400）已作废 —— 本面的调用方是 OpenAI SDK 用户，他们能拿到的信息
+        只有"请求失败了"。⚠️ 方舟线**不变**，不认识的名字仍然 400（见
+        `TestModelResolutionIsWired` 里那条"拒绝必须发生在上游调用之前"）。
+        """
         r = self.app.post(OPENAI_VIDEOS_PATH, json={"model": "sora-2", "prompt": "a cat"})
-        self.assertEqual(r.status_code, 400, r.text)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(
+            sorted({q.url.path for q in self.site.requests if q.method == "POST"}),
+            ["/api/ai.minimaxH3"],
+            "不认识的模型名也必须落到免费槽位（既不该拒，更不该照名字发出去）",
+        )
 
 
 if __name__ == "__main__":

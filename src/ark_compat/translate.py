@@ -357,7 +357,10 @@ def _as_bool(value: Any) -> bool | None:
 
 
 def translate_create(
-    body: Mapping[str, Any], *, channel_options: Mapping[str, Any] | None = None
+    body: Mapping[str, Any],
+    *,
+    channel_options: Mapping[str, Any] | None = None,
+    force_slot: str | None = None,
 ) -> dict:
     """Ark 创建任务请求体 → 完整翻译结果（纯函数，不联网）。
 
@@ -371,6 +374,10 @@ def translate_create(
     `upstream_model_map`；**精确键 + 至多一条 `*` 兜底**），**默认 = 上游 model 透传**；
     解析规则与冲突处理全在 `channel_options.resolve_model`，本函数只把它接到
     `effective.model` / `effective.model_source` 与 `web_params["procedure"]` 上。
+
+    `force_slot`：**面级策略**入口 —— "这个面只跑某一个上游槽位"，由**面的代码**传入
+    （当前只有 `/v1/videos` 用它"只跑免费线"），不是渠道可配的东西。语义与边界见
+    `channel_options.resolve_model` 的同名参数；它**不改写 `requested.model`**。
     """
     if not isinstance(body, Mapping):
         raise ParamError("body must be a JSON object")
@@ -380,9 +387,13 @@ def translate_create(
     incompatible: list[str] = []
 
     # `model` 决定**上游槽位**（= 站点 procedure 名里那一段）。判定顺序：
-    #   ① 渠道映射表精确命中 → ② 名字本身是已知上游槽位（**默认透传**）→ ③ `*` 兜底 → ④ 400。
-    # `X-Channel-Options.model`（钉住）**已撤除**（2026-09-17）⇒ 本层刻意不提供"强制一档"：
-    #   `*` 兜底也不改写调用方点名的槽位名（请求值 = 执行值）。要强制请在上层统一名字。
+    #   ① **面级策略** `force_slot` → ② 渠道映射表精确命中 → ③ 名字本身是已知上游槽位
+    #   （**默认透传**）→ ④ `*` 兜底 → ⑤ 400。
+    # `X-Channel-Options.model`（钉住）**已撤除**（2026-09-17）⇒ **渠道配置**不再能强制一档：
+    #   `*` 兜底也不改写调用方点名的槽位名（请求值 = 执行值）。
+    #   ⚠️ 面级策略 `force_slot` 是**另一回事**（2026-09-20）：由**面的代码**传入（目前只有
+    #   `/v1/videos` 的"只跑免费线"），会**跳过** ②~⑤、连不认识的名字也不 400 —— 那是该面
+    #   自己对外承诺的语义，不是运维能配的东西；改写照旧留告警与证据（`model_source=free_only`）。
     # 规则、值域与冲突处理见 `channel_options.resolve_model`（与视频适配层同一套键与语义）。
     # ⚠️ 它**不进上游请求体** —— 站点创建体的键是白名单（没有 model 字段），站点把模型编在
     #    procedure 路径上 ⇒ "落到哪个模型"在这里表现为**换 procedure**（`web_params["procedure"]`）。
@@ -392,7 +403,7 @@ def translate_create(
         raise ParamError("model is required", "model")
     # ⚠️ 变量名必须避开 `resolution` —— 那个名字在本函数里是**站点分辨率**（`720p` 之类），
     #    两者共用一个名字会让模型解析结果被分辨率覆盖掉（实测踩中，症状是 `str` 没有 `.slot`）。
-    model_resolution = resolve_model(model, channel_options)
+    model_resolution = resolve_model(model, channel_options, force_slot=force_slot)
     warnings.extend(model_resolution.warnings)
 
     items = body.get("content")

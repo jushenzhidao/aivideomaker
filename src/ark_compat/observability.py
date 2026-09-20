@@ -554,42 +554,58 @@ def record_wait(*, upstream: str, final_status: str, seconds: float, source: str
     ).record(value, attributes={"upstream": upstream, "final_status": final_status, "source": source})
 
 
-def record_videos_charge(
+def record_charged_task(
     *,
+    api: str,
     upstream: str,
     status: str,
     resolution: str = "",
     duration: int | None = None,
     model_slot: str = "",
+    expected_billed: bool | None = None,
 ) -> None:
-    """`/v1/videos` 线上**真的被扣了积分**的任务 → Logfire 计数指标（`> 0` 即异常）。
+    """**实际被扣了积分**的任务（站点记录 `usage.paid=true`）→ Logfire 计数指标。
 
-    🔴 为什么是"异常上报"而不是普通统计：该端点在 `openai_videos.PINNED_DURATIONS` 里按
-    分辨率把时长**无条件**钉在站点已实测免费的档位上（`480p` / `720p`），对外契约就是
-    "这条线永远不花钱"。⇒ 这个计数器**>0 就说明契约破了**（站点收窄了免费线 / 某条请求
-    绕过了钉死 / 模型档位与假定不符），应当在 Logfire 上给它挂告警，而不是等人去翻 trace。
+    两条线都报，但**必须能分开读** —— 它们的"正常程度"完全不同：
+      · `api="openai"`（`/v1/videos`）—— 该端点按分辨率把时长钉在免费档上，对外承诺恒不
+        花钱 ⇒ **这个端点出任何一条都值得看**（钉死的 `480p` / `720p` 真扣费 = 契约破了；
+        `1080p` 按调用方原值透传、本就可能计费，靠 `expected_billed` 区分）。
+      · `api="ark"`（`/tasks`）—— 调用方**可以自己点** `tier=base` 或传超出免费窗口的时长，
+        那种扣费是明示的选择（`billing_view` 已经为它发过告警）⇒ 方舟线的告警应当收窄到
+        `expected_billed="false"` 那一格：「创建时说免费、实际却扣了」才是口径不符。
+    预测来自创建时落库的 `effective.billed`（`tier=base` 或超免费窗口），事实来自站点终态
+    记录的 `paid` —— 🔴 判据永远是 `paid`（`credits` 与它反相，别用它判断）。
 
-    ⚠️ 标签**只放低基数字段**（`upstream` / `status` / `resolution` / `duration` /
-    `model_slot`）：`ark_id` / `task_id` **绝不进标签** —— 一任务一条会把时间序列打废
-    （与 `count_poll` 同一条纪律）。逐任务明细在 `ark.task.fetch` span 与那条 error 日志里。
+    ⚠️ 标签**只放低基数字段**：`api` / `upstream` / `status` / `resolution` / `duration` /
+    `model_slot` / `expected_billed`。`ark_id` / `task_id` **绝不进标签** —— 一任务一条会把
+    时间序列打废（与 `count_poll` 同一条纪律）；逐任务明细在 `ark.task.fetch` span 与日志里。
 
-    判据由调用方（`app._internal_view`）给出：入口是 OpenAI 兼容面 + 已进终态 +
-    `usage.paid=true`。本函数只管"怎么报"，不管"算不算"。
+    判据由调用方（`app._internal_view`）给出：已进终态 + 这次观测要留痕 + `usage.paid=true`。
+    本函数只管"怎么报"，不管"算不算"。
     """
     if not _LOGFIRE_READY:
         return
-    attrs: dict = {"upstream": upstream, "status": status or "unknown"}
+    attrs: dict = {
+        "api": api or "unknown",
+        "upstream": upstream,
+        "status": status or "unknown",
+    }
     if resolution:
         attrs["resolution"] = resolution
     if duration is not None:
         attrs["duration"] = int(duration)
     if model_slot:
         attrs["model_slot"] = model_slot
+    if expected_billed is not None:
+        attrs["expected_billed"] = bool(expected_billed)
     _metric(
         "counter",
-        "avm.videos.charged_tasks",
+        "avm.billing.charged_tasks",
         unit="1",
-        description="OpenAI /v1/videos 线上实际被扣积分的任务数（该端点钉死免费档 ⇒ >0 即异常）",
+        description=(
+            "实际被扣积分的任务数（api=ark/openai）。"
+            "expected_billed=false 却 >0 ⇒ 创建时预测免费、实际扣了费（计费口径与预测不符）"
+        ),
     ).add(1, attributes=attrs)
 
 

@@ -35,6 +35,14 @@ ARK_MODEL = "minimaxH3"
 #: 站点 UI 的六档（截图取证）—— 也是 `RATIO_ORDER`，本文件多处用它做对照。
 SITE_RATIOS = ("16:9", "4:3", "1:1", "3:4", "9:16", "21:9")
 
+#: `/v1/videos` 的「**静默载具**」：在这个面上，凡不被改写的请求都不该产生 note，
+#: 于是要测 `size` 就必须先挑一个"自己不发声"的载体。两条要求：
+#:   ① 分辨率在免费档内（480p / 720p）—— `1080p` 自 2026-09-20 起会被**降级**并留痕；
+#:   ② `seconds` 恰好等于该档的钉死值（480p → 10）—— 否则会多一条"缺省/被覆盖"的说明。
+#: ⚠️ 旧载具是 `minimaxH3_1080p`（当时它"不被钉住所以不发声"），本面只跑免费档之后
+#: 那个前提没了 —— 用它测 size 会顺带把降级那条 note 也带上，断言必然误报。
+SILENT_CARRIER = {"model": "minimaxH3_480p", "prompt": "p", "seconds": 10}
+
 
 def body(**kw) -> dict:
     b = {
@@ -268,19 +276,20 @@ class TestOpenAIVideosSize(unittest.TestCase):
     def test_site_ui_six_pass_through_silently(self):
         for v in SITE_RATIOS:
             with self.subTest(v=v):
-                b, notes = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "size": v})
+                b, notes = ark_body_from_openai({**SILENT_CARRIER, "size": v})
                 self.assertEqual(b["ratio"], v)
                 self.assertEqual(notes, [])
 
     def test_size_wxh_snaps_too(self):
-        # 1080p 载具：把 size 映射与「写死时长」隔离（否则 notes 里会多一条时长说明）
-        b, notes = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "size": "1024x1792"})
+        # 静默载具：把 size 映射与「分辨率降级 / 写死时长」两类说明隔离
+        # （否则 notes 里会混进它们，这条断言就测不到 size 了）
+        b, notes = ark_body_from_openai({**SILENT_CARRIER, "size": "1024x1792"})
         self.assertEqual(b["ratio"], "9:16")
         self.assertTrue(any("1024x1792" in n and "9:16" in n for n in notes))
 
     def test_proportion_string_is_snapped_not_rejected(self):
         """`5:4` 在**这条线**上就近落到 `4:3` 并留痕 —— 与 Ark 线的 400 形成对照。"""
-        b, notes = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "size": "5:4"})
+        b, notes = ark_body_from_openai({**SILENT_CARRIER, "size": "5:4"})
         self.assertEqual(b["ratio"], "4:3")
         self.assertTrue(any("5:4" in n and "4:3" in n and "differs by" in n for n in notes),
                         f"就近吸附必须留痕并给出偏差：{notes}")
@@ -296,7 +305,7 @@ class TestOpenAIVideosFallback(unittest.TestCase):
     def test_unreadable_size_falls_back_to_16_9(self):
         for v in ("abc", "16/9", "0x100", "16", "16:9:1", "16:9:1:2"):
             with self.subTest(v=v):
-                b, notes = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "size": v})
+                b, notes = ark_body_from_openai({**SILENT_CARRIER, "size": v})
                 self.assertEqual(b["ratio"], "16:9", f"{v} 应兜底到 16:9")
                 self.assertTrue(any(v in n and "16:9" in n for n in notes),
                                 f"{v} 的兜底没有留痕：{notes}")
@@ -308,19 +317,19 @@ class TestOpenAIVideosFallback(unittest.TestCase):
 
     def test_fallback_is_never_silent(self):
         """兜底一定要有 note —— 这条是防"有人把留痕那句删了让它闭嘴"。"""
-        _, notes = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "size": "abc"})
+        _, notes = ark_body_from_openai({**SILENT_CARRIER, "size": "abc"})
         self.assertEqual(len(notes), 1)
         self.assertIn("fell back", notes[0])
 
     def test_blank_size_is_still_absent_not_fallback(self):
         """省略 `size` ≠ 认不出：前者是"没指定"，仍交给上游默认，**不**报兜底。"""
-        b, notes = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p"})
+        b, notes = ark_body_from_openai({**SILENT_CARRIER})
         self.assertNotIn("ratio", b)
         self.assertEqual(notes, [])
 
     def test_keep_ratio_still_means_derive_from_image(self):
         """别名不能被兜底吃掉：`keep_ratio` → `adaptive`（跟随输入图），不是 16:9。"""
-        b, notes = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "size": "keep_ratio"})
+        b, notes = ark_body_from_openai({**SILENT_CARRIER, "size": "keep_ratio"})
         self.assertEqual(b["ratio"], "adaptive")
         self.assertTrue(any("keep_ratio" in n and "adaptive" in n for n in notes))
 
@@ -330,11 +339,11 @@ class TestOpenAIVideosFallback(unittest.TestCase):
         ⚠️ 大小写**不**认（`Adaptive` 会走到兜底）：别名表是小写精确匹配，而兜底会
         把它变成 16:9。这条断言把该行为显式钉住，免得日后有人当成 bug 顺手改掉。
         """
-        b, notes = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "size": "adaptive"})
+        b, notes = ark_body_from_openai({**SILENT_CARRIER, "size": "adaptive"})
         self.assertEqual(b["ratio"], "adaptive")
         self.assertEqual(notes, [])
 
-        b2, _ = ark_body_from_openai({"model": "minimaxH3_1080p", "prompt": "p", "size": "Adaptive"})
+        b2, _ = ark_body_from_openai({**SILENT_CARRIER, "size": "Adaptive"})
         self.assertEqual(b2["ratio"], "16:9", "非精确匹配的写法落兜底，不静默当 adaptive")
 
 
@@ -359,7 +368,7 @@ class TestTwoLinesDifferOnlyByFallback(unittest.TestCase):
                 else:
                     self.assertEqual(T.normalize_ratio(raw)[0], ark_want)
                 b, _ = ark_body_from_openai(
-                    {"model": "minimaxH3_1080p", "prompt": "p", "size": raw}
+                    {**SILENT_CARRIER, "size": raw}
                 )
                 self.assertEqual(b["ratio"], videos_want)
 

@@ -289,7 +289,8 @@ Seedance」的两份 OpenAPI（[创建](https://oneapis.apifox.cn/369966278e0) /
 | `POST /v1/videos` | `{"id", "object": "video", "status": "queued", "created_at"}` |
 | `GET /v1/videos/{id}` | `{"id", "object": "video", "status", "progress", "video_url", "created_at"}` |
 
-请求字段映射：`model` 原样保留（`_480p/_720p/_1080p` 后缀决定分辨率档位）；
+请求字段映射：🔴 `model` **不参与选路**（本面只跑免费线，见下面「只跑免费线」一节），但它带的
+`_480p/_720p/_1080p` 后缀**仍然**决定分辨率档位；
 `prompt` → 提示词；`size` → 宽高比 —— 认**站点 UI 的六档**（`21:9` / `16:9` / `4:3` /
 `1:1` / `3:4` / `9:16`，截图取证）外加两个别名 `keep_ratio` / `adaptive`（上游语义相同 =
 跟随输入图，映射会留痕）。与方舟线**共用同一份归一化，只有兜底策略不同**：
@@ -330,6 +331,22 @@ status 词表：`queued` / `in_progress` / `completed` / `failed`；`progress` �
 且有产出时给值。鉴权、计费口径、dry-run、凭据绑定与方舟线**完全一致**
 （`X-Avm-Dry-Run: 1` 照常可用）。
 
+🔴 **本面只跑免费线**（2026-09-20 用户口径：「`/v1/videos` 不走付费模型，全部用免费的兜底」）：
+调用方写什么模型名都**不参与选路** —— 上游槽位恒为 `openai_videos.FREE_ONLY_SLOT`
+（站点上唯一实测存在 procedure、也是唯一有实测免费窗口的那一条），由
+`translate_create(force_slot=…)` 在 app 层按面传入。三条连带后果，都是**有意的对外契约变更**：
+
+| 后果 | 旧行为（已作废） |
+|---|---|
+| 未命中的模型名**不再 400**，一律兜底到免费槽位 | 不认识的模型名一律 400 |
+| `X-Channel-Options.model_map` **在本面上不生效**（面级策略优先；覆盖写进 `warnings`，不静默） | 映射表决定上游槽位 |
+| 分辨率也被收进免费档：`_1080p` **降级为 720p** | `1080p` 按调用方原值透传、仍可能计费 |
+
+证据不丢：调用方原值留在 `requested.model`，改写结果是 `effective.model`
+（`model_source=free_only`），两条都在 `warnings` 里有说明。⚠️ 方舟线 `/tasks`
+**不受本政策影响**（那条线的调用方可以自己点档、也自己承担费用）。
+门禁：`tests/test_videos_free_only.py`（含 8 条变异自证）。
+
 🔴 **时长是写死的，不是"缺省值"**（2026-09-17 用户口径）：本端点按分辨率**无条件覆盖**
 调用方传的 `seconds` —— 表 = `openai_videos.PINNED_DURATIONS`：
 
@@ -337,7 +354,7 @@ status 词表：`queued` / `in_progress` / `completed` / `failed`；`progress` �
 |---|---|---|
 | `480p` | **10 秒** | 站点对 480p 只收**离散档位** `5 / 10 / 15 / 20`（`E2E-AVM-016` 真实提交 `480p/8s` ⇒ `480p supports 5s, 10s, 15s, or 20s duration.`）；10 秒是其中**已实测 `paid=false`** 的最长档 |
 | `720p` | **8 秒** | 合法时长连续，但免费线**到 8 秒为止**（8 秒实测 `paid=false`；9 / 10 秒实测 `paid=true`）⇒ 8 秒是免费区内最长的一档 |
-| `1080p` | 调用方原值 | **不在表内**：免费线未实测、也不是离散档位 ⇒ 凭猜写死等于引入"请求 15 秒实际拿 5 秒"这种静默改档（该请求照旧可能计费） |
+| `1080p` | **降级为 720p → 8 秒** | 站点对 1080p **没有**实测免费线（文案口径是 4 积分/秒）⇒ 2026-09-20 起先**降级**再照上表钉死（用户口径「**8s 720p**」）。降级与时长改写**各留一条** `warnings`，两句都不许少 |
 
 `model` 名**不带**分辨率后缀时同样是 `720p`（下游按 `DEFAULT_RESOLUTION` 兜底）⇒ 一样钉到
 8 秒。否则同一个 720p 请求会因"model 写没写后缀"分成**免费与计费两种结果**，而调用方从
@@ -346,24 +363,36 @@ status 词表：`queued` / `in_progress` / `completed` / `failed`；`progress` �
 告警会被读成噪声）。门禁：`tests/test_openai_pinned_duration.py` —— 时长改写与
 **计费结论**两条一起断言（只钉时长会漏掉"钉了却仍在计费区"）。
 
-🔴 **真被扣费会报警，不是只躺在 trace 里等人翻**（2026-09-20）：本端点按分辨率把时长钉在
-免费档上，对外口径就是"这条线永远不花钱" ⇒ 一旦某条任务真的进了计费区，本服务在**它进
-终态的那一次**同时发三个信号（判据只写在 `app._internal_view` 一处，不散落）：
+🔴 **真被扣了积分就上报 Logfire —— 两条线都报**（2026-09-20，用户口径：先 `/v1/videos`，随后
+"方舟线 `/tasks` 的扣费也报"）。判据只写在 `app._internal_view` 一处，不散落：
+
+三条判据**缺一不可**（逐条都有变异自证，`tests/test_charged_task_report.py`）：
+① 已进终态 —— `paid` 在终态定格，而终态必然是**一次**跃迁 ⇒ 每条任务最多报一次；
+② 这一次观测属于要留痕的那类（首见 / 跃迁 / 失败）—— 同状态重复轮询不重复报；
+③ 站点记录 `usage.paid=true`（判据是 `paid`，**不是** `credits` —— 两者反相）。
+
+⚠️ **入口不参与判定，只作标签**：两条线的扣费"正常程度"完全不同，所以统一判定、**分开读** ——
+`expected_billed` = 创建时落库的 `effective.billed`（"当时是不是就预告了会计费"）：
+
+| `api` | `expected_billed` | 含义 | 日志等级 |
+|---|---|---|---|
+| `openai`（`/v1/videos`） | `false` | 该端点的**钉死档**（480p / 720p）真扣费 = 对外"恒免费"承诺的破口 | **error** |
+| `openai`（`/v1/videos`） | `true` | **本面上不该出现**：分辨率也被收进免费档（`_1080p` 降级、时长钉死）⇒ 预测恒为免费。真出现说明降级或钉死失效了 | info |
+| `ark`（`/tasks`） | `false` | **创建时说免费、实际却扣了** ⇒ 计费口径与站点实际不符（站点收窄免费线也只在这里露头） | **error** |
+| `ark`（`/tasks`） | `true` | 调用方自己点的档（`tier=base` / 超免费窗口），`billing_view` 当时就告警过 | info |
+| `unknown` | 按实际 | `response_shape` 落盘之前建的极老记录；缺预测值按 `false` 走 error 档（"连预测都没有"本身该有人看一眼） | 同上 |
+
+三个出口（各服务一种读法）：
 
 | 出口 | 形态 | 用来干什么 |
 |---|---|---|
-| 指标 | `avm.videos.charged_tasks`（计数器；标签 `upstream` / `status` / `resolution` / `duration` / `model_slot`） | 挂告警（**>0 即异常**）、看"从什么时候开始扣的、扣了几条" |
-| 日志 | `error` 级一行，带 `ark_id` / 上游 taskId / 调用方请求的模型 / 上游槽位 / 档位 | 逐任务明细；Logfire 上可直接按等级挂告警 |
-| span | `ark.task.fetch` 上的 `videos_line_charged=true` | 在 trace 里把它们过滤出来复盘 |
+| 指标 | `avm.billing.charged_tasks`（计数器；标签 `api` / `expected_billed` / `upstream` / `status` / `resolution` / `duration` / `model_slot`） | 挂告警、看"哪条线、从什么时候开始扣的、扣了几条" |
+| 日志 | 按上表分级的一行，带 `ark_id` / 上游 taskId / 调用方请求的模型 / 上游槽位 / 档位 | 逐任务明细；Logfire 上可按等级挂告警 |
+| span | `ark.task.fetch` 上的 `billing_charged=true` + `billing_expected=<bool>` | 在 trace 里把它们过滤出来复盘 |
 
-四条判据**缺一不可**，且逐条都有变异自证（`tests/test_videos_charged_report.py`）：
-① 入口是 OpenAI 兼容面 —— 判据是任务记录里的 `response_shape`（创建时落盘；轮询阶段手里
-只有记录、没有请求，**事后无从推断入口**）；② 已进终态（`paid` 在终态定格，而终态必然是
-**一次**跃迁 ⇒ 每条任务最多报一次）；③ 这一次观测属于要留痕的那类（首见 / 跃迁 / 失败）——
-同状态重复轮询不重复报；④ 站点记录 `usage.paid=true`。
-⚠️ **方舟线刻意不报**：那边调用方可以自己点 `tier=base` 或传超出免费窗口的时长，那是它
-明示的选择（`billing_view` 已经为它发过告警）；把那些也报成"端点契约破了"，只会让这条
-告警被读成噪声，真正该看的那条反而看不见。
+**建议的告警表达式**：`avm.billing.charged_tasks{api="openai"} > 0`（该端点出任何一条都值得看）
+与 `avm.billing.charged_tasks{expected_billed="false"} > 0`（两条线共同的"口径不符"，含前者）。
+⚠️ `api` 只影响**标签与日志等级**，不影响"报不报" —— 方舟线的钱不会被静默掉。
 
 ⚠️ 刻意没有 `DELETE /v1/videos/{id}`：站点没有取消端点，理由同上。
 
@@ -424,7 +453,7 @@ AVM_TASK_STORE=memory      # 显式开发/测试开关：重启即丢
 
 | Ark 字段 | 处理 |
 |---|---|
-| `model` | **参与路由**（决定上游 procedure）。判定顺序：渠道映射表精确命中 → 名字本身是上游槽位（**默认透传**）→ 映射表的 **`*` 兜底** → **400**（`model` 钉住键已撤除，遗留即报错）。键与语义见 `docs/channel-options-model.md`；值**不进上游请求体**（站点把模型编在 procedure 路径上）—— 唯一另有副作用的是 `/v1/videos` 面的 `_480p`/`_720p`/`_1080p` 后缀（解析成 `resolution`，**先剥掉再比对槽位**）。**未命中不再静默落到 `ai.minimaxH3`**（迁移见下方「模型映射」） |
+| `model` | **参与路由**（决定上游 procedure）。判定顺序：**面级策略 `force_slot`** → 渠道映射表精确命中 → 名字本身是上游槽位（**默认透传**）→ 映射表的 **`*` 兜底** → **400**（`model` 钉住键已撤除，遗留即报错）。🔴 **`/v1/videos` 面走第一条**：它只跑免费线，模型名一律兜底、**不认识也不 400**（见该面一节）；方舟线没有面级策略，仍按 ②~⑤ 走。键与语义见 `docs/channel-options-model.md`；值**不进上游请求体**（站点把模型编在 procedure 路径上）—— 唯一另有副作用的是 `/v1/videos` 面的 `_480p`/`_720p`/`_1080p` 后缀（解析成 `resolution`，**先剥掉再比对槽位**）。**未命中不再静默落到 `ai.minimaxH3`**（迁移见下方「模型映射」） |
 | `content[].type=text` | 多条用 `\n` 连接 → `content` |
 | `content[].type=image_url` | `role=first_frame`/`last_frame` 走帧通道；`reference_image` 或无 role 进 `referenceImageUrls` |
 | `content[].type=video_url` | → `referenceVideoUrl`（单槽位） |
@@ -450,10 +479,18 @@ X-Channel-Options: {"model_map": {"doubao-seedance-2-0-260128": "seedance20",   
                                   "*": "minimaxH3"}}                            // 唯一兜底（可选）
 ```
 
-判定顺序：① 映射**精确**命中 → ② 映射的 **`*` 兜底**（**覆盖一切**未被精确列出的名字，
-含调用方写出的真槽位名）→ ③ 名字本身是上游槽位（**默认透传**）→ ④ **400**（报文给出已知槽位与
-表里已声明的键）。每一步都进 `warnings`，并留下证据字段 `effective.model` / `.model_source` /
-`.model_verified`、`web_params.procedure`、span `ark.create.submit` 的 `upstream_slot`。
+判定顺序：① **面级策略 `force_slot`**（只有 `/v1/videos` 用，见下）→ ② 映射**精确**命中 →
+③ 映射的 **`*` 兜底**（**覆盖一切**未被精确列出的名字，含调用方写出的真槽位名）→
+④ 名字本身是上游槽位（**默认透传**）→ ⑤ **400**（报文给出已知槽位与表里已声明的键）。
+每一步都进 `warnings`，并留下证据字段 `effective.model` / `.model_source` / `.model_verified`、
+`web_params.procedure`、span `ark.create.submit` 的 `upstream_slot`。
+
+🔴 **`/v1/videos` 面上这个表不生效**（2026-09-20）：那条线只跑免费线，由面自己传
+`force_slot` 覆盖掉 ②~⑤ —— 连"不认识的模型名"也**不再 400**（旧行为已作废，见该面一节）。
+覆盖**必然留痕**：报文说明"本来会落到哪儿（映射/透传/本会拒绝）→ 实际落到免费槽位"，
+证据标 `model_source=free_only`。⇒ 渠道在这一面上配的映射**不会**生效，且每次请求都会写明
+这一点（运维因此不会以为"配了没生效"是静默的）。
+⚠️ **方舟线 `/tasks` 完全不受影响**：上面 ②~⑤ 原样。
 
 🔴 **`model`（钉住）键已撤除**（2026-09-17，与 video-adapter 一致）：遗留它 ⇒ **渠道配置错误**，
 不静默忽略。⇒ 要"这个渠道只跑某一档"，**用兜底**：`{"model_map": {"*": "minimaxH3"}}`
@@ -464,9 +501,10 @@ X-Channel-Options: {"model_map": {"doubao-seedance-2-0-260128": "seedance20",   
 要覆盖一族名字就逐条写 —— 那些名字是有限的、已知的。**多模式机制拆掉之后，"多命中怎么排"
 这一整类问题不可能发生**，两个项目在这点上曾各写一套的分歧也随之消失（`docs/channel-options-model.md` §3/§9）。
 
-🔴 **这是对外契约变更**：改动前"任意模型名都通过（一律走 `ai.minimaxH3`）"，现在
+🔴 **这是对外契约变更（方舟线）**：改动前"任意模型名都通过（一律走 `ai.minimaxH3`）"，现在
 **未命中即 400**（且发生在任何上游请求之前）。要恢复旧行为，给渠道配
 `{"model_map": {"*": "minimaxH3"}}`（**不要**再用 `{"model": "minimaxH3"}` —— 该键已撤除）。
+⚠️ `/v1/videos` 面自 2026-09-20 起**不走这条**（它由面级策略兜底，未命中也不 400）。
 
 **仍未做完的前置（本实现的一处已知假设）：**
 
@@ -725,13 +763,15 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
   区分调用方轮询 / 盯梢）+ `avm.task.wait_seconds`（跃迁进终态时记一次）。
   🔴 指标标签**只放低基数枚举**：绝不放 `ark_id` / `task_id` —— 那会把时间序列打成一任务
   一条，比 span 还贵。
-- ★ **计费告警指标** `avm.videos.charged_tasks`（2026-09-20）：OpenAI 兼容面（`/v1/videos`）
-  上**实际被扣了积分**的任务数。那条线按分辨率把时长钉在免费档、对外承诺恒不花钱 ⇒
-  这个计数器 **>0 就是契约破了**，应当在 Logfire 上给它挂告警，而不是等人去翻 trace。
-  同一时刻还会发一条 `error` 级日志（带 `ark_id` / 上游 taskId / 档位 —— 逐任务明细
-  **只**在日志与 span 上，绝不进标签）与 span 属性 `videos_line_charged`。
-  判据（含"为什么方舟线刻意不报"）见上面「OpenAI `/v1/videos` 兼容面」一节；
-  门禁 `tests/test_videos_charged_report.py`（8 条变异自证全红）。
+- ★ **计费告警指标** `avm.billing.charged_tasks`（2026-09-20）：**实际被扣了积分**的任务数
+  （`usage.paid=true`）—— **两条线都报**，靠 `api`（`ark` / `openai` / `unknown`）与
+  `expected_billed`（创建时的计费预测）分开读。`expected_billed=false` 却 >0 就是
+  "创建时说免费、实际却扣了"；`/v1/videos` 的钉死档扣费也落这一格（那是对外承诺的破口）。
+  同一时刻还会发一条日志（**等级按"算不算意外"分档**：口径不符 = `error`，调用方自己点的档
+  = `info`；带 `ark_id` / 上游 taskId / 档位 —— 逐任务明细**只**在日志与 span 上，绝不进标签）
+  与 span 属性 `billing_charged` / `billing_expected`。
+  判据与建议的告警表达式见上面「OpenAI `/v1/videos` 兼容面」一节；
+  门禁 `tests/test_charged_task_report.py`（10 条变异自证全红）。
 - 具名 span（属性即契约，用内存 exporter 断言：`tests/test_trace_contract.py`）：
   - `ark.create.submit` —— `ark_id` / `upstream` / `ark_model` /
     `resolution` / `duration` / `billed` / `warning_count` / `warnings` /
@@ -751,8 +791,9 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
     `upstream_response`（归一化后的**完整内部视图** —— 上游实际执行的模型
     `upstream_model`、站点原始记录 `upstream_record`、实际产出档位 `resolution` 都在里面，
     从 `4211e5b` 起一直如此）/ **`warnings`** / **`unsupported`** / `upstream_calls` /
-    `videos_line_charged`（**只在**"`/v1/videos` 线上这条任务真被扣了积分"时才挂 ——
-    "承诺恒免费的那个端点破了契约"的现场标记，见上面「OpenAI `/v1/videos` 兼容面」一节）
+    `billing_charged=true` + `billing_expected=<bool>`（**只在这条任务真被扣了积分**时才挂 ——
+    两条线的扣费现场标记；`expected=false` 就是"说好免费却扣了"，见上面
+    「OpenAI `/v1/videos` 兼容面」一节）
 
     2026-09-15 响应体两轮收窄时**只单独补了 `warnings` / `unsupported`** —— 它们来自本地
     任务记录（`entry`），**不在** `upstream_response` 里，不挂就真的丢了。
@@ -892,7 +933,8 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 ├── test_docs_billing_sync.py 文档里的免费秒数必须跟着 FREE_MAX_DURATION 走
 ├── test_seedance25_omni.py  Seedance 2.5 全能参考（截断、专属字段、前置拒绝；零外发）
 ├── test_openai_videos.py    OpenAI /v1/videos 兼容面（Chatfire 契约六字段；零外发）
-├── test_videos_charged_report.py /v1/videos 真被扣费必须上报（指标/日志/span 三出口；含 8 条变异自证）
+├── test_charged_task_report.py 真被扣费必须上报（两条线；指标/日志/span 三出口；含 10 条变异自证）
+├── test_videos_free_only.py `/v1/videos` 只跑免费线（模型兜底 + 1080p 降级；含 8 条变异自证）
 ├── test_media_proxy.py      成片对外出口（响应头白名单、零上游痕迹、归属；含 5 条变异自证）
 ├── test_trace_contract.py   trace 属性契约（内存 exporter 捞 span 断言 + 凭证红线）
 ├── test_passthrough_cookie.py 透传（多租户隔离、缓存淘汰、闸门互斥）

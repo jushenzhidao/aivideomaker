@@ -72,11 +72,21 @@ class TestPinnedDuration(unittest.TestCase):
         self.assertEqual(eff["resolution"], DEFAULT_RESOLUTION)
         self.assertEqual(body["duration"], PINNED_DURATIONS[DEFAULT_RESOLUTION])
 
-    def test_1080p_is_left_to_the_caller(self):
-        """不在表里的分辨率按原值透传：凭猜写死等于引入"请求 15 秒实际拿 5 秒"这种静默改档。"""
-        body, _, eff = _plan({"model": "minimaxH3_1080p", "prompt": "p", "seconds": 15})
-        self.assertEqual(body["duration"], 15)
-        self.assertTrue(eff["billed"], "1080p 未被钉住，却被报成免费 —— 计费口径反了")
+    def test_1080p_is_downgraded_into_the_free_window(self):
+        """★ 2026-09-20：`1080p` **不再**"按原值透传给调用方"——它先被降级成 720p，再钉到 8s。
+
+        旧口径（"表外分辨率原值透传、该请求仍可能计费"）与"本面只跑免费线"直接矛盾：
+        站点对 1080p **没有**实测免费线（文案口径 4 积分/秒）⇒ 只要放行 15s 的 1080p，
+        这个面就会真花钱。降级方向是"往免费档收"，且两步都留痕（降级一条 + 覆盖一条）。
+        """
+        body, notes, eff = _plan({"model": "minimaxH3_1080p", "prompt": "p", "seconds": 15})
+        self.assertEqual(body["resolution"], "720p", "1080p 必须降到免费档内的分辨率")
+        self.assertEqual(body["duration"], 8, "降级后按 720p 钉到免费区最长档")
+        self.assertFalse(eff["billed"], "降级 + 钉死之后仍落在计费区 —— 那这条政策就没生效")
+        self.assertTrue(any("downgraded" in n for n in notes), f"降级没留痕：{notes}")
+        self.assertTrue(any("overridden" in n for n in notes), f"时长改写没留痕：{notes}")
+        # 两条 note 缺一不可：只留"降级"会让"15s 被改成 8s"变成静默改档（反向同理）
+        self.assertEqual(len(notes), 2, f"降级与时长改写各该有一条说明：{notes}")
 
     def test_pinned_combinations_are_actually_free(self):
         """钉住的**目的**是不计费：只测时长会漏掉"钉了但仍在计费区"。"""

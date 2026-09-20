@@ -85,7 +85,7 @@ from .observability import (
     logfire_exporting,
     logfire_ready,
     record_account,
-    record_videos_charge,
+    record_charged_task,
     record_wait,
     set_upstream_calls,
     setup_observability,
@@ -95,7 +95,12 @@ from .observability import (
 from .media_proxy import MediaProxy, MediaSourceError
 from .channel_options import CHANNEL_OPTIONS_HEADER, parse_channel_options
 from .settings import Settings
-from .openai_videos import OPENAI_VIDEOS_PATH, ark_body_from_openai, openai_task_view
+from .openai_videos import (
+    FREE_ONLY_SLOT,
+    OPENAI_VIDEOS_PATH,
+    ark_body_from_openai,
+    openai_task_view,
+)
 from .sniff import sniff_file
 from .store import build_task_store
 from .translate import ark_task_view, billing_note, billing_view, translate_create
@@ -396,7 +401,7 @@ def _sweep(cache: dict, limit: int) -> None:
 _TERMINAL_ARK_STATUS = frozenset({"succeeded", "failed", "cancelled"})
 
 #: 入口形态标识：OpenAI 兼容面（`/v1/videos`）与方舟线共用 `_submit_ark` 这**一条**管线，
-#: 需要按入口分辨的地方（目前只有"该端点承诺恒免费 ⇒ 真扣费必须报警"）一律认这个常量，
+#: 需要按入口分辨的地方（响应契约形状、以及计费告警上的 `api` 标签）一律认这个常量，
 #: 不再各写一份字面量。它同时会被写进任务记录（`entry.response_shape`）：轮询阶段拿到的是
 #: 记录、不是请求，入口信息**只能**在创建时落下，事后无从推断。
 _OPENAI_SHAPE = "openai"
@@ -1158,7 +1163,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 读头只在这一层（translate 保持纯函数）；坏掉的头**拒绝**而不是当成没配 ——
         # 当成没配会静默按透传跑掉，而运维以为自己的映射生效了。
         channel_options = parse_channel_options(request.headers.get(CHANNEL_OPTIONS_HEADER))
-        plan = translate_create(body, channel_options=channel_options)
+        # 🔴 **面级策略**：`/v1/videos` 只跑免费线（2026-09-20 用户口径：「不走付费模型，
+        #    全部用免费的兜底」）—— 该面调用方写什么模型名都不参与选路，一律落
+        #    `FREE_ONLY_SLOT`；连"不认识的模型名"也不再 400（旧行为，已作废）。
+        #    ⚠️ 方舟线 `/tasks` **不传**它：那条线的调用方可以自己点档，也自己承担费用。
+        plan = translate_create(
+            body,
+            channel_options=channel_options,
+            force_slot=FREE_ONLY_SLOT if response_shape == _OPENAI_SHAPE else None,
+        )
         eff, warns = billing_view(plan)
         if extra_warnings:
             warns = [*warns, *extra_warnings]
@@ -1535,21 +1548,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         # 计费**事实**：站点任务记录里的 `paid`（`credits` 与它反相，别用它判断）。
         paid = bool((view.get("usage") or {}).get("paid"))
-        # 🔴 `/v1/videos` 线上"真的被扣了积分" —— 该端点按分辨率把时长**无条件**钉在站点
-        #    已实测免费的档位上（`openai_videos.PINNED_DURATIONS`），对外契约就是"这条线
-        #    永远不花钱" ⇒ 这里本该**恒为 False**。四条同时成立才算，判据只写在这一点：
-        #      ① 入口是 OpenAI 兼容面（创建时落进记录的 `response_shape`；
-        #         轮询阶段只有记录，事后无从推断入口）；
-        #      ② 已进终态 —— `paid` 在终态定格，而终态必然是**一次**跃迁 ⇒ 每条任务最多
+        # 🔴 真被扣了积分就上报 —— **两条线都报**（2026-09-20 用户口径：方舟线也要看得见）。
+        #    三条同时成立才算，判据只写在这一点：
+        #      ① 已进终态 —— `paid` 在终态定格，而终态必然是**一次**跃迁 ⇒ 每条任务最多
         #         报一次（与"终态一定留痕"同一条依据）；
-        #      ③ 这次观测属于要留痕的那类（首见 / 跃迁 / 失败）—— 同状态重复轮询不重复报；
-        #      ④ `paid=true` 本身。
-        videos_charged = (
-            paid
-            and status in _TERMINAL_ARK_STATUS
-            and str(entry.get("response_shape") or "") == _OPENAI_SHAPE
-            and decision is not None
-        )
+        #      ② 这次观测属于要留痕的那类（首见 / 跃迁 / 失败）—— 同状态重复轮询不重复报；
+        #      ③ `paid=true` 本身。
+        #    ⚠️ **入口不参与判定**，只作为指标标签 `api`（`ark` / `openai` / `unknown`）：
+        #       两条线的扣费"正常程度"不同（方舟线的调用方可以自己点 base 档、也可以传超窗口
+        #       时长，那是明示的选择），分开读靠 `api` + `expected_billed`，混在一起会让
+        #       真异常淹没在预期扣费里 —— 见 `record_charged_task` 与下面的日志分级。
+        charged = paid and status in _TERMINAL_ARK_STATUS and decision is not None
+        # 上报要用的三个派生值**先算出来** —— span 属性必须挂在 span 还开着的时候，所以
+        # 不能等到 `with span(...)` 之后再算（那样就是 NameError）。
+        eff = entry.get("effective") or {}
+        # 入口只作为标签（`ark` = 方舟线 `/tasks`，`openai` = `/v1/videos`）。老记录没有这个键
+        # ⇒ `unknown`（不猜）。
+        api = str(entry.get("response_shape") or "") or "unknown"
+        # ⚠️ 缺预测值（`effective.billed` 落库之前的极老记录）按 false 处理 ⇒ 进 error 档：
+        #    "连预测都没有"本身就该有人看一眼，当"预期内"静默掉是错的一方。
+        expected_billed = bool(eff.get("billed"))
         if decision is not None:
             with span(
                 "ark.task.fetch",
@@ -1592,25 +1610,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "status_change",
                         {"from": decision["from"], "to": decision["to"]},
                     )
-                if videos_charged:
+                if charged:
                     # span 属性只能在 span **还开着**的时候挂 ⇒ 它留在这一块里；日志与指标
-                    # 放在块后（判据是同一个 `videos_charged`，不另写一份）。
-                    sp.set_attribute("videos_line_charged", True)
-        if videos_charged:
-            # 端点契约破了 → 另外两条出口各服务一种读法：
-            #   · error 日志 —— 逐任务明细（`ark_id` / 上游 taskId **只**在这里，绝不进
-            #     指标标签），且 Logfire 上可直接按 error 级挂告警；
-            #   · 计数指标 —— 时间序列，回答"从什么时候开始扣的、扣了几条"。
+                    # 放在块后（判据是同一个 `charged`，不另写一份）。
+                    # `billing_expected=false` 却挂着 `billing_charged=true`，
+                    # 就是"说好免费、实际扣了"的现场标记。
+                    sp.set_attribute("billing_charged", True)
+                    sp.set_attribute("billing_expected", expected_billed)
+        if charged:
+            # 真被扣了积分 → 三条出口各服务一种读法：
+            #   · 日志 —— 逐任务明细（`ark_id` / 上游 taskId **只**在这里，绝不进指标标签）；
+            #   · 指标 —— 时间序列，回答"哪条线、从什么时候开始、扣了几条"。
+            # 🔴 日志**等级按"这算不算意外"分两档**，一档到底会把真异常埋进预期扣费里：
+            #   · 创建时就预告过会计费（`tier=base` / 超免费窗口）⇒ `info`：调用方明示的
+            #     选择（`billing_view` 当场告警过），记在账上就行，不是故障；
+            #   · 预测免费、实际却扣了 ⇒ **`error`**：计费口径与站点实际不符 ——
+            #     `/v1/videos` 的钉死档真扣费也落这一档，那正是该端点对外承诺的破口。
             # 🔴 判据里的 `decision is not None` 就是"每条任务最多报一次"的那道闸门：
             #    同状态重复轮询不重复上报（与 `ark.task.fetch` 同一条产生层纪律）。
             #    ⚠️ 少了它，一个被按秒级轮询的任务会报上百次 —— 告警直接失效。
             # ⚠️ 这里**不改**对外响应：`/v1/videos` 的响应体是六字段契约，多一个键就是
             #    坏一个客户端（计费差异走文档与告警，不走响应体）。
-            eff = entry.get("effective") or {}
-            logger.error(
-                "/v1/videos 任务实际扣了积分（该端点按分辨率钉死免费档，本应恒不花钱）："
-                "ark_id={} upstream_task={} model={} slot={} res={} dur={}s status={}",
+            # 两条分支共用同一组排错字段（复制八遍一定会漂）
+            fields = (
                 ark_id,
+                api,
                 entry["taskId"],
                 entry["model"],
                 eff.get("model") or "-",
@@ -1618,12 +1642,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 eff.get("duration"),
                 status,
             )
-            record_videos_charge(
+            if expected_billed:
+                logger.info(
+                    "任务实际扣了积分（创建时已预告会计费 tier={}）："
+                    "ark_id={} api={} upstream_task={} model={} slot={} res={} dur={}s status={}",
+                    eff.get("tier") or "-",
+                    *fields,
+                )
+            else:
+                logger.error(
+                    "任务实际扣了积分，而创建时预测是免费的 —— 计费口径与站点实际不符："
+                    "ark_id={} api={} upstream_task={} model={} slot={} res={} dur={}s status={}",
+                    *fields,
+                )
+            record_charged_task(
+                api=api,
                 upstream=upstream.kind,
                 status=status,
                 resolution=str(eff.get("resolution") or ""),
                 duration=eff.get("duration"),
                 model_slot=str(eff.get("model") or ""),
+                expected_billed=expected_billed,
             )
         # 等待时长只在**真的看到跃迁进终态**时记一次（同状态轮询记一遍 = 重复计数）
         if (

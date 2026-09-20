@@ -12,7 +12,8 @@
 
 字段对应关系（OpenAI 形 → Ark 形）：
 
-    model     → 原样保留为请求模型；`_480p/_720p/_1080p` 后缀额外决定分辨率档位
+    model     → 原样保留为 `requested.model`，但**不决定上游槽位**（见下面 🔴）；
+                `_480p/_720p/_1080p` 后缀**仍然**决定分辨率档位（解析后先剥掉再比对槽位）
     prompt    → content[] 里的 text 项
     seconds   → duration（整数秒）—— ⚠️ **本端点按分辨率写死**（`PINNED_DURATIONS`）：
                 480p 一律 10s、720p 一律 8s；调用方显式传的值会被**覆盖**，且在 warnings 留痕
@@ -23,6 +24,21 @@
     last_frame_image      → content[] 的 last_frame 帧通道
 
 首帧 / 首尾帧 / 参考图三种场景互斥（上游硬约束），混用由 translate_create 前置 400。
+
+🔴 **本端点只跑免费线**（2026-09-20 用户口径：「`/v1/videos` 不走付费模型，全部用免费的兜底」）：
+调用方写什么模型名都**不参与选路** —— 上游槽位恒为 `FREE_ONLY_SLOT`（站点上唯一实测存在
+procedure、也是唯一有实测免费窗口的那一条），由 `translate_create(force_slot=…)` 落定，
+证据标 `effective.model_source = free_only`，调用方的原值留在 `requested.model` 与 `warnings` 里。
+连带两处后果，都是**有意的对外契约变更**：
+
+1. `X-Channel-Options.model_map` **在本面上不生效**（面级策略优先于渠道映射；每次覆盖都留痕，
+   不静默）；
+2. **未命中的名字不再 400**（旧行为：不认识的模型名一律拒 —— 而本面的调用方是 OpenAI SDK
+   用户，他们能拿到的信息只有"请求失败了"，给一档免费成片远好过给失败）。
+
+分辨率同受这条政策约束：`_1080p` 一律**降级为 720p**（站点对 1080p **没有**实测免费线，
+按秒计价），随后照 `PINNED_DURATIONS` 钉到 8s —— 即"本面上的任何请求都落在免费档"。
+⚠️ 方舟线 `/tasks` **不受本政策影响**（那条线的调用方可以自己点档、也自己承担费用）。
 """
 
 from __future__ import annotations
@@ -43,6 +59,19 @@ OPENAI_VIDEOS_PATH = "/v1/videos"
 # model 名自带分辨率档位（Chatfire 枚举：doubao-seedance-1-0-pro_1080p 一类）。
 _RESOLUTION_SUFFIX_RE = re.compile(r"_(480p|720p|1080p)\s*$", re.I)
 
+#: **本端点唯一允许落到的上游槽位**（免费线）。2026-09-20 用户口径：「`/v1/videos` 不走付费
+#: 模型，全部用免费的兜底」。取值依据是站点事实、不是偏好：全站**唯一实测存在**的生成
+#: procedure 是 `ai.minimaxH3`（见 `channel_options.VERIFIED_SLOTS`），它也是唯一有实测
+#: 免费窗口的模型（480p/10s 与 720p/8s 实测 `paid=false`）⇒ 其余槽位要么 procedure 未实测、
+#: 要么没有实测免费线。
+#: 🔴 改它 = 改本端点的计费口径 ⇒ 必须同步 README 与 `tests/test_videos_free_only.py`。
+FREE_ONLY_SLOT = "minimaxH3"
+
+#: 分辨率**降级表**：站点对 1080p **没有**实测免费线（文案口径是 4 积分/秒）⇒ 本端点收到的
+#: `_1080p` 一律降级到这里。2026-09-20 用户口径：「**8s 720p**」—— 先降级成 720p，时长再由
+#: `PINNED_DURATIONS` 照常钉到 8s，两步合起来才等于"落在免费档"（只降级不钉时长仍会越线）。
+_FREE_RESOLUTION_DOWNGRADE = {"1080p": "720p"}
+
 # 分辨率 → **写死时长**（`/v1/videos` 专属）。语义是**无条件覆盖**调用方传的 `seconds`，
 # 不是"缺省值"、也不是"仅越界时吸附" —— 调用方写 15s / 20s / 5s 一样被改。
 #
@@ -56,9 +85,10 @@ _RESOLUTION_SUFFIX_RE = re.compile(r"_(480p|720p|1080p)\s*$", re.I)
 # 🔴 改这张表 = 改对外计费口径 ⇒ 必须同步 README 与计费门禁（`test_free_window.py` 一族）。
 PINNED_DURATIONS: dict[str, int] = {"480p": 10, "720p": 8}
 
-# 未命中 `PINNED_DURATIONS` 的分辨率（当前只有 `1080p`）**按调用方原值透传**：
-# 1080p 既没实测出免费线、也不是离散档位，凭猜写死等于引入"请求 15s 实际拿 5s"
-# 这种静默改档 —— 本层最该避免的正是它。
+# ⚠️ 2026-09-20 起，本端点**不再有"未命中这张表"的分辨率**：`1080p` 在查表之前就被
+# `_FREE_RESOLUTION_DOWNGRADE` 降级成 `720p`，没写后缀的按 `DEFAULT_RESOLUTION`（= 720p）
+# 兜底 ⇒ 走到查表那一步的键只可能是表内两档。因此旧口径"1080p 按调用方原值透传、该请求
+# 照旧可能计费"**已作废** —— 它与本端点"只跑免费线"的对外承诺直接矛盾。
 
 # size 枚举 → Ark ratio。keep_ratio / adaptive 都表示"由输入图决定"，上游不区分二者。
 # ⚠️ 比例清单与 `WxH` 归一化的**唯一真源在 `translate`**（`RATIO_ORDER` /
@@ -242,6 +272,17 @@ def ark_body_from_openai(fields: Mapping[str, Any], *, reference_format: str = "
     m = _RESOLUTION_SUFFIX_RE.search(model)
     if m:
         resolution = m.group(1).lower()
+
+    # 免费线约束：1080p **降级**（站点对 1080p 没有实测免费线，见表定义）。
+    # ⚠️ 必须在**查表之前**降级，否则时长仍按"表外原值"透传(= 仍可能计费)；
+    #    且必须**留痕** —— 调用方要 1080p、拿到 720p 是一次改档，只是方向朝免费档收。
+    if resolution in _FREE_RESOLUTION_DOWNGRADE:
+        downgraded = _FREE_RESOLUTION_DOWNGRADE[resolution]
+        notes.append(
+            f'resolution "{resolution}" downgraded to "{downgraded}": this endpoint only runs the '
+            f"free tier, and the upstream has no measured free window at {resolution}"
+        )
+        resolution = downgraded
 
     duration = _seconds_to_duration(fields.get("seconds"))
 
