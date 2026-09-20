@@ -85,6 +85,7 @@ from .observability import (
     logfire_exporting,
     logfire_ready,
     record_account,
+    record_videos_charge,
     record_wait,
     set_upstream_calls,
     setup_observability,
@@ -393,6 +394,12 @@ def _sweep(cache: dict, limit: int) -> None:
 # Ark 归一化后的终态集合（translate._WEB_STATUS_TO_ARK 的值域子集）。
 # 终态视图**不可变**：站点的任务记录定格，视频地址与用量不会再变 —— 缓存到记录删除为止。
 _TERMINAL_ARK_STATUS = frozenset({"succeeded", "failed", "cancelled"})
+
+#: 入口形态标识：OpenAI 兼容面（`/v1/videos`）与方舟线共用 `_submit_ark` 这**一条**管线，
+#: 需要按入口分辨的地方（目前只有"该端点承诺恒免费 ⇒ 真扣费必须报警"）一律认这个常量，
+#: 不再各写一份字面量。它同时会被写进任务记录（`entry.response_shape`）：轮询阶段拿到的是
+#: 记录、不是请求，入口信息**只能**在创建时落下，事后无从推断。
+_OPENAI_SHAPE = "openai"
 
 
 class TaskViewCache:
@@ -1260,6 +1267,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "effective": eff,
             "warnings": warns,
             "unsupported": plan["unsupported"],
+            # 入口形态（`ark` / `openai`）：两条入口共用同一张任务表，而"这条任务是不是
+            # 从 `/v1/videos` 进来的"决定了一件事 —— 那个端点按分辨率把时长钉死在免费档、
+            # 对外承诺恒不花钱（见 `openai_videos.PINNED_DURATIONS`），所以它真扣了积分
+            # 必须能被单独认出来（`_internal_view` 里的上报）。
+            # ⚠️ 轮询阶段只有记录、没有请求 ⇒ 只能在这里落盘；老记录缺这个键时按"非
+            #    OpenAI 线"处理（不猜），代价是老任务不参与那条上报。
+            "response_shape": response_shape,
             "createdAtMs": int(time.time() * 1000),
         }
         # 凭据绑定（E2E-AVM-011）：task_id ↔ api-key（透传下即 newapi 传来的会话凭据）。
@@ -1273,7 +1287,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             task_id,
             eff["billed"],
         )
-        if response_shape == "openai":
+        if response_shape == _OPENAI_SHAPE:
             # Chatfire 创建响应契约：恰好四个字段。id 形态本就是 `cgt-*`，与示例一致。
             return {
                 "id": entry["id"],
@@ -1519,6 +1533,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             reported=decision is not None,
             cached=cached,
         )
+        # 计费**事实**：站点任务记录里的 `paid`（`credits` 与它反相，别用它判断）。
+        paid = bool((view.get("usage") or {}).get("paid"))
+        # 🔴 `/v1/videos` 线上"真的被扣了积分" —— 该端点按分辨率把时长**无条件**钉在站点
+        #    已实测免费的档位上（`openai_videos.PINNED_DURATIONS`），对外契约就是"这条线
+        #    永远不花钱" ⇒ 这里本该**恒为 False**。四条同时成立才算，判据只写在这一点：
+        #      ① 入口是 OpenAI 兼容面（创建时落进记录的 `response_shape`；
+        #         轮询阶段只有记录，事后无从推断入口）；
+        #      ② 已进终态 —— `paid` 在终态定格，而终态必然是**一次**跃迁 ⇒ 每条任务最多
+        #         报一次（与"终态一定留痕"同一条依据）；
+        #      ③ 这次观测属于要留痕的那类（首见 / 跃迁 / 失败）—— 同状态重复轮询不重复报；
+        #      ④ `paid=true` 本身。
+        videos_charged = (
+            paid
+            and status in _TERMINAL_ARK_STATUS
+            and str(entry.get("response_shape") or "") == _OPENAI_SHAPE
+            and decision is not None
+        )
         if decision is not None:
             with span(
                 "ark.task.fetch",
@@ -1534,7 +1565,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 poll_count=decision["polls"],
                 # 终态与**实际计费结果**必须进 trace —— 出片后对账就靠这两项
                 status=status,
-                paid=bool((view.get("usage") or {}).get("paid")),
+                paid=paid,
                 # 归一化后的任务对象（出片地址、用量、resolution 回填都在这里）
                 upstream_response=view,
                 # 只有这两项必须单独挂：它们来自**本地任务记录**（`entry`），不在
@@ -1561,6 +1592,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "status_change",
                         {"from": decision["from"], "to": decision["to"]},
                     )
+                if videos_charged:
+                    # span 属性只能在 span **还开着**的时候挂 ⇒ 它留在这一块里；日志与指标
+                    # 放在块后（判据是同一个 `videos_charged`，不另写一份）。
+                    sp.set_attribute("videos_line_charged", True)
+        if videos_charged:
+            # 端点契约破了 → 另外两条出口各服务一种读法：
+            #   · error 日志 —— 逐任务明细（`ark_id` / 上游 taskId **只**在这里，绝不进
+            #     指标标签），且 Logfire 上可直接按 error 级挂告警；
+            #   · 计数指标 —— 时间序列，回答"从什么时候开始扣的、扣了几条"。
+            # 🔴 判据里的 `decision is not None` 就是"每条任务最多报一次"的那道闸门：
+            #    同状态重复轮询不重复上报（与 `ark.task.fetch` 同一条产生层纪律）。
+            #    ⚠️ 少了它，一个被按秒级轮询的任务会报上百次 —— 告警直接失效。
+            # ⚠️ 这里**不改**对外响应：`/v1/videos` 的响应体是六字段契约，多一个键就是
+            #    坏一个客户端（计费差异走文档与告警，不走响应体）。
+            eff = entry.get("effective") or {}
+            logger.error(
+                "/v1/videos 任务实际扣了积分（该端点按分辨率钉死免费档，本应恒不花钱）："
+                "ark_id={} upstream_task={} model={} slot={} res={} dur={}s status={}",
+                ark_id,
+                entry["taskId"],
+                entry["model"],
+                eff.get("model") or "-",
+                eff.get("resolution") or "-",
+                eff.get("duration"),
+                status,
+            )
+            record_videos_charge(
+                upstream=upstream.kind,
+                status=status,
+                resolution=str(eff.get("resolution") or ""),
+                duration=eff.get("duration"),
+                model_slot=str(eff.get("model") or ""),
+            )
         # 等待时长只在**真的看到跃迁进终态**时记一次（同状态轮询记一遍 = 重复计数）
         if (
             decision is not None

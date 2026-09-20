@@ -346,6 +346,25 @@ status 词表：`queued` / `in_progress` / `completed` / `failed`；`progress` �
 告警会被读成噪声）。门禁：`tests/test_openai_pinned_duration.py` —— 时长改写与
 **计费结论**两条一起断言（只钉时长会漏掉"钉了却仍在计费区"）。
 
+🔴 **真被扣费会报警，不是只躺在 trace 里等人翻**（2026-09-20）：本端点按分辨率把时长钉在
+免费档上，对外口径就是"这条线永远不花钱" ⇒ 一旦某条任务真的进了计费区，本服务在**它进
+终态的那一次**同时发三个信号（判据只写在 `app._internal_view` 一处，不散落）：
+
+| 出口 | 形态 | 用来干什么 |
+|---|---|---|
+| 指标 | `avm.videos.charged_tasks`（计数器；标签 `upstream` / `status` / `resolution` / `duration` / `model_slot`） | 挂告警（**>0 即异常**）、看"从什么时候开始扣的、扣了几条" |
+| 日志 | `error` 级一行，带 `ark_id` / 上游 taskId / 调用方请求的模型 / 上游槽位 / 档位 | 逐任务明细；Logfire 上可直接按等级挂告警 |
+| span | `ark.task.fetch` 上的 `videos_line_charged=true` | 在 trace 里把它们过滤出来复盘 |
+
+四条判据**缺一不可**，且逐条都有变异自证（`tests/test_videos_charged_report.py`）：
+① 入口是 OpenAI 兼容面 —— 判据是任务记录里的 `response_shape`（创建时落盘；轮询阶段手里
+只有记录、没有请求，**事后无从推断入口**）；② 已进终态（`paid` 在终态定格，而终态必然是
+**一次**跃迁 ⇒ 每条任务最多报一次）；③ 这一次观测属于要留痕的那类（首见 / 跃迁 / 失败）——
+同状态重复轮询不重复报；④ 站点记录 `usage.paid=true`。
+⚠️ **方舟线刻意不报**：那边调用方可以自己点 `tier=base` 或传超出免费窗口的时长，那是它
+明示的选择（`billing_view` 已经为它发过告警）；把那些也报成"端点契约破了"，只会让这条
+告警被读成噪声，真正该看的那条反而看不见。
+
 ⚠️ 刻意没有 `DELETE /v1/videos/{id}`：站点没有取消端点，理由同上。
 
 ⚠️ **刻意没有 `DELETE /tasks/{id}`**（2026-09-15 定）：站点没有取消端点，"删本地记录"
@@ -706,6 +725,13 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
   区分调用方轮询 / 盯梢）+ `avm.task.wait_seconds`（跃迁进终态时记一次）。
   🔴 指标标签**只放低基数枚举**：绝不放 `ark_id` / `task_id` —— 那会把时间序列打成一任务
   一条，比 span 还贵。
+- ★ **计费告警指标** `avm.videos.charged_tasks`（2026-09-20）：OpenAI 兼容面（`/v1/videos`）
+  上**实际被扣了积分**的任务数。那条线按分辨率把时长钉在免费档、对外承诺恒不花钱 ⇒
+  这个计数器 **>0 就是契约破了**，应当在 Logfire 上给它挂告警，而不是等人去翻 trace。
+  同一时刻还会发一条 `error` 级日志（带 `ark_id` / 上游 taskId / 档位 —— 逐任务明细
+  **只**在日志与 span 上，绝不进标签）与 span 属性 `videos_line_charged`。
+  判据（含"为什么方舟线刻意不报"）见上面「OpenAI `/v1/videos` 兼容面」一节；
+  门禁 `tests/test_videos_charged_report.py`（8 条变异自证全红）。
 - 具名 span（属性即契约，用内存 exporter 断言：`tests/test_trace_contract.py`）：
   - `ark.create.submit` —— `ark_id` / `upstream` / `ark_model` /
     `resolution` / `duration` / `billed` / `warning_count` / `warnings` /
@@ -724,7 +750,9 @@ curl -X POST http://127.0.0.1:8808/api/v3/contents/generations/tasks \
     **`paid`**（出片后对账的两项关键；`paid` 才是"这次花没花钱"的判据，不是 `credits`）/
     `upstream_response`（归一化后的**完整内部视图** —— 上游实际执行的模型
     `upstream_model`、站点原始记录 `upstream_record`、实际产出档位 `resolution` 都在里面，
-    从 `4211e5b` 起一直如此）/ **`warnings`** / **`unsupported`** / `upstream_calls`
+    从 `4211e5b` 起一直如此）/ **`warnings`** / **`unsupported`** / `upstream_calls` /
+    `videos_line_charged`（**只在**"`/v1/videos` 线上这条任务真被扣了积分"时才挂 ——
+    "承诺恒免费的那个端点破了契约"的现场标记，见上面「OpenAI `/v1/videos` 兼容面」一节）
 
     2026-09-15 响应体两轮收窄时**只单独补了 `warnings` / `unsupported`** —— 它们来自本地
     任务记录（`entry`），**不在** `upstream_response` 里，不挂就真的丢了。
@@ -864,6 +892,7 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 ├── test_docs_billing_sync.py 文档里的免费秒数必须跟着 FREE_MAX_DURATION 走
 ├── test_seedance25_omni.py  Seedance 2.5 全能参考（截断、专属字段、前置拒绝；零外发）
 ├── test_openai_videos.py    OpenAI /v1/videos 兼容面（Chatfire 契约六字段；零外发）
+├── test_videos_charged_report.py /v1/videos 真被扣费必须上报（指标/日志/span 三出口；含 8 条变异自证）
 ├── test_media_proxy.py      成片对外出口（响应头白名单、零上游痕迹、归属；含 5 条变异自证）
 ├── test_trace_contract.py   trace 属性契约（内存 exporter 捞 span 断言 + 凭证红线）
 ├── test_passthrough_cookie.py 透传（多租户隔离、缓存淘汰、闸门互斥）

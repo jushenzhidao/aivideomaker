@@ -554,6 +554,45 @@ def record_wait(*, upstream: str, final_status: str, seconds: float, source: str
     ).record(value, attributes={"upstream": upstream, "final_status": final_status, "source": source})
 
 
+def record_videos_charge(
+    *,
+    upstream: str,
+    status: str,
+    resolution: str = "",
+    duration: int | None = None,
+    model_slot: str = "",
+) -> None:
+    """`/v1/videos` 线上**真的被扣了积分**的任务 → Logfire 计数指标（`> 0` 即异常）。
+
+    🔴 为什么是"异常上报"而不是普通统计：该端点在 `openai_videos.PINNED_DURATIONS` 里按
+    分辨率把时长**无条件**钉在站点已实测免费的档位上（`480p` / `720p`），对外契约就是
+    "这条线永远不花钱"。⇒ 这个计数器**>0 就说明契约破了**（站点收窄了免费线 / 某条请求
+    绕过了钉死 / 模型档位与假定不符），应当在 Logfire 上给它挂告警，而不是等人去翻 trace。
+
+    ⚠️ 标签**只放低基数字段**（`upstream` / `status` / `resolution` / `duration` /
+    `model_slot`）：`ark_id` / `task_id` **绝不进标签** —— 一任务一条会把时间序列打废
+    （与 `count_poll` 同一条纪律）。逐任务明细在 `ark.task.fetch` span 与那条 error 日志里。
+
+    判据由调用方（`app._internal_view`）给出：入口是 OpenAI 兼容面 + 已进终态 +
+    `usage.paid=true`。本函数只管"怎么报"，不管"算不算"。
+    """
+    if not _LOGFIRE_READY:
+        return
+    attrs: dict = {"upstream": upstream, "status": status or "unknown"}
+    if resolution:
+        attrs["resolution"] = resolution
+    if duration is not None:
+        attrs["duration"] = int(duration)
+    if model_slot:
+        attrs["model_slot"] = model_slot
+    _metric(
+        "counter",
+        "avm.videos.charged_tasks",
+        unit="1",
+        description="OpenAI /v1/videos 线上实际被扣积分的任务数（该端点钉死免费档 ⇒ >0 即异常）",
+    ).add(1, attributes=attrs)
+
+
 def record_account(
     *,
     upstream: str,
