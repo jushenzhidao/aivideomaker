@@ -330,8 +330,10 @@ class TestRehostBudget(unittest.TestCase):
     def test_a_failed_item_aborts_the_whole_submit(self):
         """🔴 底线：转存任何一项走不完，**绝不许**接着提交上游（提交即计费）。
 
-        用真客户端 + 慢链接把第 1 项卡在预算上 ⇒ `submit` 一次都不能被调到，
-        第 2 项也不该被尝试（`file_hits` 停在 1）。这才是"调用方超时"最坏的后果。
+        用真客户端 + 慢链接把第 1 项卡在预算上 ⇒ `submit` 一次都不能被调到。
+        ⚠️ 2026-09-20 转存改**并行**后语义有一处变化：另一项**可能**已被同时取回
+        （`file_hits` 不再恒为 1 —— 那只是带宽浪费，不是计费风险）。真正的不变量是
+        「任一项失败 ⇒ 整次创建失败（504），上游提交一次都不发生」—— 下面照旧钉死。
         """
         site = LinkSite(delay=0.6)
         site.set("ai.minimaxH3", "t1")
@@ -350,7 +352,7 @@ class TestRehostBudget(unittest.TestCase):
                                                             "https://files.test/b.png"]}})
         self.assertEqual(ctx.exception.http_status, 504)
         self.assertEqual(submitted, [], "转存失败后绝不能接着提交（那一步会计费）")
-        self.assertEqual(site.file_hits, 1, "第 1 项就失败了，不该再去取第 2 项")
+        self.assertGreaterEqual(site.file_hits, 1, "至少第 1 项真的被尝试过（否则这条是空跑）")
 
 
 # ============================================================ 3 预签名 PUT 的头 ----

@@ -120,8 +120,10 @@ class ChargedTaskCase(unittest.TestCase):
         self.site = FakeSite()
         self.site.set("ai.minimaxH3", "t1")
         self.site.set("model.getModel", site_task())
-        # TTL=0：每次查询都真的回上游读一次，好让"运行中"与"终态"都能被观测到
+        # TTL=0：每次查询都真的回上游读一次，好让"运行中"与"终态"都能被观测到。
+        # 另用**同步推进**（submit_inline）：本门禁考的是"扣费上报"而非受理时序。
         app = create_app(web_settings(gate_key=GATE, task_cache_ttl=0.0))
+        app.state.submit_inline = True
         client = make_client(self.site)
         app.state.upstreams = {
             "web": WebUpstream(client, WebSubmitQueue(client, max_concurrent=2, poll_interval=0.01))

@@ -232,6 +232,8 @@ class TestOpenAiFaceCarriesTheSameSemantics(unittest.TestCase):
         self.site.set("ai.minimaxH3", "t-h3")
         c = make_client(self.site)
         app = create_app(web_settings())
+        # 映射/接线类门禁用**同步推进**（submit_inline，见 _schedule_videos_submit 的说明）
+        app.state.submit_inline = True
         app.state.upstreams = {
             "web": WebUpstream(c, WebSubmitQueue(c, max_concurrent=1, poll_interval=0.01))
         }

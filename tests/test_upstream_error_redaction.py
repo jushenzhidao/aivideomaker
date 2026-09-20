@@ -242,6 +242,14 @@ class RedactionCase(unittest.TestCase):
 
     # ---- 场景 5：OpenAI 面必须同样脱敏（两个入口共用一套出口）----
     def test_openai_face_is_redacted_too(self):
+        """🔴 受理分离后（2026-09-20）本面**没有同步错误报文**可泄漏了：
+
+        POST 恒 200 + 四字段契约；上游侧失败（含 transport 级异常）写进记录、
+        由轮询给出 `failed` —— 而**六字段契约根本不带原因**。所以这条改为钉住：
+        ① 受理报文不含任何上游细节；② 轮询报文不含任何上游细节与内部归因
+        （`submit_error` 是给日志/span 的，不是给调用方的）；③ 完整细节照旧只在 trace。
+        """
+
         def timeout(_request):
             raise httpx.ReadTimeout("The read operation timed out")
 
@@ -257,8 +265,36 @@ class RedactionCase(unittest.TestCase):
             json={"model": "minimaxH3", "prompt": "p", "seconds": 5, "size": "adaptive"},
             headers={"Authorization": f"Bearer {GATE}"},
         )
-        self.assertEqual(r.status_code, 502, r.text)
-        self.assert_redacted(r, code="UpstreamError")
+        # 受理即返：四字段契约，**没有**任何上游细节可泄漏
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(set(r.json()), {"id", "object", "status", "created_at"})
+        self.assertNotIn("The read operation timed out", r.text)
+        tid = r.json()["id"]
+
+        # 等后台提交真正失败（有界等待 —— 它跑在 daemon 线程里）
+        import time
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            rec = self.client.app.state.tasks.get(tid)
+            if rec and rec.get("submit_error"):
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("后台提交没有按预期失败（submit_error 一直没落库）")
+
+        # 轮询：failed 是合法终态；六字段契约 + 不含上游细节/内部归因
+        r2 = self.client.get(
+            f"{OPENAI_VIDEOS_PATH}/{tid}", headers={"Authorization": f"Bearer {GATE}"}
+        )
+        self.assertEqual(r2.status_code, 200, r2.text)
+        self.assertEqual(r2.json()["status"], "failed")
+        dumped = json.dumps(r2.json(), ensure_ascii=False)
+        self.assertNotIn("The read operation timed out", dumped, "上游原始异常文本不许出出口")
+        self.assertNotIn("site.test", dumped, "上游域名不许出出口")
+        self.assertNotIn("worker restart", dumped, "内部归因（submit_error）不许出现在响应体里")
+        # 完整细节照旧只在 trace 里（对账/排障要看）
+        self.assertIn("ReadTimeout", json.dumps(self.spans("ark.create.submit"), ensure_ascii=False))
 
     # ---- 对照：我们**自己**的报文不许被误伤 ----
     def test_our_own_messages_keep_their_useful_text(self):

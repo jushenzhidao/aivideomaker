@@ -73,6 +73,9 @@ class FreeOnlyCase(unittest.TestCase):
         )
         c = make_client(self.site)
         app = create_app(web_settings())
+        # 政策门禁考的是"槽位/分辨率落定 + 证据字段"⇒ 用**同步推进**保持确定性；
+        # 受理时序由 test_videos_async_accept 在真实异步模式下钉住。
+        app.state.submit_inline = True
         app.state.upstreams = {
             "web": WebUpstream(c, WebSubmitQueue(c, max_concurrent=2, poll_interval=0.01))
         }

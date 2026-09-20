@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import base64
 import re
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Any, Callable
 
 from loguru import logger
@@ -35,6 +37,12 @@ from .web_queue import WebSubmitQueue
 
 _DATA_URI_RE = re.compile(r"^data:([^;,]+);base64,(.*)$", re.S)
 _SITE_CDN_RE = re.compile(r"^https?://static\d*\.img2video\.ai/", re.I)
+
+#: 转存的**并发上限**（2026-09-20 受理分离配套）。最多 7 项互相独立（图 4 / 视频 1 /
+#: 音频 2），线程大部分时间在等网络 ⇒ 4 个 worker 已能把"总耗时 ≈ 各项之和"压成
+#: "≈ 最慢一项"，再高只会去顶站点的上传限速。预算语义不变（`MediaFetchBudget` 只读
+#: deadline，线程安全）；失败语义也不变：任一项失败 ⇒ 整次创建失败。
+_REHOST_MAX_WORKERS = 4
 
 
 def _decode_data_uri(value: str) -> dict | None:
@@ -74,14 +82,44 @@ class WebUpstream:
         （实测过一个 `.jpg` 外链返回非标准 MIME `image/jpg`，字节其实是 PNG）。
         已经是 `static*.img2video.ai` 的地址原样放过，不重复上传。
 
-        ⚠️ 这里是**串行**的，最多 7 项（图 4 / 视频 1 / 音频 2）⇒ 由 `budget` 兜住总时长。
+        ⚠️ 2026-09-20 起**并行**执行（`_REHOST_MAX_WORKERS`，受理分离的配套 ——
+        这段耗时现在发生在后台线程，但压它仍直接影响"多久能真正提交出去"）：
+        最多 7 项互相独立，串行时总耗时 = 各项之和（3 张图各 3s ⇒ 9s），并行后 ≈ 最慢一项。
+        预算语义不变（任一项发现超预算就抛 504，**点名**是哪一步哪一项）；
+        失败语义不变：任一项失败 ⇒ 整次创建失败（结果按提交顺序回收，第一个异常照原样上抛）。
         """
+        jobs: list[tuple[str, Any]] = []
         for key in ("imageUrl", "lastFrameUrl", "referenceVideoUrl"):
-            params[key] = self._upload_one(params.get(key), budget)
+            jobs.append((key, params.get(key)))
         for key in ("referenceImageUrls", "referenceAudioUrls"):
             vals = params.get(key)
             if isinstance(vals, list) and vals:
-                params[key] = [self._upload_one(v, budget) for v in vals]
+                for i, v in enumerate(vals):
+                    jobs.append((f"{key}[{i}]", v))
+        if not jobs:
+            return params  # 纯文生视频：没有要转存的东西，连线程池都不必起
+
+        with ThreadPoolExecutor(max_workers=_REHOST_MAX_WORKERS) as pool:
+            # 🔴 必须**带着上下文**进工作线程：上传链路的证据采集（`note_upstream`）靠
+            #    contextvar 找采集箱，而 ThreadPoolExecutor 的线程**不继承**提交者的上下文
+            #    ⇒ 不 copy 的话，上传发生在"没有采集箱"的线程里，`ark.create.submit` 的
+            #    `upstream_calls` 会**静默变空**（2026-09-20 实测踩中：并行化之后
+            #    download/presign/PUT 的留痕全部消失，靠失败路径的门禁抓回来的）。
+            #    ⚠️ **每项各自 copy 一份**：`Context.run` 不可重入（并行两个线程进同一个
+            #    Context 会抛 "already entered"），但每份拷贝里装的**引用**是同一个采集箱，
+            #    各线程照样写进同一个 box（list.append 原子）。
+            futures = [
+                pool.submit(copy_context().run, self._upload_one, value, budget)
+                for _, value in jobs
+            ]
+            # 按提交顺序回收 ⇒ 第一个异常就是"第一项"的异常，与串行时代一致
+            uploaded = [f.result() for f in futures]
+        for (key, _old), new in zip(jobs, uploaded):
+            if key.endswith("]"):
+                base, idx = key[:-1].split("[")
+                params[base][int(idx)] = new
+            else:
+                params[key] = new
         return params
 
     def _upload_one(self, value, budget=None):

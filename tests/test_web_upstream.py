@@ -539,6 +539,24 @@ class TestNormalizeWebTask(unittest.TestCase):
 # ----------------------------------------------------------------- app layer ----
 
 
+def wait_until(pred, *, timeout: float = 5.0, what: str = "条件") -> None:
+    """**有界轮询**等待一个条件成立（受理分离后，"POST 已返回"≠"提交已完成"）。
+
+    `/v1/videos` 自 2026-09-20 起受理即返：上游提交发生在 daemon 后台线程里 ⇒
+    任何"POST 之后立刻断言站点已收到/记录已有 taskId"的测试都存在竞态（可能闪绿）。
+    断言前先用本函数等确定性信号（站点收到了调用 / 记录里有了 taskId / submit_error 落库）。
+    🔴 超时**必须失败**（不许静默跳过）—— 否则就是一次假绿。
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"等待超时（{timeout:.0f}s）：{what}")
+
+
 def web_settings(**kw) -> Settings:
     base = dict(
         cookie="auth_session=deadbeef",

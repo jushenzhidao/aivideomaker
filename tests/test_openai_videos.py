@@ -100,6 +100,9 @@ def settings(**kw) -> Settings:
 
 def _app_with_fake(fake: FakeClient, **kw):
     app = create_app(settings(**kw))
+    # 映射/契约类门禁用**同步推进**（submit_inline，见 _schedule_videos_submit）：
+    # 它们考的是参数映射与响应契约，不是受理时序 —— 时序由 test_videos_async_accept 钉住。
+    app.state.submit_inline = True
     # 换掉真实上游：app 只读 upstreams 注册表（与 test_web_upstream 同一手法）
     app.state.upstreams = {
         "web": WebUpstream(fake, WebSubmitQueue(fake, max_concurrent=2, poll_interval=0.01))

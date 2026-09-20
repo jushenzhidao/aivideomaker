@@ -347,6 +347,24 @@ status 词表：`queued` / `in_progress` / `completed` / `failed`；`progress` �
 **不受本政策影响**（那条线的调用方可以自己点档、也自己承担费用）。
 门禁：`tests/test_videos_free_only.py`（含 8 条变异自证）。
 
+🔴 **受理/推进分离**（2026-09-20 用户拍板「1 2试试 目前只针对/v1/videos」）：`POST /v1/videos`
+**毫秒级返回** id（`status=queued`），素材转存/取 token/上游提交在 daemon 后台线程完成 ——
+客户端不再同步等"等槽位（最坏 600s）+ 转存（最坏 120s）+ 现场铸 token（2~45s）"。
+
+| 变化 | 语义 |
+|---|---|
+| 受理 | **先落库再返回**：记录在受理时就有了（含凭据绑定），`GET /v1/videos/{id}` 立即可查，返回 `queued` |
+| 上游侧失败 | **不再在 POST 上报错**（旧行为：429 / 502 同步返回）—— 记录转 `failed`，轮询可见；完整归因只在日志与 span |
+| 提交失败原因 | **不出响应体**（六字段契约没这个键）；内部归因落在 `submit_error`（日志/span），对外只有脱敏通用句 |
+| 提交线程死了 | 提交**租约** `_SUBMIT_LEASE_SECONDS`（1200s，覆盖最坏 转存 120 + 等槽位 600 + 铸 45）超时仍未提交 ⇒ 轮询判定并标 `failed`，不会永远 queued |
+| 未提交阶段轮询 | **零上游调用**（拿空 taskId 打上游只会得到错误空壳，还会凭空制造假跃迁） |
+| 方舟线 | **完全不受影响**：`/tasks` 仍同步受理，POST 返回时上游受理已成功/失败当场可知 |
+
+前置校验（鉴权 / 参数 / 渠道配置 / 能力）仍在本请求内**同步 400** —— 受理分离只挪"会慢的部分"。
+配套：素材转存改**并行**（`_REHOST_MAX_WORKERS`，总耗时 ≈ 最慢一项）；后台并发推进上限
+`_SUBMIT_WORKERS`（daemon 线程 —— 故意不用 ThreadPoolExecutor，进程退出时不 join 在飞提交）。
+门禁：`tests/test_videos_async_accept.py`（6 条时序断言，全部有变异自证）。
+
 🔴 **时长是写死的，不是"缺省值"**（2026-09-17 用户口径）：本端点按分辨率**无条件覆盖**
 调用方传的 `seconds` —— 表 = `openai_videos.PINNED_DURATIONS`：
 
@@ -935,6 +953,7 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 ├── test_openai_videos.py    OpenAI /v1/videos 兼容面（Chatfire 契约六字段；零外发）
 ├── test_charged_task_report.py 真被扣费必须上报（两条线；指标/日志/span 三出口；含 10 条变异自证）
 ├── test_videos_free_only.py `/v1/videos` 只跑免费线（模型兜底 + 1080p 降级；含 8 条变异自证）
+├── test_videos_async_accept.py 受理/推进分离的**时序**门禁（受理即返/未提交零上游调用/失败可见/租约；含 6 条变异自证）
 ├── test_media_proxy.py      成片对外出口（响应头白名单、零上游痕迹、归属；含 5 条变异自证）
 ├── test_trace_contract.py   trace 属性契约（内存 exporter 捞 span 断言 + 凭证红线）
 ├── test_passthrough_cookie.py 透传（多租户隔离、缓存淘汰、闸门互斥）
