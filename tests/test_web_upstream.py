@@ -82,9 +82,10 @@ OGG = b"OggS\x00\x00" + b"\x00" * 16
 class TrpcError:
     """让替身站点返回一个 tRPC 错误信封。"""
 
-    def __init__(self, message: str, code: str = "BAD_REQUEST"):
+    def __init__(self, message: str, code: str = "BAD_REQUEST", http_status: int = 400):
         self.message = message
         self.code = code
+        self.http_status = http_status
 
 
 class FakeSite:
@@ -126,7 +127,7 @@ class FakeSite:
             if isinstance(value, TrpcError):
                 return httpx.Response(
                     200,
-                    json=[{"error": {"json": {"message": value.message, "data": {"code": value.code, "httpStatus": 400}}}}],
+                    json=[{"error": {"json": {"message": value.message, "data": {"code": value.code, "httpStatus": value.http_status}}}}],
                 )
             return httpx.Response(200, json=[{"result": {"data": {"json": value}}}])
         return httpx.Response(404, json={"nope": path})

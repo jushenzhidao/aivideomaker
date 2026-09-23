@@ -63,17 +63,28 @@ def text(s="a red balloon"):
 
 class TestSnapDuration(unittest.TestCase):
     def test_exact_values_pass_through(self):
+        """档位内的值原样通过（480p 的合法档位 = 5/10/15/20）。"""
         self.assertEqual(T.snap_duration(5, "480p"), 5)
         self.assertEqual(T.snap_duration(10, "480p"), 10)
+        self.assertEqual(T.snap_duration(15, "480p"), 15)
+        self.assertEqual(T.snap_duration(20, "480p"), 20)
 
-    def test_480p_accepts_any_integer(self):
-        """站点对时长是"连续秒数 + 上限"，不是离散档位。
+    def test_480p_snaps_to_the_discrete_ladder(self):
+        """480p 只收离散 `5/10/15/20`（E2E-AVM-016 实测 + 生产 38 次 502 实锤）。
 
-        曾经 480p 被写成 `[5, 10, 15, 20]`，会把 `duration=8`（本就在免费线内）
-        吸附到 10s，从而**跨进计费区** —— 静默变贵，是本项目最该避免的一类。
+        2026-09-24 之前误当"连续区间" ⇒ 6/7/8/9/11..14/16..19s **原样发出、被上游拒绝**。
+        现在一律**就近吸附**（平手取较小值）。
         """
-        self.assertEqual(T.snap_duration(8, "480p"), 8)
-        self.assertEqual(T.snap_duration(6, "480p"), 6)
+        cases = {6: 5, 7: 5, 8: 10, 9: 10, 11: 10, 12: 10,
+                 13: 15, 14: 15, 16: 15, 17: 15, 18: 20, 19: 20}
+        for raw, expected in cases.items():
+            self.assertEqual(T.snap_duration(raw, "480p"), expected, f"480p/{raw}s 吸附错了")
+
+    def test_480p_snap_never_crosses_the_free_line(self):
+        """免费区（≤10s）的请求吸附后仍在免费区（只落 5 或 10）——"静默变贵"担忧不成立。"""
+        for raw in range(5, 11):
+            snapped = T.snap_duration(raw, "480p")
+            self.assertLessEqual(snapped, 10, f"480p/{raw}s 吸附到 {snapped}s 越过了免费线")
 
     def test_out_of_range_clamps_to_the_nearest_legal_value(self):
         self.assertEqual(T.snap_duration(1, "480p"), 5)
@@ -81,12 +92,13 @@ class TestSnapDuration(unittest.TestCase):
 
     def test_prefer_free_pulls_billed_durations_back_under_the_line(self):
         """`prefer_free` 的用途是**主动省钱**：合法但已计费的时长要能拉回免费区。"""
-        self.assertEqual(T.snap_duration(12, "480p"), 12)
-        self.assertEqual(T.snap_duration(12, "480p", prefer_free=True), 10)
+        self.assertEqual(T.snap_duration(15, "480p"), 15)
+        self.assertEqual(T.snap_duration(15, "480p", prefer_free=True), 10)
 
-    def test_prefer_free_leaves_free_durations_alone(self):
+    def test_prefer_free_keeps_free_requests_free(self):
+        """免费区请求经 prefer_free 后**仍在免费区**（480p 的 8s 吸附到 10s，不越线）。"""
         self.assertEqual(T.snap_duration(5, "480p", prefer_free=True), 5)
-        self.assertEqual(T.snap_duration(8, "480p", prefer_free=True), 8)
+        self.assertEqual(T.snap_duration(8, "480p", prefer_free=True), 10)
 
     def test_720p_accepts_any_integer(self):
         self.assertEqual(T.snap_duration(6, "720p"), 6)
@@ -141,6 +153,13 @@ class TestTranslateCreate(unittest.TestCase):
         # 站点支持 1080p，翻译层不该擅自降级（实际产出的档位以任务记录的
         # kelingKeyId 为准，见 test_web_upstream.py 的 normalize 用例）
         self.assertEqual(plan["effective"]["resolution"], "1080p")
+
+    def test_480p_off_ladder_duration_is_snapped_with_a_trace(self):
+        """480p 非档位值（8s）→ 就近吸附到 10s，且**留痕**（改了什么必须看得到）。"""
+        plan = T.translate_create(body(resolution="480p", duration=8))
+        self.assertEqual(plan["web_params"]["duration"], 10)
+        self.assertTrue(any("snapped to 10s" in w for w in plan["warnings"]), plan["warnings"])
+
 
     def test_raw_translation_leaves_billing_wording_to_the_view(self):
         """翻译层只给事实，计费口径的措辞由 `billing_view` 渲染。"""

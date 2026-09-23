@@ -358,6 +358,19 @@ class RedactionCase(unittest.TestCase):
         self.assertIn("ai.minimaxH3", str(span.get("error", "")))
 
 
+    def test_content_rejection_is_400_not_502(self):
+        """端到端：替身站点回 500 + 内容敏感 ⇒ 出口 400 / ContentFiltered（不是 502）。"""
+        self.site.set(
+            "ai.minimaxH3",
+            error=TrpcError("Prompt or Image Sensitive", code="INTERNAL_SERVER_ERROR", http_status=500),
+        )
+        self.app_with(make_client(self.site, user_id="u-test"))
+        r = self.post()
+        self.assertEqual(r.status_code, 400, r.text)
+        err = self.assert_redacted(r, code="ContentFiltered")
+        self.assertIn("content policy", err["message"])
+
+
 class TestClientMessagePhases(unittest.TestCase):
     """阶段区分：**调用方自己的素材** vs **上游自己**。
 
@@ -408,6 +421,80 @@ class TestClientMessagePhases(unittest.TestCase):
             for token in INTERNAL_TOKENS:
                 self.assertNotIn(token, m, f"{token!r} 出现在对外句里：{m}")
 
+
+class TestContentAndMediaErrorMapping(unittest.TestCase):
+    """出口语义修正（2026-09-23 生产数据驱动）。
+
+    · **内容策略拒绝**：上游包成 `INTERNAL_SERVER_ERROR status=500`，方舟官方对同类是 400
+      ⇒ 不能压成 502（调用方会误当服务故障、反复重试，而重试必败）。
+    · **素材链接 403**：download 阶段的 403 = 调用方引用的素材不可用（请求内容问题），
+      不是权限问题 ⇒ 400；**非 download 的 403 保持原样**（别把规则放宽）。
+    """
+
+    @staticmethod
+    def we(procedure: str, message: str, *, http_status: int = 0, code: str | None = None):
+        from ark_compat.errors import WebApiError
+
+        return WebApiError(procedure, message, code=code, http_status=http_status)
+
+    def test_content_rejection_maps_to_400_content_filtered(self):
+        from ark_compat.app import _upstream_client_message, _web_code_for, _web_http_for
+
+        messages = (
+            "Prompt or Image Sensitive",
+            "The content could not be processed because it contained material "
+            "flagged by a content checker.",
+        )
+        for m in messages:
+            e = self.we("ai.minimaxH3", m, http_status=500, code="INTERNAL_SERVER_ERROR")
+            self.assertEqual(_web_http_for(e), 400, m)
+            self.assertEqual(_web_code_for(e), "ContentFiltered", m)
+            client = _upstream_client_message(e)
+            self.assertIn("content policy", client)
+            self.assertIn("retry", client, "要给行动项（调整内容再试）")
+            for token in INTERNAL_TOKENS:
+                self.assertNotIn(token, client, f"{token!r} 漏进对外句：{client}")
+
+    def test_download_403_maps_to_400(self):
+        from ark_compat.app import _upstream_client_message, _web_http_for
+
+        e = self.we(
+            "download",
+            "403 for https://omnix.example/cos/x.jpg（参考文件链接不可用）",
+            http_status=403, code="TRPC_ERROR",
+        )
+        self.assertEqual(_web_http_for(e), 400, "素材链接不可用是请求内容问题，不是权限问题")
+        self.assertIn("reference file you supplied", _upstream_client_message(e))
+
+    def test_non_download_403_stays_403(self):
+        """鉴权类 403（非 download 阶段）保持透传 —— 修正只针对素材下载。"""
+        from ark_compat.app import _web_http_for
+
+        e = self.we("model.getModel", "forbidden", http_status=403)
+        self.assertEqual(_web_http_for(e), 403)
+
+    def test_regular_upstream_5xx_still_maps_to_502(self):
+        """回归：普通上游 500（队列满等）仍是 502 —— 别把"内容拒绝"放宽成"所有 500"。"""
+        from ark_compat.app import _web_code_for, _web_http_for
+
+        e = self.we(
+            "ai.minimaxH3",
+            "The queue is full. The pro plan can only run 4 task at a time.",
+            http_status=500, code="INTERNAL_SERVER_ERROR",
+        )
+        self.assertEqual(_web_http_for(e), 502)
+        self.assertEqual(_web_code_for(e), "UpstreamError")
+
+    def test_480p_duration_rejection_stays_502(self):
+        """回归：时长档位类错误不许被内容规则误判（480p 已离散化，此路径应罕见）。"""
+        from ark_compat.app import _web_http_for
+
+        e = self.we(
+            "ai.minimaxH3",
+            "480p supports 5s, 10s, 15s, or 20s duration.",
+            http_status=500, code="INTERNAL_SERVER_ERROR",
+        )
+        self.assertEqual(_web_http_for(e), 502)
 
 if __name__ == "__main__":
     unittest.main()

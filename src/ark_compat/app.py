@@ -230,10 +230,36 @@ def _rid_of(request) -> str:
 # 压成 502，调用方就分不清"上游坏了"与"你给的链接太慢/太大"。
 _WEB_HTTP = (400, 401, 403, 404, 429, 504)
 
+# 上游**内容策略拒绝**的实测消息形态（2026-09-23 生产 24h 内 28 次）。
+# 这类拒绝是"你的内容有问题"，不是"服务故障"：方舟官方对同类错误的契约就是 **400**
+# （`*SensitiveContentDetected` 系列 / `InputTextRiskDetection`），而 web 上游把它包成
+# `INTERNAL_SERVER_ERROR status=500` ⇒ 不识别就会被压成 502，调用方误当服务故障**反复重试**
+# （重试必败，白耗配额）。
+# ⚠️ 匹配的是**上游原文措辞**，上游改词这里要跟着更新（门禁：test_upstream_error_redaction）。
+_CONTENT_REJECTION_MARKERS = (
+    "sensitive",
+    "flagged by a content checker",
+    "could not be processed because it contained",
+)
+
+
+def _is_content_rejected(e: WebApiError) -> bool:
+    """上游因内容策略拒绝本条（**非服务故障**，重试无用）。"""
+    blob = str(e).lower()
+    return any(marker in blob for marker in _CONTENT_REJECTION_MARKERS)
+
 
 def _web_http_for(e: WebApiError) -> int:
     if e.code in ("CAPTCHA_REQUIRED", "QUEUE_TIMEOUT"):
         return 429
+    if _is_content_rejected(e):
+        # 内容拒绝 ⇒ 400（方舟官方同类错误就是 400，见 _CONTENT_REJECTION_MARKERS 注释）
+        return 400
+    if e.procedure == "download" and e.http_status == 403:
+        # 引用素材链接不可用（2026-09-23 生产 24h 148 次）：这是**调用方提供的素材**问题
+        # （请求内容不合法），不是权限/鉴权问题 —— 原样回 403 会被误读成"我的凭据过期了"，
+        # 触发无谓的换 key / 重试。
+        return 400
     if e.http_status in _WEB_HTTP:
         return e.http_status
     return 502
@@ -246,6 +272,8 @@ def _web_code_for(e: WebApiError) -> str:
     `data.code`）带进来，那是上游的内部词表 —— 出现在我们的 `code` 字段里就是泄漏
     （也是把"实现细节"写进了对外契约）。只有 `NOT_FOUND` 这类**我们已确认语义**的才映射。
     """
+    if _is_content_rejected(e):
+        return "ContentFiltered"
     return {
         "CAPTCHA_REQUIRED": "RateLimitExceeded",
         "QUEUE_TIMEOUT": "TaskQueueFull",
@@ -300,6 +328,13 @@ def _upstream_client_message(e: WebApiError) -> str:
             f"may help"
             if timed_out
             else f"{phase} failed"
+        )
+    elif _is_content_rejected(e):
+        # 内容策略拒绝：**调用方能自己修**（换 prompt / 换素材），重试必败 ⇒ 说清行动项
+        why = (
+            "the input content was rejected by the upstream's content policy — "
+            "adjust the prompt or the reference media and retry; repeating the same request "
+            "will fail again"
         )
     elif e.code == "CAPTCHA_REQUIRED":
         why = (
