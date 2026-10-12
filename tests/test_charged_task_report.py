@@ -72,6 +72,16 @@ GATE = "gate-secret-123"
 METRIC = "avm.billing.charged_tasks"
 NEEDLE = "任务实际扣了积分"
 
+#: 本服务自己的指标**命名空间**（`observability` 里所有指标都以 `avm.` 开头，
+#: instrumentation scope 名是 `logfire`）。
+#: 🔴 第三方自动插桩发出的 `http.server.*`（scope 名是 `fastapi`）**不是本服务的口径** ——
+#:    2026-10-12 实证：`opentelemetry-instrumentation-fastapi` 新版开始发 HTTP server 指标，
+#:    其 `http.route` 属性值是**路由模板** `/api/v3/contents/generations/tasks/{task_id}`，
+#:    里面字面含 `task_id` ⇒ 下面那条"标签不许带任务 id"的**子串**扫描会**误报**（那是常量、
+#:    基数恒为 1，与要防的"一任务一条"是两回事）；同时它会让"logfire 没装配 ⇒ 零指标"那
+#:    条断言看见 4 条第三方的 `http.server.*` 而变红。⇒ `points()` 一律只取本命名空间。
+OUR_METRIC_PREFIX = "avm."
+
 # 站点侧任务记录（与 `test_poll_suppression` 同形）。`url` 必须有：站点会把没有产出
 # URL 的 `succeed` 判成失败（`translate.normalize_web_task` 里那条自相矛盾状态的修正）。
 SITE_TASK = {
@@ -172,7 +182,8 @@ class ChargedTaskCase(unittest.TestCase):
         return self.client.get(f"{TASKS_PATH}/{tid}", headers={"Authorization": f"Bearer {GATE}"})
 
     def points(self) -> list:
-        """`(指标名, 值, 标签)`。**整个测试只读一次**（见类 docstring 的顺序陷阱）。
+        """`(指标名, 值, 标签)` —— **只含本服务自己的指标**（`avm.*`，见 `OUR_METRIC_PREFIX`）。
+        **整个测试只读一次**（见类 docstring 的顺序陷阱）。
 
         ⚠️ 直方图的 data point 没有 `.value`（走 `sum` / `count`）—— 与 `test_poll_metrics`
         同一份处理，否则同一条断言会因为"顺带读了别的指标"而炸。
@@ -183,6 +194,9 @@ class ChargedTaskCase(unittest.TestCase):
             for rm in (data.resource_metrics if data is not None else []):
                 for sm in rm.scope_metrics:
                     for m in sm.metrics:
+                        # 只取本服务自己的指标，理由见 OUR_METRIC_PREFIX
+                        if not m.name.startswith(OUR_METRIC_PREFIX):
+                            continue
                         for dp in m.data.data_points:
                             value = getattr(dp, "value", None)
                             if value is None:  # HistogramDataPoint 一族
@@ -372,6 +386,10 @@ class TestJudgement(ChargedTaskCase):
 
         与 `test_poll_suppression` 里那条同款纪律 —— 一任务一条比 span 还贵，
         而且告警规则会变成"逐任务触发"。
+
+        ⚠️ 扫描范围**只限 `avm.*`**（`points()` 已按命名空间收窄）：第三方插桩的
+        `http.route` 里那个 `{task_id}` 是**路由模板**（常量），不是本服务的标签 ——
+        把它算进来会让这条门禁变成"看环境版本脸色"的假红，同时再也测不出真问题。
         """
         tid = self.post_ark()
         self.site.set("model.getModel", site_task(paid=True))
@@ -384,7 +402,14 @@ class TestJudgement(ChargedTaskCase):
         self.assertNotIn(tid, dumped, "任务 id 也不许作为标签值出现")
 
     def test_nothing_is_reported_when_logfire_is_down(self):
-        """Logfire 没装配 ⇒ 零指标（no-op），但**日志照打**（本地 stderr 仍看得见）。"""
+        """Logfire 没装配 ⇒ **本服务**零指标（no-op），但**日志照打**（本地 stderr 仍看得见）。
+
+        ⚠️ 判据是"`avm.*` 一条都没有"（`points()` 已按命名空间收窄），不是"整个 exporter 空"：
+        本用例是把 `O._LOGFIRE_READY` 翻成 False，而 `instrument_fastapi` 是**建 app 时就挂上**
+        的（`create_app` 里 `if logfire_ok`）⇒ 这里翻开关**撤不掉**那条第三方中间件，它会继续
+        发 `http.server.*`。生产里"logfire 关"= 根本没有那条中间件（`setup_observability` 早退），
+        所以这条断言的语义（本服务不上报）与生产一致。
+        """
         O._LOGFIRE_READY = False
         tid = self.post_ark()
         self.site.set("model.getModel", site_task(paid=True))
