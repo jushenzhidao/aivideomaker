@@ -217,6 +217,30 @@ class Settings:
     # （图 4 / 视频 1 / 音频 2）且串行转存，没有总闸就是"单项超时 × 项数"。
     # 2026-09-16 由 90 调到 120 = **图 4 × 单项 30s**（最常见的"多图带链接"档位）。
     media_rehost_budget: float = 120.0
+    # 提交**推进名额**（`AVM_SUBMIT_WORKERS`）。受理/推进分离之后，真正的提交（素材转存 →
+    # 抢上游槽位 → `ai.minimaxH3` create）跑在 daemon 后台线程里，这个数就是"同时在推进的
+    # 提交"上限；超出名额的提交在信号量上排队 —— **对调用方无感**（id 早已返回，状态仍是
+    # queued）。两条线（方舟 `/tasks` 与 OpenAI `/v1/videos`）**共用同一个池子**。
+    #
+    # 为什么是 32（此前是 app.py 里写死的 8）：
+    #   · 推进线程绝大部分时间阻塞在**上游闸门**上（每账号一把，premium 2 / pro 4），
+    #     并不产生额外的上游流量 ⇒ 名额偏小不会"少打上游"，只会让**上游槽位空转**；
+    #   · 透传线每份凭据 = 一个账号 = 一把闸门 ⇒ 号池有多少账号，就有多少份并行槽位。
+    #     2026-10-12 的生产号池实测 12 个账号 × 2 槽 = 24 ⇒ 8 会让近 2/3 的槽位闲着；
+    #   · 方舟线并入同一个池子后，两条线的推进需求叠加，8 更不够。
+    # 调到 1 可复现"串行提交"（排查时序用）；调大**没有副作用**（真正的限流在上游闸门，
+    # 这里多出来的线程只是更早地去排队）。
+    submit_workers: int = 32
+    # **只给测试与本地调试**：受理分离的"推进侧"改为**同步执行** —— POST 要等提交完成才返回，
+    # 与 2026-09 之前的行为同形。
+    # 存在的理由只有一个：让「参数映射 / 响应契约」这类功能门禁保持**确定性**（它们考的是
+    # 映射与证据，不是受理时序）。真实时序由 `tests/test_videos_async_accept.py` 在
+    # **异步模式**下逐条钉住。两条线的写回语义完全一致（成功补 taskId / 失败落 submit_error），
+    # 所以两条路被门禁覆盖的程度是一样的。
+    # 🔴 刻意**不**从环境变量读、也不登记 `.env.example`：这是个能改变**对外时序契约**的开关，
+    #    生产误开等于把"提交立即返回 id"这个特性静默关掉。要复现同步行为请走测试基座
+    #    （`tests/test_web_upstream.py` 的 `web_settings`）。
+    submit_inline: bool = False
     # 号池上报是否带**账号身份（邮箱）**。默认关：遥测里放 PII 要显式点头。
     account_report_identity: bool = False
     # ---- Turnstile token 铸造服务（见 tools/turnstile_service.py）----
@@ -324,6 +348,7 @@ class Settings:
             probe_timeout=float(env.get("AVM_PROBE_TIMEOUT") or 8),
             media_fetch_timeout=float(env.get("AVM_MEDIA_FETCH_TIMEOUT") or 30),
             media_rehost_budget=float(env.get("AVM_MEDIA_REHOST_BUDGET") or 120),
+            submit_workers=max(1, int(env.get("AVM_SUBMIT_WORKERS") or 32)),
             minter_url=(env.get("AVM_MINTER_URL") or "").strip(),
             minter_key=(env.get("AVM_MINTER_KEY") or "").strip(),
             minter_timeout=float(env.get("AVM_MINTER_TIMEOUT") or 25),

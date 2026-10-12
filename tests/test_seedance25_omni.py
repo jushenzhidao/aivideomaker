@@ -122,6 +122,9 @@ def settings(**kw) -> Settings:
         enable_logfire=False,
         trust_env=False,
         task_store="memory",  # 任务表落内存：单测不落盘、不互相污染
+        # 受理分离：本文件考的是参数映射与兼容门禁（含"不该被门禁拦下"的对照组，
+        # 而对照组断言的是 POST 上的 502）⇒ 必须同步推进，异步会把 502 变成 200。
+        submit_inline=True,
     )
     base.update(kw)
     return Settings(**base)

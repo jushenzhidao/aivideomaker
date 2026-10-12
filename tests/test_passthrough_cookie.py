@@ -31,14 +31,16 @@ from fastapi.testclient import TestClient  # noqa: E402
 from ark_compat import app as app_mod  # noqa: E402
 from ark_compat.app import TASKS_PATH, create_app  # noqa: E402
 from ark_compat.settings import Settings  # noqa: E402
-from ark_compat.upstreams import _build_web, build_web_for_cookie  # noqa: E402
+from ark_compat.upstreams import WebUpstream, _build_web, build_web_for_cookie  # noqa: E402
 from ark_compat.web_client import WebClient  # noqa: E402
+from ark_compat.web_queue import WebSubmitQueue  # noqa: E402
 
 # 已知上游槽位（`model` 参与路由，未命中 ⇒ 400）；本模块只关心凭据透传。
 ARK_MODEL = "minimaxH3"
 DEAD_UPSTREAM = "http://127.0.0.1:9"
 TOKEN_A = "a" * 40
 TOKEN_B = "b" * 40
+TOKEN_C = "c" * 40  # 第三个凭据：用来触发下一次 sweep（缓存里已有的 key 不触发淘汰）
 COOKIE_A = f"auth_session={TOKEN_A}"
 
 
@@ -50,6 +52,9 @@ def settings(**kw) -> Settings:
         enable_logfire=False,
         trust_env=False,
         task_store="memory",
+        # 受理分离：本文件考的是凭据透传 / 租户隔离 / 淘汰判据，**不是受理时序** ⇒
+        # 同步推进，避免断言撞上"提交还在后台跑"。真实异步时序见 test_videos_async_accept。
+        submit_inline=True,
     )
     base.update(kw)
     return Settings(**base)
@@ -97,6 +102,28 @@ class FakeWebUpstream:
         self.client = FakeClient()
         self.queue = FakeQueue(running=running)
         self.created = []
+        self._in_flight = 0
+
+    # ---- 在飞提交记账（与 `WebUpstream` 同一套契约）--------------------------
+    # 🔴 这三个成员**不是可选装饰**：受理路径（`app._submit_ark`）无条件调用
+    #    `begin_submit()`，缺了它替身会直接 AttributeError —— 替身必须履行它触碰到的契约。
+    # ⚠️ 但 in-flight 的**语义**不由替身证明（那要用真 `WebUpstream`，见
+    #    `TestEvictionOfInFlightSubmits`）；这里只是让替身能跑通受理路径。
+
+    def begin_submit(self) -> None:
+        self._in_flight += 1
+
+    def end_submit(self) -> None:
+        self._in_flight = max(0, self._in_flight - 1)
+
+    @property
+    def in_flight(self) -> int:
+        return self._in_flight
+
+    @property
+    def idle(self) -> bool:
+        """淘汰判据（与 `WebUpstream.idle` 同义，`app._sweep` 只认它）。"""
+        return self._in_flight == 0 and not self.queue.stats()["running"]
 
     def create(self, plan) -> str:
         self.created.append(plan)
@@ -348,6 +375,74 @@ class TestEviction(unittest.TestCase):
         self._hit(client, TOKEN_B)
         self.assertEqual(len(app.state.passthrough_web), 1)
         self.assertEqual(builder.upstreams[0].client.closed, 1)
+
+
+class TestEvictionOfInFlightSubmits(unittest.TestCase):
+    """🔴 受理分离引入的新窗口：**已受理、提交还没写完记录**的账号不许被淘汰。
+
+    为什么单独立一组：`app._sweep` 判空闲原先只看"闸门里有没有在跑的任务"，而受理分离之后，
+    任务在"拿到 id → 提交写完记录"这一段**既不在** `queue.running`、**也不在任何计数里**
+    ⇒ 该账号被判空闲 ⇒ 淘汰 + `client.close()` ⇒ 后台线程拿着**已关闭的 client** 提交
+    ⇒ 提交失败。多账号透传下"缓存新建"就是"触发 sweep"，于是现象是**偶发提交失败**，
+    而记录里只会留一句 client closed —— 溯源时根本指不回淘汰逻辑。
+
+    必须用**真** `WebUpstream`：in-flight 记账与 `idle` 判据是它的属性，替身版本测不到。
+    """
+
+    def _app(self, limit: int):
+        made: list = []
+
+        def builder(settings_, cookie, log=None):
+            up = WebUpstream(FakeClient(), WebSubmitQueue(FakeClient(), max_concurrent=2))
+            made.append(up)
+            return up
+
+        patch = mock.patch.object(app_mod, "build_web_for_cookie", builder)
+        patch.start()
+        self.addCleanup(patch.stop)
+        limit_patch = mock.patch.object(app_mod, "_PASSTHROUGH_WEB_CACHE_MAX", limit)
+        limit_patch.start()
+        self.addCleanup(limit_patch.stop)
+        return create_app(settings()), made
+
+    def _hit(self, client, token):
+        client.post(
+            TASKS_PATH, json=body(extra_body={"aivideomaker_dry_run": True}), headers=auth(token)
+        )
+
+    def test_an_in_flight_submit_keeps_the_upstream_alive(self):
+        app, made = self._app(1)
+        client = TestClient(app)
+        self._hit(client, TOKEN_A)
+        made[0].begin_submit()  # 受理了一条：后台提交还没写完记录
+        try:
+            self._hit(client, TOKEN_B)
+            self.assertEqual(
+                len(app.state.passthrough_web), 2, "在飞提交的账号不许被淘汰"
+            )
+            self.assertEqual(made[0].client.closed, 0, "它正握着这个 client 在提交")
+        finally:
+            made[0].end_submit()
+        # 收尾之后必须回到"可淘汰" —— 否则它会**永久**占着缓存（漏一次 end_submit 就是这后果）
+        self._hit(client, TOKEN_C)
+        self.assertEqual(len(app.state.passthrough_web), 1)
+        self.assertEqual(made[0].client.closed, 1)
+
+    def test_a_plain_idle_upstream_is_still_evicted(self):
+        """对照：没有在飞提交时照旧可淘汰（别把 idle 做成恒 False，那会让缓存只涨不落）。"""
+        app, made = self._app(1)
+        client = TestClient(app)
+        self._hit(client, TOKEN_A)
+        self._hit(client, TOKEN_B)
+        self.assertEqual(len(app.state.passthrough_web), 1)
+        self.assertEqual(made[0].client.closed, 1)
+
+    def test_end_submit_never_goes_negative(self):
+        """多注销一次不许把计数做成负数 —— 那会让 `idle` 恒 False，该上游**再也不会**被淘汰。"""
+        up = WebUpstream(FakeClient(), WebSubmitQueue(FakeClient(), max_concurrent=2))
+        up.end_submit()
+        self.assertEqual(up.in_flight, 0)
+        self.assertTrue(up.idle, "计数被减成负数 ⇒ idle 恒 False ⇒ 缓存只涨不落")
 
 
 class TestCredentialPlumbing(unittest.TestCase):

@@ -10,6 +10,9 @@
     balance() -> int | None      余额
     health() -> dict             /healthz 用
 
+另有两个**受理分离专用**的记账方法（`begin_submit` / `end_submit`）与派生属性
+`idle` —— 它们回答的是"这个上游此刻能不能被安全关掉"，见 `idle` 的说明。
+
 （**没有** cancel/delete：站点没有取消端点，"删本地记录"只会制造任务已消失的
 错觉 —— 对外接口面刻意只有创建 + 查询，记录随保留窗口自然淘汰。）
 
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import base64
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from typing import Any, Callable
@@ -67,6 +71,10 @@ class WebUpstream:
         # 整个转存阶段的总预算（秒）。见 `MediaFetchBudget`：没有它，最多 7 个媒体项
         # 串行转存的最坏耗时会把调用方的超时甩在后面，而我们还接着把任务提交出去。
         self.media_rehost_budget = max(1.0, float(media_rehost_budget))
+        # 「已受理、提交还没写完记录」的条数（受理分离配套）。**必须**与本类的
+        # `idle` 判据同锁读写，否则淘汰侧会读到撕裂的中间态。
+        self._in_flight = 0
+        self._in_flight_lock = threading.Lock()
 
     def create(self, plan: dict) -> str:
         budget = MediaFetchBudget(self.media_rehost_budget)
@@ -136,6 +144,53 @@ class WebUpstream:
             return self.client.upload_file(value, budget=budget)["publicUrl"]
         return value
 
+    # ---- 在飞提交记账（受理分离配套）--------------------------------------
+
+    def begin_submit(self) -> None:
+        """受理侧登记：这条任务**已经拿到 id**、提交压后做 —— 从此刻起本上游不算空闲。
+
+        必须**先于**任务落库调用（见 `app._submit_ark`）：落库与调度之间即使只有毫秒级
+        窗口，淘汰侧也可能恰好在那时扫到"running 为空"。
+        """
+        with self._in_flight_lock:
+            self._in_flight += 1
+
+    def end_submit(self) -> None:
+        """推进侧注销：无论提交成功、失败、还是线程被掐断，都必须调用一次。
+
+        用 `max(0, …)` 兜底而不是直接自减：多减一次会让计数**变负**并永久骗过 `idle`
+        （那个上游从此再也不会被淘汰，只会占着内存与 socket）。
+        """
+        with self._in_flight_lock:
+            self._in_flight = max(0, self._in_flight - 1)
+
+    @property
+    def in_flight(self) -> int:
+        with self._in_flight_lock:
+            return self._in_flight
+
+    @property
+    def idle(self) -> bool:
+        """这个上游此刻**能不能被安全关掉**（透传缓存的淘汰判据，唯一定义处）。
+
+        两个条件同时成立才算空闲：
+
+          ① 闸门里没有正在跑的任务（`queue.stats()["running"]`）—— 关掉正在被轮询的
+             client 会让那次轮询失败（现象是"任务查不到"，见 `app._sweep`）；
+          ② **没有在飞提交**（`in_flight`）—— 这是受理分离带来的**新窗口**：任务已受理
+             （上行请求早已返回 id），但提交还压在后台线程里（转存 / 抢槽位 / create）。
+             那个线程**正握着这个 client**，此时 `client.close()` 会让提交直接炸
+             （httpx 对已关闭客户端的请求即抛错）。
+
+        ② 是 2026-10-12 补的：此前只判 ①，于是在**多账号透传**下，A 账号的提交正在后台跑、
+        缓存又恰好满、B 账号来建新客户端 ⇒ A 被误判空闲并关掉 ⇒ 那种"偶发提交失败"
+        查起来毫无头绪（记录里只有一句 client closed，指向不了淘汰逻辑）。
+        """
+        with self._in_flight_lock:
+            if self._in_flight:
+                return False
+        return not self.queue.stats()["running"]
+
     def get_task(self, task_id: str) -> dict:
         return normalize_web_task(self.client.get_task(task_id))
 
@@ -147,6 +202,9 @@ class WebUpstream:
             "upstream": self.kind,
             "base_url": self.client.base_url,
             "submit_queue": self.queue.stats(),
+            # 受理分离：已受理但提交尚未写完记录的条数。它与 submit_queue.running
+            # **相加**才是"这个上游此刻真正占用的任务数"（淘汰判据 `idle` 认的也是这两者）。
+            "pending_submits": self.in_flight,
         }
         try:
             info["balance"] = self.balance()

@@ -55,6 +55,10 @@ def settings(**kw) -> Settings:
         enable_logfire=False,
         trust_env=False,
         task_store="memory",
+        # 受理分离：本文件考的是凭据绑定 / 租户隔离 / 视图缓存，**不是受理时序** ⇒
+        # 走同步推进（`submit_inline`），否则"POST 返回时 taskId 还在路上"会让断言随机红。
+        # 真实异步时序由 tests/test_videos_async_accept.py 覆盖。
+        submit_inline=True,
     )
     base.update(kw)
     return Settings(**base)
@@ -90,14 +94,34 @@ class FakeClient:
 
 
 class CountingUpstream:
-    """替身上游：记录 create/get_task 调用次数，get_task 的视图可随时改写。"""
+    """替手上游：记录 create/get_task 调用次数，get_task 的视图可随时改写。"""
 
     kind = "web"
+
+    def begin_submit(self) -> None:
+        self._in_flight += 1
+
+    def end_submit(self) -> None:
+        self._in_flight = max(0, self._in_flight - 1)
+
+    @property
+    def in_flight(self) -> int:
+        return self._in_flight
+
+    @property
+    def idle(self) -> bool:
+        """淘汰判据（与 `WebUpstream.idle` 同义，`app._sweep` 只认它）。
+
+        in-flight 的**语义**由 `test_passthrough_cookie.TestEvictionOfInFlightSubmits`
+        （真 WebUpstream + 假 client）覆盖；这里只保证替身能跑通受理路径。
+        """
+        return self._in_flight == 0 and not self.queue.stats()["running"]
 
     def __init__(self, cookie: str):
         self.cookie = cookie
         self.client = FakeClient()
         self.queue = FakeQueue()
+        self._in_flight = 0
         self.created: list[dict] = []
         self.fetches = 0
         # 初始视图：非终态（running）。测试里按需改写 status。

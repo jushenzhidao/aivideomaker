@@ -420,11 +420,12 @@ def _close_upstream(up: object) -> None:
 def _sweep(cache: dict, limit: int) -> None:
     """缓存到顶时淘汰**空闲**项，直到 `len(cache) < limit`（全忙则不淘汰）。
 
-    web 上游的槽位被**后台轮询线程**占到任务终态，关掉正在被轮询的客户端会让那次
-    轮询直接失败（现象是"任务查不到"）⇒ 只淘汰空闲的。
+    「空闲」的唯一定义在 `WebUpstream.idle`（**别在这里另写一份判据**）——
+    它同时认「闸门里没有在跑的任务」与「没有在飞提交」，后者是受理分离带来的新窗口：
+    提交压在后台线程里的那条任务，此刻正握着这个 client，关掉它提交就会直接失败。
     """
     while len(cache) >= limit:
-        key = next((k for k, v in cache.items() if not v.queue.stats()["running"]), None)
+        key = next((k for k, v in cache.items() if v.idle), None)
         if key is None:
             logger.warning(
                 "透传上游缓存已满（{} 条）且没有空闲项可淘汰 —— 暂不淘汰，等任务结束", len(cache)
@@ -443,23 +444,40 @@ _TERMINAL_ARK_STATUS = frozenset({"succeeded", "failed", "cancelled"})
 #: 记录、不是请求，入口信息**只能**在创建时落下，事后无从推断。
 _OPENAI_SHAPE = "openai"
 
-#: **受理/推进分离**（2026-09-20 用户拍板「1 2试试 目前只针对/v1/videos」）：
-#: `POST /v1/videos` 毫秒级返回 id（`status=queued`），素材转存/取 token/上游提交在
-#: 后台线程完成 —— 客户端不再同步等"等槽位（最坏 600s）+ 转存（最坏 120s）+ 现场铸 token"。
-#: ⚠️ 只作用于 OpenAI 兼容面：方舟线 `/tasks` 保持同步（调用方按旧契约等待受理结果，
-#: 失败也当场拿到）。
+#: **受理/推进分离**（两条线共用。OpenAI 面 2026-09-20 落地；方舟线 2026-10-12 并入，
+#: 用户口径：「优化 minimax 服务，支持后端排队【提交立即返回任务 id】」）：
+#: `POST` **毫秒级返回 id**，素材转存 / 取 token / 抢上游槽位 / `create` 全在 daemon 后台
+#: 线程完成 —— 客户端不再同步等"转存（最坏 120s）+ 等槽位（最坏 600s）+ 现场铸 token（2~45s）"。
+#:
+#: 两条线共用同一条管线，只在**外壳**上不同：
+#:   · `/v1/videos` ⇒ `{id, object, status:"queued", created_at}`（Chatfire 四字段契约）；
+#:   · 方舟 `/tasks`  ⇒ `{"id"}` —— **形状与受理分离之前逐字一致**（这个端点的调用方是官方
+#:     SDK 与直连客户，契约一个键都不能动）；变的只是"返回时上游受理**可能**还没完成"。
+#:
+#: 🔴 **失败语义（两条线一致）**：上游侧失败（闸门 / 队列 / 站点 5xx / 转存超预算）**不再在
+#: POST 上报错**，而是把记录转 `failed` —— 调用方按各自契约轮询即可看到终态。前置校验
+#: （鉴权 / 参数 / 渠道配置 / 能力 / dry-run）仍在本请求内**同步**返回，不受影响。
+#: ⚠️ 对方舟线这是**对外契约变更**：此前 POST 返回时"上游受理已成功/失败当场可知"。
 #:
 #: 提交**租约**：后台线程最坏要 转存 120s + 等槽位 600s + 现场铸 token 45s + 若干 RTT ≈ 800s，
 #: 租约取 1200s —— 超过它仍没有 `taskId`，就判定提交线程已死（进程重启/崩溃）并把记录
 #: 标成 `failed`，否则客户端会**永远** queued。判定挂在轮询路径上（顺带做），不需要清扫线程。
 _SUBMIT_LEASE_SECONDS = 1200.0
 
-#: 后台提交的**并发推进上限**。线程大部分时间阻塞在**上游**并发闸门上（每账号一把，2/4 槽）；
-#: 8 个并发推进足够覆盖多账号透传，超出的在本信号量上排队 —— 对调用方无感（id 早已返回，
-#: 状态仍是 queued）。⚠️ 用 **daemon 线程**而不是 ThreadPoolExecutor：后者在进程退出时
-# 会 join 在飞线程（最坏等满一次 600s 的槽位等待），daemon 线程随进程立即消失，
-# 没提交完的记录交给上面的租约判定标 failed。
-_SUBMIT_WORKERS = 8
+#: 提交失败时对外给的**错误码**（方舟线查询的 `error.code`）。自造白名单值 ——
+#: 上游原文 code 一律不透传（见 errors.py 的 code 纪律），这里是"我们的"归纳。
+SUBMISSION_FAILED_CODE = "SubmissionFailed"
+#: 提交失败时对外给的**脱敏通用句**（与 `_upstream_client_message` 同一条纪律）。
+#: 完整归因留在记录的 `submit_error` 里（日志 / span 可查）。
+SUBMISSION_FAILED_MESSAGE = "the task could not be submitted to the upstream"
+
+#: 并发推进名额的**默认值**。运行时取 `settings.submit_workers`（`AVM_SUBMIT_WORKERS`）——
+#: 两条线**共用一个池子**。取值依据与"为什么是 32"见 `settings.submit_workers` 的注释。
+#: 保留这个常量只为给测试与文档一个稳定的默认锚点（别再在代码里硬编码它）。
+#: ⚠️ 用 **daemon 线程**而不是 ThreadPoolExecutor：后者在进程退出时会 join 在飞线程
+#: （最坏等满一次 600s 的槽位等待），daemon 线程随进程立即消失，没提交完的记录交给上面的
+#: 租约判定标 failed。
+DEFAULT_SUBMIT_WORKERS = 32
 
 
 class TaskViewCache:
@@ -1050,10 +1068,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.task_cache = TaskViewCache(settings.task_cache_ttl)
     # 轮询上报闸门：同一任务**只有状态跃迁（含首次观测、失败）才留 span**
     app.state.poll_gate = PollReportGate()
-    # /v1/videos 受理分离的**推进侧**并发上限（daemon 线程，理由见 _SUBMIT_WORKERS）：
-    # 放在 create_app 里而不是 lifespan —— 测试用 `TestClient(app)` 不进 lifespan，
-    # 而提交调度必须**无条件可用**（缺它 = 那条面的创建直接坏）。
-    app.state.submit_slots = threading.BoundedSemaphore(_SUBMIT_WORKERS)
+    # 受理分离的**推进侧**并发上限（daemon 线程，**两条线共用**一个池子；取值依据见
+    # settings.submit_workers）：放在 create_app 里而不是 lifespan —— 测试用
+    # `TestClient(app)` 不进 lifespan，而提交调度必须**无条件可用**（缺它 = 两条线的创建
+    # 直接坏）。BoundedSemaphore ⇒ 多还一次会当场抛错，而不是把名额悄悄放大。
+    app.state.submit_slots = threading.BoundedSemaphore(max(1, settings.submit_workers))
+    # 受理分离的**同步推进**开关（仅测试/调试，见 settings.submit_inline 的说明）。
+    # 从 settings 初始化（而不是只在测试里手改 state）—— 于是"测试基座传一个参数"就够，
+    # 不必每个用例都记得改 state，也就不会有用例漏改而变成时序不确定的假绿。
+    app.state.submit_inline = bool(settings.submit_inline)
     # ---- 成片对外出口（见 media_proxy）----
     # 上游直链里带着上游域名与**上游实际执行的模型名**，响应头 `content-disposition`
     # 里还重复一份模型名。配上 `AVM_PUBLIC_BASE` 后对外只给 `{base}/v/{ark_id}.mp4`，
@@ -1238,12 +1261,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> str:
         """真正把任务提交到上游（**阻塞**），证据挂在 `ark.create.submit` 上。
 
-        两条调用方（2026-09-20 受理分离后）：
-          · 方舟线 —— `await asyncio.to_thread(...)`：客户端是同步 httpx，别阻塞事件循环；
-          · `/v1/videos` —— **后台线程**直接调（它本来就不在事件循环里）。
-        抽成同步函数是受理分离的硬要求：后台线程里没有事件循环可依托。
+        调用方现在**只有一条**：受理分离之后的 daemon 后台线程（两条线共用
+        `_schedule_submit`）。抽成**同步**函数正是受理分离的硬要求 —— 后台线程里没有
+        事件循环可依托，而客户端是同步 httpx（并发闸门还可能阻塞数十秒）。
         `async_accept=True` 时本函数运行在 daemon 线程里，失败**不抛给调用方**
-        （响应早已返回），由调度方写回记录（见 `_schedule_videos_submit`）。
+        （响应早已返回），由调度方写回记录（见 `_schedule_submit`）。
         """
         with upstream_exchanges() as calls, span(
             "ark.create.submit",
@@ -1295,7 +1317,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise ArkError(400, "InvalidParameter", "upstream accepted nothing (no taskId returned)")
         return task_id
 
-    def _schedule_videos_submit(
+    def _schedule_submit(
         entry: dict,
         upstream,
         plan: dict,
@@ -1304,24 +1326,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         body: dict,
         request: Request,
     ) -> None:
-        """受理分离的**推进侧**：把真正的提交挪到 daemon 后台线程（仅 `/v1/videos`）。
+        """受理分离的**推进侧**：把真正的提交挪到 daemon 后台线程（两条线共用）。
 
         · `copy_context()`：让 `ark.create.submit` 这条 span 仍挂在受理请求的 trace 上
-        （否则它是无父级的孤儿，只能靠 ark_id 属性反查）。
-        · 信号量限并发推进（`_SUBMIT_WORKERS`），**在线程里**取 —— 受理路径绝不阻塞。
+          （否则它是无父级的孤儿，只能靠 ark_id 属性反查）。
+        · 信号量限并发推进（`settings.submit_workers` / `AVM_SUBMIT_WORKERS`，两条线
+          **共用一个池子**），**在线程里**取 —— 受理路径绝不阻塞。
         · 结局只有两种，都必须写回记录（否则客户端对着 queued 等到天荒地老）：
             成功 ⇒ patch(taskId=…)；失败 ⇒ patch(submit_error=…) —— 轮询路径据此
-            给 `failed`（OpenAI 契约的合法终态），原因本体留在日志与 span 里。
+            给 `failed`（两条契约里都是合法终态），原因本体留在日志与 span 里。
         """
         entry_id = entry["id"]
         slots = request.app.state.submit_slots
 
-        # 测试/调试开关：**同步推进**（与方舟线同形）。既有"参数映射 / 响应契约"类门禁
-        # 用它保持确定性 —— 它们考的是映射与证据，不是受理时序；受理分离的时序
-        # 由 tests/test_videos_async_accept.py 在**真实异步模式**下钉住。
-        # ⚠️ 写回语义与后台路径完全一致（成功 patch taskId / 失败 patch submit_error），
-        #    所以两条路被门禁覆盖的程度是一样的。
+        # 测试/调试开关：**同步推进**（退回受理分离之前的行为）。既有"参数映射 / 响应契约"
+        # 类门禁用它保持确定性 —— 它们考的是映射与证据，不是受理时序；受理分离的时序由
+        # tests/test_videos_async_accept.py 在**真实异步模式**下（两条线各一组）钉住。
+        #
+        # 🔴 失败语义**按面**还原 —— 两条线"受理分离之前"的样子本来就不同，用一个口径
+        #    会覆盖掉其中一个面的旧契约（2026-10-12 实测：把异常一律吞掉之后，错误脱敏 /
+        #    转存预算 / span 契约三组门禁当场全红，因为它们断言的正是"POST 当场报错"）：
+        #      · 方舟线：异常**抛给调用方**（旧契约 = 上游受理结果在 POST 上当场可知）；
+        #      · OpenAI 面：只写回 submit_error、POST 照常 200 —— 与它的真异步路径**完全
+        #        同形**（那条契约本就是"受理即返回"）⇒ 它的门禁一个字节都不用改。
+        # ⚠️ 真异步路径（生产）对两条线统一是"POST 200 + 轮询见 failed"，不受这里影响。
         if getattr(request.app.state, "submit_inline", False):
+            is_ark_line = entry.get("response_shape") != _OPENAI_SHAPE
             try:
                 task_id = _submit_with_evidence(
                     upstream, plan, ark_id=entry["id"], eff=eff, warns=warns,
@@ -1329,7 +1359,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             except BaseException as e:  # noqa: BLE001 与后台路径同一份写回
                 request.app.state.tasks.patch(entry["id"], submit_error=describe_error(e))
+                if is_ark_line:
+                    # 方舟线：还原旧契约 —— 让调用方在 POST 上当场看到
+                    raise
                 return
+            finally:
+                # 与后台路径同一份注销纪律：成功、失败、异常都必须还回名额与在飞计数
+                upstream.end_submit()
             request.app.state.tasks.patch(entry["id"], taskId=task_id)
             return
 
@@ -1345,6 +1381,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 logger.error("后台提交失败 ark_id={} — {}", entry_id, err)
                 request.app.state.tasks.patch(entry_id, submit_error=err)
                 return
+            finally:
+                # 🔴 契约：`_submit_ark` 里 `begin_submit()` 记账，这里（两条路径各自）
+                #    注销。**任何**退出路径都要走到 —— 漏一次就等于把这个上游永久钉住：
+                #    它再也不会被淘汰，只会白占内存与 socket。
+                upstream.end_submit()
             request.app.state.tasks.patch(entry_id, taskId=task_id)
             logger.info("后台提交完成 ark_id={} upstream_task={}", entry_id, task_id)
 
@@ -1433,58 +1474,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         ark_id = _new_ark_id()
 
-        if response_shape == _OPENAI_SHAPE:
-            # 🔴 **受理/推进分离**（仅本面，2026-09-20 用户拍板）：先把记录落库并**立即返回**
-            #    id（status=queued），转存/取 token/上游提交挪到后台线程 —— 客户端不再同步等
-            #    "等槽位（最坏 600s）+ 转存（最坏 120s）+ 现场铸 token（2~45s）"。
-            #    ⚠️ 顺序：**先 put 再调度** —— 否则 GET 会在记录存在前打到 404。
-            #    ⚠️ 有意的行为变更：上游侧失败（闸门/队列/站点 5xx）**不再在 POST 上报错**，
-            #       而是记录转 `failed` —— Chatfire 契约本就要求调用方轮询，failed 是合法终态；
-            #       前置校验（鉴权/参数/渠道配置/能力）仍在本请求内同步 400，不受影响。
-            entry = {
-                "id": ark_id,
-                # ⚠️ 此时**还没有** taskId：轮询路径据此走"未提交"分支（绝不拿空 id 打上游）
-                "upstream": upstream.kind,
-                # 归属（凭据指纹）：透传模式下 GET 要靠它做租户隔离
-                "owner": _owner_of(request),
-                "model": plan["requested"]["model"],
-                "requested": plan["requested"],
-                "effective": eff,
-                "warnings": warns,
-                "unsupported": plan["unsupported"],
-                "response_shape": response_shape,
-                "createdAtMs": int(time.time() * 1000),
-                # 提交租约起点（见 _SUBMIT_LEASE_SECONDS）：由轮询路径判定"提交线程已死"
-                "submit_started_at_ms": int(time.time() * 1000),
-            }
-            # 凭据绑定（E2E-AVM-011）在**受理时**就落库：后台线程提交、轮询路径都按它解析
-            request.app.state.tasks.put(entry, credential=credential)
-            _schedule_videos_submit(entry, upstream, plan, eff, warns, body, request)
-            logger.info(
-                "已受理（后台提交中）ark_id={} upstream={} billed={}",
-                entry["id"],
-                upstream.kind,
-                eff["billed"],
-            )
-            # Chatfire 创建响应契约：恰好四个字段。id 形态本就是 `cgt-*`，与示例一致。
-            return {
-                "id": entry["id"],
-                "object": "video",
-                "status": "queued",
-                "created_at": int(entry["createdAtMs"]) // 1000,
-            }
-
-        # 方舟线：**同步**受理（旧契约 —— POST 返回时上游受理已成功/失败当场可知）
-        task_id = await asyncio.to_thread(
-            _submit_with_evidence,
-            upstream, plan, ark_id, eff, warns, body, request,
-        )
-
+        # 🔴 **受理/推进分离**（两条线共用）：先把记录落库并**立即返回** id，转存 / 取 token /
+        #    抢槽位 / 上游提交挪到后台线程。此前两条线的差别是方舟线**同步**受理 —— 它的
+        #    POST 要等完"转存（最坏 120s）+ 等槽位（最坏 600s）+ 现场铸 token"，实测最坏形态是
+        #    调用方 290s 拿不到响应、请求在网关侧积压数小时（2026-09-22 现场）。
+        #    ⚠️ 顺序：**先 put 再调度** —— 否则 GET 会在记录存在前打到 404。
+        #    ⚠️ 有意的行为变更（两条线）：上游侧失败**不再在 POST 上报错**，而是记录转
+        #       `failed`，由调用方轮询看到终态；前置校验仍在本请求内同步返回，不受影响。
         entry = {
             "id": ark_id,
-            "taskId": task_id,
+            # ⚠️ 此时**还没有** taskId：轮询路径据此走"未提交"分支（绝不拿空 id 打上游）
             "upstream": upstream.kind,
-            # 归属（凭据指纹）：透传模式下 GET /tasks 要靠它做租户隔离
+            # 归属（凭据指纹）：透传模式下 GET 要靠它做租户隔离
             "owner": _owner_of(request),
             "model": plan["requested"]["model"],
             "requested": plan["requested"],
@@ -1498,18 +1499,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             #    OpenAI 线"处理（不猜），代价是老任务不参与那条上报。
             "response_shape": response_shape,
             "createdAtMs": int(time.time() * 1000),
+            # 提交租约起点（见 _SUBMIT_LEASE_SECONDS）：由轮询路径判定"提交线程已死"
+            "submit_started_at_ms": int(time.time() * 1000),
         }
-        # 凭据绑定（E2E-AVM-011）：task_id ↔ api-key（透传下即 newapi 传来的会话凭据）。
-        # 之后 GET /tasks/{id} 不带凭据也按这条绑定解析上游凭据 —— 轮询方不必再持 cookie。
-        # 原文只进 sqlite（0600），绝不进日志 / span / 响应体。
-        request.app.state.tasks.put(entry, credential=credential)
+        # 🔴 受理即登记「在飞」：从这一刻到提交写完记录为止，这个上游**不许被淘汰**
+        #    （透传缓存会关掉空闲 client，而关掉一个正在提交的 client = 提交直接失败）。
+        #    必须**先于** put：落库与调度之间哪怕只有毫秒级窗口，淘汰侧也可能正好扫到。
+        #    结束侧在 `_schedule_submit`（两条路径的 finally 各注销一次，见那里的契约）。
+        upstream.begin_submit()
+        try:
+            # 凭据绑定（E2E-AVM-011）在**受理时**就落库：后台线程提交、轮询路径都按它解析
+            request.app.state.tasks.put(entry, credential=credential)
+        except BaseException:
+            # 落库都没成功 ⇒ 不会有后台线程去注销，必须在这里还回去
+            upstream.end_submit()
+            raise
+        _schedule_submit(entry, upstream, plan, eff, warns, body, request)
         logger.info(
-            "已提交 ark_id={} upstream={} upstream_task={} billed={}",
+            "已受理（后台提交中）ark_id={} upstream={} shape={} billed={}",
             entry["id"],
             upstream.kind,
-            task_id,
+            response_shape,
             eff["billed"],
         )
+        if response_shape == _OPENAI_SHAPE:
+            # Chatfire 创建响应契约：恰好四个字段。id 形态本就是 `cgt-*`，与示例一致。
+            return {
+                "id": entry["id"],
+                "object": "video",
+                "status": "queued",
+                "created_at": int(entry["createdAtMs"]) // 1000,
+            }
+        # 方舟线：**形状不变**（只有一个 id）—— 官方 SDK / 直连客户的原解析代码照旧可用；
+        # 变的只是"返回时上游受理可能还没完成"，失败由轮询的 `status=failed` 体现。
         return {"id": entry["id"]}
 
     @app.post(TASKS_PATH)
@@ -1713,7 +1735,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         对外的那个地址由 `_task_view` 换；`/v/{ark_id}.mp4` 下载端点则直接用它回源。
         """
         ark_id = entry["id"]
-        # 🔴 **受理分离的窗口期 / 提交失败**（`/v1/videos`，2026-09-20）：记录还没有
+        # 🔴 **受理分离的窗口期 / 提交失败**（两条线共用；方舟线 2026-10-12 并入）：记录还没有
         #    `taskId` ⇒ **绝不**打上游 —— 空 taskId 打上游只会拿回错误空壳，还会被
         #    轮询闸门当成状态跃迁凭空留痕。两种情形都对外可读：
         #      · 还没提交完 ⇒ `queued`（OpenAI 语义里本就是"已受理未开始"）；
@@ -1753,9 +1775,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             stub = {"status": status}
             if err:
                 # 🔴 对外只给**脱敏的通用句**（与 `_upstream_client_message` 同一纪律）；
-                #    完整归因在 submit_error（日志/span）。且 `openai_task_view` 的六字段
-                #    契约根本不带 error —— 这句只服务方舟线 `/tasks` 的查询。
-                stub["error"] = "the task could not be submitted to the upstream"
+                #    完整归因在 submit_error（日志/span）。
+                # ⚠️ **必须是对象**：方舟官方 schema 里 `error` 是 `{code, message}`，而
+                #    `ark_task_view` 对**非 Mapping** 的值会直接丢成 `null`。此前这里给的是
+                #    裸字符串 ⇒ "提交失败"在方舟线查询里只剩 `status=failed`、一句原因都没有
+                #    （受理分离推广到方舟线后这条路径的流量大涨，故一并修正）。
+                #    `code` 走**自造白名单**（上游原文 code 一律不透传，见 errors.py）；
+                #    `openai_task_view` 的六字段契约不带 error ⇒ 这句只服务方舟线的查询。
+                stub["error"] = {
+                    "code": SUBMISSION_FAILED_CODE,
+                    "message": SUBMISSION_FAILED_MESSAGE,
+                }
             return _with_internal_evidence(stub, entry)
         # 先看节流缓存：非终态 TTL 内复用、终态永久复用 —— 轮询的请求量不能
         # 原样打到上游（429 的主要来源，任务出片要 ~60s）。

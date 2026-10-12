@@ -566,6 +566,13 @@ def web_settings(**kw) -> Settings:
         enable_logfire=False,
         trust_env=False,
         task_store="memory",  # 任务表落内存：单测不落盘、不互相污染
+        # 受理分离：测试基座一律走**同步推进**（`submit_inline`）—— 本目录绝大多数门禁
+        # 考的是参数映射 / 响应契约 / 计费口径 / 证据，不是受理时序；真异步会让
+        # "POST 返回时 taskId 还在路上"变成随机结果，把功能门禁变成时序彩票。
+        # ⚠️ 时序本身**并没有失去覆盖**：`tests/test_videos_async_accept.py` 显式传
+        #    `submit_inline=False`，在真实异步模式下逐条钉住两条线的受理/推进分离。
+        #    ⇒ 改这里之前先看那个文件，别把时序门禁的唯一锚点一起关掉。
+        submit_inline=True,
     )
     base.update(kw)
     return Settings(**base)

@@ -146,10 +146,10 @@ credential 管**上游解析**，两者用途不同、互不替代。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/v3/contents/generations/tasks` | 创建任务（透传下把凭据绑定到这条任务上） |
+| POST | `/api/v3/contents/generations/tasks` | 创建任务（**立即返回 `{"id"}`**，真正的提交在后台线程；透传下把凭据绑定到这条任务上） |
 | GET | `/api/v3/contents/generations/tasks` | 列表（**仅本凭据创建过的**；透传下必须带凭据，否则 401） |
 | GET | `/api/v3/contents/generations/tasks/{id}` | 查询（实时回上游取；透传下**可不带凭据**，按创建时绑定的凭据取；TTL 缓存节流见下） |
-| POST | `/v1/videos` | 创建任务（**OpenAI v1/videos 形状**，见下节） |
+| POST | `/v1/videos` | 创建任务（**OpenAI v1/videos 形状**，立即返回 `queued`；见下节） |
 | GET | `/v1/videos/{id}` | 查询（OpenAI v1/videos 形状） |
 | GET | `{AVM_PUBLIC_PATH}/{name}` | **成片下载出口**（默认 `/v/{ark_id}.mp4`，见下节）。未配置 `AVM_PUBLIC_BASE` 时**不存在** |
 | GET | `/healthz` | 存活 + 上游可用性与计费口径；`?deep=1` 额外查上游 |
@@ -172,6 +172,12 @@ credential 管**上游解析**，两者用途不同、互不替代。
 - **没有值就不给键**，唯一例外是 `error`（官方规定成功时显式返回 `null`，那是**确定**的
   信息，不是"不知道"）。任务还在跑时，响应可能就只有 `{"status": "queued", "error": null}`
   —— 那是**正确**的，不是字段漏了。
+- 🔴 **提交失败**（受理分离之后才有的一种终态）：`status` 为 `failed`，`error` 是**对象**
+  `{"code": "SubmissionFailed", "message": "<脱敏通用句>"}` —— `code` 是我们的**自造白名单**
+  （上游原文 code 一律不透传，见 `errors.py`），`message` 与 `_upstream_client_message` 同一条
+  脱敏纪律；**完整归因只在日志与 span**（记录的 `submit_error`）。
+  ⚠️ 早先这里给的是**裸字符串**，会被出口白名单（`ark_task_view` 对非 Mapping 的值）丢成
+  `null` ⇒ "提交失败"只剩 `status=failed`、一句原因都没有；2026-10-12 随方舟线并入受理分离时修。
 - 🔴 `duration` 是 **integer**。站点任务记录里它是**字符串** `"5"` —— 原样透传会让官方
   Java/Go SDK 在反序列化时**抛类型错误**（这就是 2026-09-15 报告"跟原生接口对不上"的元凶）。
 - **不给编造值**。`seed:-1` / `framespersecond:24` / `service_tier:"default"` /
@@ -347,23 +353,36 @@ status 词表：`queued` / `in_progress` / `completed` / `failed`；`progress` �
 **不受本政策影响**（那条线的调用方可以自己点档、也自己承担费用）。
 门禁：`tests/test_videos_free_only.py`（含 8 条变异自证）。
 
-🔴 **受理/推进分离**（2026-09-20 用户拍板「1 2试试 目前只针对/v1/videos」）：`POST /v1/videos`
-**毫秒级返回** id（`status=queued`），素材转存/取 token/上游提交在 daemon 后台线程完成 ——
+🔴 **受理/推进分离**（两条线共用。OpenAI 面 2026-09-20 落地「1 2试试 目前只针对/v1/videos」；
+方舟线 2026-10-12 并入，用户口径「优化 minimax 服务，支持后端排队【提交立即返回任务 id】」）：
+`POST` **毫秒级返回** id，素材转存 / 取 token / 抢上游槽位 / 上游提交全在 daemon 后台线程完成 ——
 客户端不再同步等"等槽位（最坏 600s）+ 转存（最坏 120s）+ 现场铸 token（2~45s）"。
+（2026-09-22 生产现场：方舟线同步受理时，最坏形态是调用方 290s 拿不到响应、请求在网关侧积压数小时。）
+
+两条线**共用同一条管线**，只在"外壳"上不同：
+
+| 面 | 创建响应 | 上游侧失败怎么体现 |
+|---|---|---|
+| `/v1/videos` | `{id, object, status:"queued", created_at}`（Chatfire 四字段契约） | 记录转 `failed`、轮询的 `status` 变 `failed`（**六字段契约不带 error**，原因只在日志/span） |
+| 方舟 `/tasks` | `{"id"}` —— **与受理分离之前逐字一致**（官方 SDK / 直连客户的原解析代码照旧可用） | 轮询 `status=failed` + `error:{code, message}`（形状见上节） |
 
 | 变化 | 语义 |
 |---|---|
-| 受理 | **先落库再返回**：记录在受理时就有了（含凭据绑定），`GET /v1/videos/{id}` 立即可查，返回 `queued` |
-| 上游侧失败 | **不再在 POST 上报错**（旧行为：429 / 502 同步返回）—— 记录转 `failed`，轮询可见；完整归因只在日志与 span |
-| 提交失败原因 | **不出响应体**（六字段契约没这个键）；内部归因落在 `submit_error`（日志/span），对外只有脱敏通用句 |
-| 提交线程死了 | 提交**租约** `_SUBMIT_LEASE_SECONDS`（1200s，覆盖最坏 转存 120 + 等槽位 600 + 铸 45）超时仍未提交 ⇒ 轮询判定并标 `failed`，不会永远 queued |
+| 受理 | **先落库再返回**：记录在受理时就有了（含凭据绑定），`GET` 立即可查，未提交阶段给 `queued` |
+| 上游侧失败 | 🔴 **不再在 POST 上报错**（旧行为：429 / 502 同步返回）—— 记录转 `failed`，由调用方轮询看到终态；完整归因只在日志与 span。⚠️ **对方舟线是契约变更**：此前 POST 返回时"上游受理已成功/失败当场可知" |
+| 提交失败原因（方舟线） | `error` 是**对象** `{"code":"SubmissionFailed","message":"…"}`；`code` 自造白名单，message 脱敏通用句 |
+| 提交失败原因（`/v1/videos`） | **不出响应体**（六字段契约没这个键）；内部归因落在 `submit_error`（日志/span） |
+| 提交线程死了 | 提交**租约** `_SUBMIT_LEASE_SECONDS`（1200s，覆盖最坏 转存 120 + 等槽位 600 + 铸 45）超时仍未提交 ⇒ 轮询判定并标 `failed`，不会永远 queued（**两条线同一套判定**） |
 | 未提交阶段轮询 | **零上游调用**（拿空 taskId 打上游只会得到错误空壳，还会凭空制造假跃迁） |
-| 方舟线 | **完全不受影响**：`/tasks` 仍同步受理，POST 返回时上游受理已成功/失败当场可知 |
+| 透传缓存的「空闲」 | 判据是 `WebUpstream.idle` = **闸门里没在跑** 且 **没有在飞提交**。受理分离后"已受理但提交还没写完记录"的任务**不算空闲** —— 那时它正握着客户端，淘汰并 `close()` 会让提交直接失败（多账号透传下缓存频繁新建就是频繁 sweep ⇒ 表现为偶发提交失败） |
 
-前置校验（鉴权 / 参数 / 渠道配置 / 能力）仍在本请求内**同步 400** —— 受理分离只挪"会慢的部分"。
+前置校验（鉴权 / 参数 / 渠道配置 / 能力 / dry-run）仍在本请求内**同步**返回 —— 受理分离只挪"会慢的部分"。
 配套：素材转存改**并行**（`_REHOST_MAX_WORKERS`，总耗时 ≈ 最慢一项）；后台并发推进上限
-`_SUBMIT_WORKERS`（daemon 线程 —— 故意不用 ThreadPoolExecutor，进程退出时不 join 在飞提交）。
-门禁：`tests/test_videos_async_accept.py`（6 条时序断言，全部有变异自证）。
+`AVM_SUBMIT_WORKERS`（默认 32，**两条线共用一个池子**；daemon 线程 —— 故意不用 ThreadPoolExecutor，
+进程退出时不 join 在飞提交）。⚠️ 它**不是**上游并发开关（真正的限流是 `AVM_MAX_CONCURRENT`
+那把上游闸门）；推进线程绝大多数时间阻塞在那把闸门上 ⇒ 调小只让上游槽位空转。
+门禁：`tests/test_videos_async_accept.py`（**两条线各 5 条**时序断言）+ 淘汰判据
+（`test_passthrough_cookie.TestEvictionOfInFlightSubmits`）。
 
 🔴 **时长是写死的，不是"缺省值"**（2026-09-17 用户口径）：本端点按分辨率**无条件覆盖**
 调用方传的 `seconds` —— 表 = `openai_videos.PINNED_DURATIONS`：
@@ -953,7 +972,7 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 ├── test_openai_videos.py    OpenAI /v1/videos 兼容面（Chatfire 契约六字段；零外发）
 ├── test_charged_task_report.py 真被扣费必须上报（两条线；指标/日志/span 三出口；含 10 条变异自证）
 ├── test_videos_free_only.py `/v1/videos` 只跑免费线（模型兜底 + 1080p 降级；含 8 条变异自证）
-├── test_videos_async_accept.py 受理/推进分离的**时序**门禁（受理即返/未提交零上游调用/失败可见/租约；含 6 条变异自证）
+├── test_videos_async_accept.py 受理/推进分离的**时序**门禁（**两条线各 5 条**：受理即返 / 未提交零上游调用 / 失败可见 / 租约；方舟线另有「契约形状不变」与「error 必须是对象」）
 ├── test_media_proxy.py      成片对外出口（响应头白名单、零上游痕迹、归属；含 5 条变异自证）
 ├── test_trace_contract.py   trace 属性契约（内存 exporter 捞 span 断言 + 凭证红线）
 ├── test_passthrough_cookie.py 透传（多租户隔离、缓存淘汰、闸门互斥）
