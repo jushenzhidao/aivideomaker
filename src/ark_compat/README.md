@@ -980,7 +980,11 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 ├── test_env_template.py     .env 模板门禁（**双向**：声明 ↔ 生产代码读取）
 ├── test_compose_env_injection.py 模板声明的键必须真的**注入容器**（声明 ↔ 编排注入）
 ├── test_auto_concurrency.py 并发槽位按账号额度自动定（含多 worker 分摊）
-├── test_probe_retry.py      只读探测的超时与重试（写入绝不重试）
+├── test_probe_retry.py      只读探测的超时与重试（写请求默认一次都不重发）
+├── test_submit_retry.py     **重试的安全边界**（2026-10-21）：队列满/429/连接类可重发，
+│                           读超时与内容审核绝不重发 —— 这条线没有幂等键，判错一边就是重复扣费
+├── test_submit_speedup.py   提交提速（2026-10-21）：minter 自适应 `?reserve=N`（提前过 CF）、
+│                           闸门探测短缓存 + 空 taskId 强制真探、转存并发与并行预热
 ├── test_pool_metrics.py     号池指标（凭据原文绝不进遥测，含变异测试）
 ├── test_token_minter.py     铸造服务接线（取不到 token 就如实失败）
 ├── test_minter_chrome_guard.py 铸造器 Chrome 生命周期守卫（绝不叠实例）

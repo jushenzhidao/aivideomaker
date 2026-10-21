@@ -376,6 +376,10 @@ class TestUpload(unittest.TestCase):
 class FakeWebClient:
     """只实现闸门需要的两个方法，并记录峰值并发。"""
 
+    #: 转存期间的"闸门并行预热"开关（2026-10-21）。替身显式关掉：
+    #: 它的 `needs_captcha` 不存在，而且这些用例考的是闸门/转存语义，不是预热。
+    captcha_probe_ttl = 0.0
+
     def __init__(self):
         self._lock = threading.Lock()
         self._events: dict[str, threading.Event] = {}

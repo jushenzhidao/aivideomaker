@@ -42,11 +42,14 @@ from .web_queue import WebSubmitQueue
 _DATA_URI_RE = re.compile(r"^data:([^;,]+);base64,(.*)$", re.S)
 _SITE_CDN_RE = re.compile(r"^https?://static\d*\.img2video\.ai/", re.I)
 
-#: 转存的**并发上限**（2026-09-20 受理分离配套）。最多 7 项互相独立（图 4 / 视频 1 /
-#: 音频 2），线程大部分时间在等网络 ⇒ 4 个 worker 已能把"总耗时 ≈ 各项之和"压成
-#: "≈ 最慢一项"，再高只会去顶站点的上传限速。预算语义不变（`MediaFetchBudget` 只读
-#: deadline，线程安全）；失败语义也不变：任一项失败 ⇒ 整次创建失败。
-_REHOST_MAX_WORKERS = 4
+#: 转存的**默认并发上限**（2026-09-20 受理分离配套；2026-10-21 由写死的 4 改为可配）。
+#: 一次创建最多 7 项互相独立（图 4 / 视频 1 / 音频 2），线程大部分时间在等网络 ⇒
+#: 把并发提到**项数**（`min(len(jobs), workers)`）能把"分摊两轮"变成"一轮"，
+#: 4 张图约省 1~3s。生产实测没有出现被站点上传限速打回的迹象（PUT 失败只有 4 条，
+#: 且都是超时/断连）。
+#: 预算语义不变（`MediaFetchBudget` 只读 deadline，线程安全）；失败语义也不变：
+#: 任一项失败 ⇒ 整次创建失败。
+_REHOST_MAX_WORKERS = 7
 
 
 def _decode_data_uri(value: str) -> dict | None:
@@ -65,9 +68,11 @@ class WebUpstream:
 
     kind = "web"
 
-    def __init__(self, client: WebClient, queue: WebSubmitQueue, *, media_rehost_budget: float = 90.0):
+    def __init__(self, client: WebClient, queue: WebSubmitQueue, *, media_rehost_budget: float = 90.0,
+                 rehost_workers: int = _REHOST_MAX_WORKERS):
         self.client = client
         self.queue = queue
+        self.rehost_workers = max(1, int(rehost_workers))
         # 整个转存阶段的总预算（秒）。见 `MediaFetchBudget`：没有它，最多 7 个媒体项
         # 串行转存的最坏耗时会把调用方的超时甩在后面，而我们还接着把任务提交出去。
         self.media_rehost_budget = max(1.0, float(media_rehost_budget))
@@ -78,8 +83,26 @@ class WebUpstream:
 
     def create(self, plan: dict) -> str:
         budget = MediaFetchBudget(self.media_rehost_budget)
+        token = plan.get("captcha_token")
+        # ★ 2026-10-21：**转存期间并行预热闸门探测**。
+        #   `needs_captcha()` 是提交关键路径上的一次上游往返（实测 0.1~1s），而转存
+        #   通常要 1~3s（下载 + 预签名 + PUT）—— 把它塞进这段时间等于白赚。
+        #   探测是只读、不占上游槽位、不产生计费，失败也无所谓（缓存没热就照旧再探一次）。
+        #   · 有 BYO token 时不必探（`_create_once` 里只在 `not token` 时才问闸门）；
+        #   · 缓存 TTL=0（关掉）时也不探，否则等于凭空多一次请求。
+        # `getattr` 兜底：测试替身与"旧客户端"没有这个属性时不预热（安全降级）。
+        # 真实的 `WebClient` 永远有它，所以生产行为不受影响。
+        if not token and getattr(self.client, "captcha_probe_ttl", 0.0) > 0:
+            try:
+                ctx = copy_context()
+                threading.Thread(
+                    target=ctx.run, args=(self.client.needs_captcha,),
+                    name="avm-gate-warm", daemon=True,
+                ).start()
+            except Exception as e:  # noqa: BLE001 预热失败绝不影响业务
+                logger.debug("闸门预热线程起不来（不影响提交）：{}", e)
         params = self._rehost(dict(plan["web_params"]), budget)
-        return self.queue.submit(params, token=plan.get("captcha_token"))
+        return self.queue.submit(params, token=token)
 
     # ---- 媒体转存 ----------------------------------------------------------
 
@@ -98,7 +121,10 @@ class WebUpstream:
         """
         jobs: list[tuple[str, Any]] = []
         for key in ("imageUrl", "lastFrameUrl", "referenceVideoUrl"):
-            jobs.append((key, params.get(key)))
+            # 只给**真有值**的项起任务：空值也会走到 `_upload_one` 里空转一趟，
+            # 白白占掉并发名额（4 张图的请求会因此从 4 个 worker 变成 7 个里 3 个空转）。
+            if params.get(key):
+                jobs.append((key, params.get(key)))
         for key in ("referenceImageUrls", "referenceAudioUrls"):
             vals = params.get(key)
             if isinstance(vals, list) and vals:
@@ -107,7 +133,7 @@ class WebUpstream:
         if not jobs:
             return params  # 纯文生视频：没有要转存的东西，连线程池都不必起
 
-        with ThreadPoolExecutor(max_workers=_REHOST_MAX_WORKERS) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(jobs), self.rehost_workers)) as pool:
             # 🔴 必须**带着上下文**进工作线程：上传链路的证据采集（`note_upstream`）靠
             #    contextvar 找采集箱，而 ThreadPoolExecutor 的线程**不继承**提交者的上下文
             #    ⇒ 不 copy 的话，上传发生在"没有采集箱"的线程里，`ark.create.submit` 的
@@ -278,15 +304,36 @@ def _build_web(
         # 取"参考文件链接"的单项预算：调大了就是把调用方的超时甩在后面（见 _fetch_media）
         media_fetch_timeout=settings.media_fetch_timeout,
         # 闸门开着时会自动去铸造服务取 token（未配置则为 None ⇒ 行为不变）
-        minter=TokenMinter(settings.minter_url, settings.minter_key, settings.minter_timeout),
+        minter=TokenMinter(
+            settings.minter_url,
+            settings.minter_key,
+            settings.minter_timeout,
+            # 铸造的重试次数要一起传下去，否则 `AVM_MINTER_RETRIES` 配了也不生效
+            retries=getattr(settings, "minter_retries", 1),
+            # 提前量（提前过 CF）：池子空时声明"接下来还要 N 个"，见 TokenMinter 的说明
+            reserve=getattr(settings, "minter_reserve", 8),
+        ),
+        # 提交重试（只对"上游确定没接单"的失败生效，见 web_client.retryable_submit_error）
+        submit_retries=settings.submit_retries,
+        submit_retry_backoff=settings.submit_retry_backoff,
+        # 转存（下载外链 / PUT 到站点 CDN）的重试：幂等操作
+        media_retries=settings.media_retries,
+        # 闸门探测的短期缓存（省掉每条提交的一次上游往返）
+        captcha_probe_ttl=settings.captcha_probe_ttl,
     )
     queue = WebSubmitQueue(
         client,
         max_concurrent=resolve_max_concurrent(settings, client),
         poll_interval=settings.poll_interval,
+        # 闸门盯梢（轮询）的总时限，此前只能吃构造默认值 3600
+        watch_timeout=settings.watch_timeout,
         log=log,
     )
-    return WebUpstream(client, queue, media_rehost_budget=settings.media_rehost_budget)
+    return WebUpstream(
+        client, queue,
+        media_rehost_budget=settings.media_rehost_budget,
+        rehost_workers=settings.rehost_workers,
+    )
 
 
 def build_upstreams(settings, log: Callable[[str], None] | None = None) -> dict[str, Any]:

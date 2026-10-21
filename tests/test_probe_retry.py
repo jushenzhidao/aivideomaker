@@ -5,8 +5,12 @@
 
 1. **只读重试**：出口代理会偶发 502 / 超时，实测"下一发就成功"。而失败后等 10s，
    会白烧掉一整个闸门窗口（实测一次真提交被吞 ⇒ 该条延后 393s）。
-2. **写入绝不重试**：这条线**没有幂等键**，响应丢失时重试可能重复建任务
+2. **写入默认不重试**：这条线**没有幂等键**，响应丢失时重试可能重复建任务
    （计费线上就是重复扣费）⇒ 这条属性必须有测试守着，不能被后人"顺手统一"掉。
+   ⚠️ 2026-10-21 起 `trpc` 多了个 `write_retries`：**只有**"请求一个字节都没发出去"
+   的传输错误（连接类）才允许重发。本文件下面那三条`POST`断言用的是 `ConnectTimeout`，
+   但走的是 `trpc` 的默认路径（`write_retries=None`，一次都不重发）—— 仍然成立。
+   分层的语义边界见 `tests/test_submit_retry.py`（那里才是新契约的家）。
 3. **探测用短超时**：默认 30s 的一发卡住探测会把重试循环占满。
    顺带守住一个 httpx 陷阱：`timeout=None` 表示**关闭超时**（不是"用默认"），
    所以 None 时**必须不传**这个参数。
@@ -152,12 +156,14 @@ class TestSettings(unittest.TestCase):
         self.assertEqual(Settings.from_env({"AVM_PROBE_TIMEOUT": "3"}).probe_timeout, 3.0)
 
     def test_upstream_timeout_knob(self):
-        """主调用超时：默认仍是 30（行为不变），可由 `AVM_UPSTREAM_TIMEOUT` 放大。
+        """主调用超时：默认 **120**（2026-10-21 由 60 上调），可由 `AVM_UPSTREAM_TIMEOUT` 覆盖。
 
-        2026-09-18 之前这一档是 `WebClient` 的硬编码默认 30 —— 上游偶发慢于 30s 时
-        （`ReadTimeout`）没有任何变量能调，只能改代码。
+        2026-09-18 之前这一档是 `WebClient` 的硬编码默认 30；之后暴露成变量。
+        ⚠️ 2026-10-21 的事实核对：ai-prod 的容器**从 10-12 起就是 60**（docker inspect
+        实测），而那 54 条 `ReadTimeout` 就发生在 60s 上限下 ⇒ 60 不够，才提到 120。
+        受理/推进分离之后 POST 毫秒级返回，这个值不再与调用方超时竞争，所以敢往上调。
         """
-        self.assertEqual(Settings.from_env({}).upstream_timeout, 30.0)
+        self.assertEqual(Settings.from_env({}).upstream_timeout, 120.0)
         self.assertEqual(
             Settings.from_env({"AVM_UPSTREAM_TIMEOUT": "45"}).upstream_timeout, 45.0
         )

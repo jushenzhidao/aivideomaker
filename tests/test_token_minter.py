@@ -79,6 +79,8 @@ def make_client(site: FakeSite, minter=None, gate_note: str = "") -> WebClient:
         transport=site,
         minter=minter,
         probe_retries=0,
+        # 提交重试（2026-10-21）：CAPTCHA 失败也会重试 ⇒ 测试里不退避，别把用例拖成秒级
+        submit_retry_backoff=0.0,
     )
 
 
@@ -122,7 +124,10 @@ class TestDegradation(unittest.TestCase):
         c = make_client(site, m)
         with self.assertRaises(CaptchaRequiredError):
             c.create(body_params())
-        self.assertEqual(m.calls, 1, "应当尝试过一次铸造")
+        # 2026-10-21：`CAPTCHA_REQUIRED` 属于"上游确定没接单" ⇒ 提交层会重试
+        # 1 + submit_retries(2) = 3 轮（生产 16 条 mint 503 就靠这个救）。
+        # ★ 但**一条 create 都不许发** —— 这一条才是安全属性，上面的次数只钉节奏。
+        self.assertEqual(m.calls, 3, "闸门类失败会重试 3 轮（铸造 1 + 重试 2）")
         self.assertEqual(site.creates(), [], "⛔ 取不到 token 却仍然提交 —— 这是静默失败")
 
     def test_no_minter_configured_keeps_old_behaviour(self):
@@ -349,15 +354,24 @@ class TestMinterFailureAttribution(unittest.TestCase):
         self.assertIn("HTTP 503", m.last_error)
         self.assertNotIn("unreachable", m.last_error)
 
-    def test_last_error_cleared_after_success(self):
+    def test_transient_503_is_retried_within_one_mint(self):
+        """单地址部署：503 是**瞬时**的 ⇒ 同一次 mint() 里重试一次就拿到。
+
+        生产依据：2026-10 的 16 条 `CAPTCHA_REQUIRED`，`last_error` **全是 HTTP 503**。
+        """
         responses = iter([httpx.Response(503, json={}),
                           httpx.Response(200, json={"token": "TK"})])
         m = TokenMinter("http://minter.test")
         m._http = httpx.Client(transport=httpx.MockTransport(lambda r: next(responses)))
-        self.assertIsNone(m.mint())
-        self.assertIsNotNone(m.last_error)
-        self.assertEqual(m.mint(), "TK")
+        self.assertEqual(m.mint(), "TK", "503 后应当同址重试并成功")
         self.assertIsNone(m.last_error, "成功后归因必须清空")
+
+    def test_persistent_503_returns_none_with_attribution(self):
+        m = TokenMinter("http://minter.test")
+        m._http = httpx.Client(transport=httpx.MockTransport(
+            lambda r: httpx.Response(503, json={"error": "boom"})))
+        self.assertIsNone(m.mint())
+        self.assertIn("HTTP 503", m.last_error)
 
     def test_unreachable_hint_points_at_host_firewall(self):
         class DeadMinter(FakeMinter):

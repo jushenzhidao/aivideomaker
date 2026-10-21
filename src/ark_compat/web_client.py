@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,85 @@ VOID_INPUT: dict[str, Any] = {"0": {"json": None, "meta": {"values": ["undefined
 
 TERMINAL = frozenset({"succeed", "success", "completed", "failed", "error", "cancelled", "canceled"})
 SUCCESS = frozenset({"succeed", "success", "completed"})
+
+
+# ---- 重试的安全边界（本文件的**唯一判定处**，2026-10-21）--------------------
+#
+# 这条线**没有幂等键**：`POST ai.minimaxH3` 重发一次就可能建出两个任务，而建任务
+# 就是计费动作（tier=base 一律扣费）⇒ "能不能重试"必须按**上游到底有没有接单**来判，
+# 不能用"失败就再试一次"那种通用套路。
+#
+# 白名单（而不是黑名单）是刻意的：漏掉一种可重试错误只是少救回几条，
+# 错放一种不可重试错误就是**重复扣费**。
+
+#: 传输层异常里**能证明请求一个字节都没发出去**的那几种 ⇒ 写请求唯一允许重发的传输错误。
+#: 反例（刻意**不在**表里）：
+#:   · `ReadTimeout`   —— 请求已送达，上游可能已经建好任务，只是响应慢了；
+#:   · `WriteTimeout`  —— 请求体写到一半，上游可能已按完整请求处理；
+#:   · `RemoteProtocolError` / `ReadError` / `CloseError` —— 对端已开始回应后断开。
+#: 这三种正是生产日志里最常见的（2026-10-21：读超时 54 条），**只能靠加超时减少**，不能重试。
+_SAFE_RESEND_ERRORS = (
+    httpx.ConnectError,        # 连不上：DNS / 拒绝 / TLS 握手失败
+    httpx.ConnectTimeout,      # 连接阶段超时 —— 请求体还没开始写
+    httpx.PoolTimeout,         # 没拿到连接（本地连接池）
+    httpx.ProxyError,          # 代理层失败
+    httpx.LocalProtocolError,  # 本地协议错误（参数/状态机，请求没发出去）
+)
+_SAFE_RESEND_TRANSPORTS = frozenset(e.__name__ for e in _SAFE_RESEND_ERRORS)
+
+#: 上游**明确拒绝、没建任务**的报文特征 ⇒ 提交可安全重试。
+#: 站点原话（生产实测 19 条，2026-10-19/20）：
+#:   `The queue is full. The pro plan can only run 4 task at a time.`
+#: 这是"账号并发全满"，不是参数或内容问题 —— 等一个任务跑完再发就进得去。
+#: ⚠️ 它挂在 `http=500 / code=INTERNAL_SERVER_ERROR` 上，**不能**按 500 一概而论：
+#:    同一个 500 里还有内容审核（见下），那种重发多少次都是拒。
+_RETRYABLE_SUBMIT_TEXTS = ("queue is full",)
+
+#: 内容审核的**两种**站点文案（2026-10 生产日志各占一半）⇒ 绝不重试。
+#: 放在判定最前面：它们也带 http=500，先判审核才不会误放。
+_CONTENT_REJECT_TEXTS = (
+    "prompt or image sensitive",
+    "flagged by a content checker",
+)
+
+
+def safe_to_resend(exc: BaseException) -> bool:
+    """这个传输异常发生时，请求**一定没发出去**吗？（写请求重试的唯一依据）"""
+    return isinstance(exc, _SAFE_RESEND_ERRORS)
+
+
+def is_content_rejection(err: "WebApiError") -> bool:
+    """这条失败是**内容审核**吗？
+
+    单列成函数是为了让门禁能**直接**断言它 —— 只验"最终没重试"是不够的：
+    审核错误恰好也没命中其他白名单，所以即便把文案表清空，行为看起来一样对。
+    等到哪天有人往白名单里加了 `http_status == 500`，清空的代价就是**审核被重试**。
+    """
+    text = str(err).lower()
+    return any(t in text for t in _CONTENT_REJECT_TEXTS)
+
+
+def retryable_submit_error(err: "WebApiError") -> bool:
+    """建任务失败里，哪些是"上游确定没接单"⇒ 可以安全重发。
+
+    判定顺序有讲究：**审核先判**（它也带 500/429 形态），再判闸门与并发满，
+    最后才看传输层。返回 False 的一律不重试 —— 宁可少救，不可多扣。
+    """
+    if is_content_rejection(err):
+        return False
+    text = str(err).lower()
+    # Turnstile 闸门 / 铸造失败：上游根本没到建任务那一步
+    if getattr(err, "code", "") == "CAPTCHA_REQUIRED":
+        return True
+    if getattr(err, "http_status", 0) == 429:
+        return True
+    # 账号并发满
+    if any(t in text for t in _RETRYABLE_SUBMIT_TEXTS):
+        return True
+    # 请求没发出去的传输错误
+    if getattr(err, "transport", "") in _SAFE_RESEND_TRANSPORTS:
+        return True
+    return False
 
 
 def parse_sse(text: str) -> dict | None:
@@ -141,6 +221,19 @@ class WebClient:
         minter: object | None = None,
         trust_env: bool = True,
         transport: httpx.BaseTransport | None = None,
+        # ---- 重试（2026-10-21，见本文件顶部「重试的安全边界」）----
+        # 建任务的重试次数与退避基数：**只对"上游确定没接单"的失败生效**
+        # （queue is full / 429 闸门 / 连接类错误 / 空 taskId）。
+        submit_retries: int = 2,
+        submit_retry_backoff: float = 3.0,
+        # 转存（下载外链 + PUT 到站点 CDN）的重试次数：幂等操作，传输抖动可重发。
+        media_retries: int = 2,
+        # 闸门探测（`model.needsCaptcha`）的缓存 TTL（秒，2026-10-21）。
+        # 每次提交前都要问一次上游（一次完整往返）；连续提交同一个账号时，5 秒内的
+        # 答案几乎不会变（闸门是**速度型**开关，不是逐请求翻转）。0 = 关闭缓存。
+        # ⚠️ 缓存"关"的风险窗口 = TTL：这期间若闸门翻起，提交会被站点**静默拒**
+        #    （空 taskId）—— 已有兜底：`_create_once` 拿到空串会**换新 token 重试一次**。
+        captcha_probe_ttl: float = 5.0,
     ):
         # 裸 token 也接受：自动补 `auth_session=` 前缀并告警（见 ark_compat/cookie.py）。
         # 在构造函数里兜一次，这样直接 `WebClient(cookie=...)` 的调用方也不会踩坑。
@@ -158,7 +251,18 @@ class WebClient:
         self.probe_retries = max(0, int(probe_retries))
         self.timeout = max(1.0, float(timeout))
         self.media_fetch_timeout = max(1.0, float(media_fetch_timeout))
+        # 轮询（`get_task`）单次的超时：**故意比主调用短**。
+        # 轮询是高频重复的只读查询，一次卡满主超时（60s）会把 10s 的轮询间隔拖成
+        # "一分钟才看一次状态"；短超时 + 下一轮重来反而更快看到状态跃迁。
+        self.poll_timeout = max(1.0, min(20.0, self.timeout))
         self.minter = minter
+        self.submit_retries = max(0, int(submit_retries))
+        self.submit_retry_backoff = max(0.0, float(submit_retry_backoff))
+        self.media_retries = max(0, int(media_retries))
+        # 闸门探测缓存：(取值时刻 monotonic, 是否要过闸门)。多线程提交共用 ⇒ 加锁。
+        self.captcha_probe_ttl = max(0.0, float(captcha_probe_ttl))
+        self._captcha_lock = threading.Lock()
+        self._captcha_cache: tuple[float, bool] | None = None
         self._http = httpx.Client(
             base_url=self.base_url,
             timeout=timeout,
@@ -193,7 +297,8 @@ class WebClient:
     def trpc(self, procedure: str, inp: Any = None, *, method: str = "GET",
              referer: str = PAGE, meta: dict | None = None,
              timeout: float | None = None, retries: int | None = None,
-             returns_task_id: bool = False) -> Any:
+             returns_task_id: bool = False,
+             write_retries: int | None = None) -> Any:
         """调一个 tRPC procedure，解开 `result.data.json`；出错抛 `WebApiError`。
 
         `returns_task_id=True`：这次调用的返回值**就是**站点 taskId —— 由它决定要不要把返回值
@@ -209,8 +314,16 @@ class WebClient:
           按 `probe_retries`（默认 2）**立即**重试。实测这类错误多数下一发就成功；
           而"失败后等 10s 再试"会白烧掉一整个闸门窗口（实测：一次真提交被代理吞掉
           ⇒ 那个窗口作废 ⇒ 该条整体延后 393s）。
-        - `POST` 是**写**，而这条线**没有幂等键** ⇒ **绝不自动重试**：响应丢失时重试
-          可能重复建任务（计费线上就是重复扣费）。写失败只能由调用方决定怎么处理。
+        - `POST` 是**写**，而这条线**没有幂等键** ⇒ 默认**一次都不重试**：响应丢失时重试
+          可能重复建任务（计费线上就是重复扣费）。
+          ⚠️ 唯一的例外是调用方**显式**给了 `write_retries`（目前只有转存链路的
+          `uploads.getPresignedUrl` 会传 —— 它无副作用、不建任务），且失败必须是
+          `safe_to_resend()` 认得的那几种 —— 即"请求一个字节都没发出去"（连不上 /
+          连接超时 / 没拿到连接 / 代理失败）。读超时、写超时、对端断开**一律不重试**：
+          那几种上游可能已经把任务建好了。
+          ⚠️ **建任务（`create`）刻意不走这里**：它在**上一层**统一重试（要能识别
+          `queue is full` / 429 / 空 taskId 这些**业务级**的"没接单"信号，还要决定
+          要不要换 token）。两层都开就会变成 3×3 次重发。
         - `timeout=None` ⇒ 用 client 默认（长）；探测类显式传 `probe_timeout`（短）。
         """
         payload = json.dumps(meta if meta is not None else {"0": {"json": inp}}, separators=(",", ":"))
@@ -223,9 +336,14 @@ class WebClient:
         req_view = {"procedure": procedure, "method": method, "input": inp, "headers": safe_headers(hdrs)}
         started = time.perf_counter()
 
-        # 只有只读请求（GET）自动重试；写入（POST）一次都不重试 —— 没有幂等键。
+        # 只读（GET）：按 `probe_retries` 立即重试。
+        # 写入（POST）：默认一次都不重试（没有幂等键）；只有显式给了 `write_retries`
+        # 才重发，且仅限"请求没发出去"的传输错误（循环里再判一次 `safe_to_resend`）。
         planned = self.probe_retries if retries is None else max(0, int(retries))
-        attempts = 1 if method == "POST" else planned + 1
+        if method == "POST":
+            attempts = 1 + max(0, int(write_retries or 0))
+        else:
+            attempts = planned + 1
         # ⚠️ httpx 的 `timeout=None` 表示**关闭超时**（不是"用默认值"），所以 None 时
         # 必须**不传**这个参数，否则一个卡住的请求会永远挂着。
         tkw = {} if timeout is None else {"timeout": timeout}
@@ -240,7 +358,8 @@ class WebClient:
                     r = self._http.get(url, params=params, headers=hdrs, **tkw)
                 break
             except httpx.HTTPError as e:
-                if attempt + 1 < attempts:
+                # 写请求只允许"请求没发出去"这一类重发（幂等安全边界，见模块顶部）
+                if attempt + 1 < attempts and (method != "POST" or safe_to_resend(e)):
                     # 立即重试：退避只用于错开极短抖动，不做秒级等待
                     time.sleep(0.25 * (2 ** attempt))
                     continue
@@ -356,18 +475,36 @@ class WebClient:
         r = self.trpc("ai.queryUserPermission", {}, timeout=self.probe_timeout)
         return r if isinstance(r, dict) else None
 
-    def needs_captcha(self) -> bool:
-        """这个账号现在要不要过 Turnstile？
+    def needs_captcha(self, *, force: bool = False) -> bool:
+        """这个账号现在要不要过 Turnstile？（**短期缓存**，2026-10-21）
 
-        **动态风控开关，不是账号属性** —— 每次提交前都要重新问，不要缓存。
+        它是**动态风控开关，不是账号属性** —— 所以缓存只能很短（默认 5 秒），
+        但对"同一账号连续提交"这种最常见形态，它能省掉每条一次上游往返
+        （实测这条探测 0.1~1s，串在提交关键路径上）。
+
+        `force=True` 强制真探：`_create_once` 在"拿到空 taskId"之后应该用它 ——
+        那正是"缓存说不用过、其实闸门已经翻起"的情形。
+
+        缓存"开"（需要过闸门）的代价只是多铸一个 token（幂等、便宜）；
+        缓存"关"的代价是一个 TTL 窗口内的静默拒，已有换 token 兜底。
         """
-        return bool(
+        ttl = self.captcha_probe_ttl
+        if not force and ttl > 0:
+            with self._captcha_lock:
+                hit = self._captcha_cache
+            if hit is not None and (time.monotonic() - hit[0]) < ttl:
+                return hit[1]
+        value = bool(
             self.trpc(
                 "model.needsCaptcha",
                 {"userId": self.get_user_id()},
                 timeout=self.probe_timeout,
             )
         )
+        if ttl > 0:
+            with self._captcha_lock:
+                self._captcha_cache = (time.monotonic(), value)
+        return value
 
     # ------------------------------------------------------------- create ----
 
@@ -407,9 +544,53 @@ class WebClient:
         return f"token minter configured but mint failed (last_error={last}) — "
 
     def create(self, params: dict, token: str | None = None) -> str:
-        """创建视频任务，返回站点 taskId。
+        """创建视频任务，返回站点 taskId —— **带幂等安全边界内的重试**。
+
+        ★ 2026-10-21 起（用户口径「能提高成功率都可以加重试」）：失败不再一次定生死。
+        但这条线**没有幂等键**，所以重试的许可条件只有一个 —— **上游确定没建任务**
+        （判定全在 `retryable_submit_error`）：
+
+        ==========================  ========  ====================================
+        失败                          重试?     依据（生产实测，1052 条受理）
+        ==========================  ========  ====================================
+        `queue is full`               ✅ 退避    账号并发满，19 条；隔几秒就有空位
+        `CAPTCHA_REQUIRED`(429)       ✅ 换 token 闸门/铸造失败，16 条；上游没到建任务
+        空 taskId（站点静默拒）        ✅        站点自己说"不收"，不会已建任务
+        连接类错误（连不上/连接超时）    ✅        请求一个字节都没发出去
+        `ReadTimeout` / `WriteTimeout` ⛔        请求可能已被接收 ⇒ 重发＝重复扣费
+        内容审核                        ⛔        重发还是拒（用户明确排除）
+        参数类 / 其他 4xx-5xx           ⛔        不是抖动
+        ==========================  ========  ====================================
 
         `token` 是调用方自带的真实 Turnstile token（BYO）。闸门关闭时可为 None。
+        """
+        attempts = 1 + self.submit_retries
+        current = token
+        last: WebApiError | None = None
+        for attempt in range(attempts):
+            try:
+                return self._create_once(params, token=current)
+            except WebApiError as e:
+                last = e
+                if attempt + 1 >= attempts or not retryable_submit_error(e):
+                    raise
+                # 闸门/铸造失败 ⇒ 手上这个 token 已经废了（可能被用掉或已过期），
+                # 下一轮交给 `_create_once` 重新探测 + 重铸；其余情况（并发满）保留它，
+                # 因为上游根本没走到校验 token 那一步。
+                if getattr(e, "code", "") == "CAPTCHA_REQUIRED":
+                    current = None
+                delay = self.submit_retry_backoff * (2 ** attempt)
+                logger.warning(
+                    "提交失败（第 {}/{} 次，将重试）—— {}；{:.1f}s 后重发（上游未建任务，不会重复扣费）",
+                    attempt + 1, attempts, e, delay,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+        raise last  # pragma: no cover —— attempts ≥ 1，循环内必定 return 或 raise
+
+    def _create_once(self, params: dict, token: str | None = None) -> str:
+        """**单次**提交，不做任何业务级重试（重试在 `create` 的壳里）。
+
         闸门开启且没带 token 时**不提交**，直接抛 `CaptchaRequiredError` ——
         上游此时会把 `token: null` 静默拒掉（返回空串），既不报错也不建任务，
         所以我们必须自己把它变成显式失败。
@@ -457,14 +638,24 @@ class WebClient:
             #   ② 探测时闸门是关的、提交前刚好被顶开（竞态）。
             # 两者都能被"**换一个新 token 重试一次**"救回来。空串意味着上游没建任务，
             # 所以重试不会重复建（已用 token 的情况也一样 —— 它根本没被接受）。
-            fresh = self._mint_token_from_service()
+            # 先**强制**真探一次闸门（不能信 5 秒缓存：空串很可能就是"缓存说不用过、
+            # 其实已经翻起"）。探到要过闸门才值得换 token；否则换了也是白换。
+            # 探测本身失败时按"需要 token"乐观处理 —— 探测故障不该让这条直接失败。
+            try:
+                gate = self.needs_captcha(force=True)
+            except Exception:  # noqa: BLE001
+                gate = True
+            fresh = self._mint_token_from_service() if gate else None
             if fresh:
                 body["token"] = fresh
                 task_id = self.trpc(procedure, body, method="POST", returns_task_id=True)
                 if task_id:
                     logger.info("用新铸的 token 重试成功（上一个 token 已过期/已用，或闸门刚被顶开）")
         if not task_id:
-            # 站点用空串表示"拒绝"，不报错 —— 必须当成显式失败
+            # 站点用空串表示"拒绝"，不报错 —— 必须当成显式失败。
+            # ⚠️ 这里**不**让外层再重试：上面已经"换一个新 token"试过一次了，还是空串
+            #    说明不是 token 老死（更可能是闸门没回落或参数问题）⇒ 再试也是白试。
+            #    生产依据：9 天 1052 条受理里这条路径**一次都没出现**（0 条）。
             raise WebApiError(
                 procedure,
                 "create returned no task id — the request was rejected (captcha gate or invalid parameters)",
@@ -505,9 +696,9 @@ class WebClient:
         result = (first or {}).get("result") or {}
         return ((result.get("data") or {}).get("json")) or {}
 
-    def get_model(self, task_id: str) -> dict | None:
+    def get_model(self, task_id: str, *, timeout: float | None = None) -> dict | None:
         """单条任务。**三种读法里最好的一种**：一次请求、权威、不依赖分页位置。"""
-        return self.trpc("model.getModel", {"id": task_id})
+        return self.trpc("model.getModel", {"id": task_id}, timeout=timeout)
 
     def find_in_list(self, task_id: str, limit: int = 40) -> dict | None:
         data = self.list(limit=limit)
@@ -537,7 +728,8 @@ class WebClient:
             raise WebApiError("model-status/token", f"no token in response: {json.dumps(j)[:200]}")
         return str(token)
 
-    def get_task(self, task_id: str, *, sse_timeout: float = 12.0, prefer_list: bool = True) -> dict:
+    def get_task(self, task_id: str, *, sse_timeout: float = 12.0, prefer_list: bool = True,
+                 timeout: float | None = None) -> dict:
         """读完整任务记录，逐级回落。
 
         三种读法的实测取舍：
@@ -550,7 +742,7 @@ class WebClient:
         ==================  =========  ==========================================
         """
         try:
-            rec = self.get_model(task_id)
+            rec = self.get_model(task_id, timeout=timeout)
             if rec:
                 return rec
         except WebApiError as e:
@@ -618,7 +810,8 @@ class WebClient:
         while time.time() - t0 < timeout:
             try:
                 with suppress_http():
-                    last = self.get_task(task_id)
+                    # 轮询用**短超时**（`poll_timeout`）：一次卡满主超时会让轮询间隔失真
+                    last = self.get_task(task_id, timeout=self.poll_timeout)
             except WebApiError as e:
                 if e.code == "NOT_FOUND":
                     raise
@@ -667,7 +860,34 @@ class WebClient:
         return max(0.1, min(want, budget.remaining()))
 
     def _fetch_media(self, url: str, *, budget=None) -> bytes:
-        """把调用方给的**文件链接**取回内存：流式 + 硬字节上限 + 总时长预算。
+        """（重试壳）GET 幂等 ⇒ 传输抖动重发是安全的，不会多扣费也不会多建任务。
+
+        生产实测（2026-10-21，9 天日志）：转存阶段的 `uploads.PUT WriteTimeout` /
+        `ConnectError` / `RemoteProtocolError` 共 4 条，`download: 404` 只有 1 条 ——
+        前者是"重发一次就好"的抖动，后者是用户给的链接本身坏了（**不重试**）。
+        判定看 `transport`：只有传输层异常才带它；4xx / 超量 / 预算耗尽一律不重发。
+        """
+        attempts = 1 + self.media_retries
+        last: WebApiError | None = None
+        for attempt in range(attempts):
+            try:
+                return self._fetch_media_once(url, budget=budget)
+            except WebApiError as e:
+                last = e
+                if attempt + 1 >= attempts or not e.transport:
+                    raise
+                if budget is not None and budget.expired():
+                    raise  # 预算已耗尽 ⇒ 重发也会立刻撞同一个 504
+                delay = 0.5 * (2 ** attempt)
+                logger.warning(
+                    "取参考文件失败（第 {}/{} 次，将重试）—— {}；{:.1f}s 后重发",
+                    attempt + 1, attempts, e, delay,
+                )
+                time.sleep(delay)
+        raise last  # pragma: no cover
+
+    def _fetch_media_once(self, url: str, *, budget=None) -> bytes:
+        """（单次）把调用方给的**文件链接**取回内存：流式 + 硬字节上限 + 总时长预算。
 
         🔴 为什么不能沿用 `self._http.get(url)`（旧写法）：
 
@@ -722,6 +942,8 @@ class WebClient:
                 f"{type(e).__name__}: 取参考文件失败（耗时 "
                 f"{time.perf_counter() - started:.1f}s）: {url[:120]} — {e}",
                 http_status=504 if isinstance(e, httpx.TimeoutException) else 0,
+                # 归因给重试壳用：只有它认得的那几种才是"重发能好"的抖动
+                transport=type(e).__name__,
             ) from None
         return b"".join(chunks)
 
@@ -788,11 +1010,13 @@ class WebClient:
         width, height = image_dimensions(buf) if info["kind"] == "image" else (0, 0)
         file_name = f"{base}.{info['ext']}"
 
+        # 预签名也是 POST，但**无副作用**（只是拿一个 URL，不建任务）⇒ 连接类抖动可重发。
         pre = self.trpc(
             "uploads.getPresignedUrl",
             {"fileName": file_name, "contentType": info["content_type"], "fileSize": len(buf), "permanent": permanent},
             method="POST",
             timeout=self._step_timeout(self.timeout, budget),
+            write_retries=self.media_retries,
         ) or {}
 
         max_bytes = pre.get("maxBytes")
@@ -816,49 +1040,89 @@ class WebClient:
         put_headers.setdefault("Content-Type", info["content_type"])
         # 上传预算按体积给（约 2s/MB + 30s 底），再与总预算取小：10MB ⇒ 50s，50MB ⇒ 130s
         put_budget_s = 30.0 + len(buf) / (1024 * 1024) * 2.0
-        put_view = {
-            "url": upload_url,
-            "fileSize": len(buf),
-            "contentType": info["content_type"],
-            "header_keys": sorted(put_headers),
-        }
-        started = time.perf_counter()
-        try:
-            put = self._http.put(
-                upload_url,
-                headers=put_headers,
-                content=buf,
-                timeout=self._step_timeout(put_budget_s, budget),
-            )
-        except httpx.HTTPError as e:
+        # ★ 2026-10-21：PUT **重试**。它是幂等的（同一个预签名 URL + 同一份字节），
+        #   生产实测的 4 条失败全是传输抖动（WriteTimeout 2 / ConnectError 1 /
+        #   RemoteProtocolError 1）⇒ 重发一次就好。
+        #   ⚠️ 预签名 URL 只有 **60 秒**有效期 ⇒ `400/403` 视为"过期/签名失配"，
+        #   走**重签**再传（而不是拿旧 URL 硬撞），这也是不设长退避的原因。
+        put_attempts = 1 + max(0, int(self.media_retries))
+        put: httpx.Response | None = None
+        for put_attempt in range(put_attempts):
+            put_view = {
+                "url": upload_url,
+                "fileSize": len(buf),
+                "contentType": info["content_type"],
+                "header_keys": sorted(put_headers),
+            }
+            started = time.perf_counter()
+            try:
+                put = self._http.put(
+                    upload_url,
+                    headers=put_headers,
+                    content=buf,
+                    timeout=self._step_timeout(put_budget_s, budget),
+                )
+            except httpx.HTTPError as e:
+                note_upstream(
+                    "uploads.PUT",
+                    upstream="web",
+                    request=put_view,
+                    status="error",
+                    error=f"{type(e).__name__}: {e}",
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                )
+                if put_attempt + 1 < put_attempts:
+                    delay = 0.5 * (2 ** put_attempt)
+                    logger.warning(
+                        "转存失败（第 {}/{} 次，将重试）—— {}: {}；{:.1f}s 后重发",
+                        put_attempt + 1, put_attempts, type(e).__name__, e, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise WebApiError(
+                    "uploads.PUT",
+                    f"{type(e).__name__}: 转存 {len(buf)} 字节失败（耗时 "
+                    f"{time.perf_counter() - started:.1f}s）— {e}",
+                    http_status=504 if isinstance(e, httpx.TimeoutException) else 0,
+                ) from None
             note_upstream(
                 "uploads.PUT",
                 upstream="web",
                 request=put_view,
-                status="error",
-                error=f"{type(e).__name__}: {e}",
+                response={
+                    "http_status": put.status_code,
+                    "body": put.text[:300],
+                    "publicUrl": pre.get("publicUrl"),
+                },
+                status="ok" if put.status_code < 400 else "error",
                 duration_ms=(time.perf_counter() - started) * 1000,
             )
-            raise WebApiError(
-                "uploads.PUT",
-                f"{type(e).__name__}: 转存 {len(buf)} 字节失败（耗时 "
-                f"{time.perf_counter() - started:.1f}s）— {e}",
-                http_status=504 if isinstance(e, httpx.TimeoutException) else 0,
-            ) from None
-        note_upstream(
-            "uploads.PUT",
-            upstream="web",
-            request=put_view,
-            response={
-                "http_status": put.status_code,
-                "body": put.text[:300],
-                "publicUrl": pre.get("publicUrl"),
-            },
-            status="ok" if put.status_code < 400 else "error",
-            duration_ms=(time.perf_counter() - started) * 1000,
-        )
-        if put.status_code >= 400:
+            if put.status_code < 400:
+                break
+            # 预签名过期/签名失配 ⇒ 重签再传（同一份字节，不会多存一份）
+            if put.status_code in (400, 403) and put_attempt + 1 < put_attempts:
+                logger.warning(
+                    "转存 PUT 返回 {} ⇒ 重新申请预签名后重传（预签名只有 60s 有效期）",
+                    put.status_code,
+                )
+                pre = self.trpc(
+                    "uploads.getPresignedUrl",
+                    {
+                        "fileName": file_name,
+                        "contentType": info["content_type"],
+                        "fileSize": len(buf),
+                        "permanent": permanent,
+                    },
+                    method="POST",
+                    timeout=self._step_timeout(self.timeout, budget),
+                    write_retries=self.media_retries,
+                ) or {}
+                upload_url = pre.get("uploadUrl") or upload_url
+                put_headers = dict(pre.get("headers") or {})
+                put_headers.setdefault("Content-Type", info["content_type"])
+                continue
             raise WebApiError("uploads.PUT", f"{put.status_code}: {put.text[:300]}", http_status=put.status_code)
+        assert put is not None
 
         return {
             "publicUrl": pre.get("publicUrl"),
