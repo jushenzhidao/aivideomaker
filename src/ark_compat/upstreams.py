@@ -239,7 +239,13 @@ class WebUpstream:
         return info
 
 
-def resolve_max_concurrent(settings, client) -> int:
+def _fallback_slots(settings) -> int:
+    """探测不可用时的槽位数（已按 worker 数分摊）。"""
+    divisor = max(1, int(getattr(settings, "concurrency_divisor", 1) or 1))
+    return max(1, settings.max_concurrent_fallback // divisor)
+
+
+def resolve_max_concurrent(settings, client, *, probe: bool = True) -> int:
     """定提交闸门槽位。
 
     `settings.max_concurrent > 0` ⇒ 用它（显式覆盖优先）。
@@ -247,9 +253,17 @@ def resolve_max_concurrent(settings, client) -> int:
     `ai.queryUserPermission.maxQueueLength`（premium 2 / pro 4）。
     读不到（网络抖动 / 站点改字段）⇒ 回落到 `max_concurrent_fallback`，并留一条日志 ——
     这里**不能**猜成"没限制"，那会把上游配额直接撞满。
+
+    ★ `probe=False`（2026-10-21，**透传建实例用**）：**绝不在受理路径上等这次往返**。
+      透传模式下每个新账号的**首条** `POST /tasks` 都要现建上游，而这个探测是跨境的
+      一次完整往返（新 HTTP 客户端还要先做 TLS 握手，实测把"受理即返"从毫秒拖到 3.1s）。
+      改成：先用 `max_concurrent_fallback` 把闸门建起来立即服务，额度交给
+      `_probe_capacity_async` 后台补许可（`WebSubmitQueue.raise_capacity`，只放宽）。
     """
     if settings.max_concurrent > 0:
         return settings.max_concurrent
+    if not probe:
+        return _fallback_slots(settings)
     divisor = max(1, int(getattr(settings, "concurrency_divisor", 1) or 1))
     try:
         perm = client.get_permission() or {}
@@ -276,11 +290,50 @@ def resolve_max_concurrent(settings, client) -> int:
     return max(1, settings.max_concurrent_fallback // divisor)
 
 
+def _probe_capacity_async(upstream: "WebUpstream", settings) -> None:
+    """后台探账号额度，探到就**补许可**（只放宽）。
+
+    为什么要 `begin_submit`/`end_submit` 包着：探测线程握着这个 client，而
+    `WebUpstream.idle` 的判据是"闸门没在跑 **且** 没有在飞提交" —— 不登记的话，
+    多账号透传缓存恰好满时，这个刚建好还在探测的 client 可能被判空闲并 close，
+    探测就会莫名其妙地失败（现象是"偶发没有额度日志"）。
+    """
+    def run() -> None:
+        upstream.begin_submit()
+        try:
+            perm = upstream.client.get_permission() or {}
+            n = int(perm.get("maxQueueLength") or 0)
+            plan = perm.get("planName") or "?"
+            if n <= 0:
+                logger.warning(
+                    "后台额度探测：读不到 maxQueueLength（planName={}）⇒ 保持 {} 槽",
+                    plan, upstream.queue.max_concurrent,
+                )
+                return
+            divisor = max(1, int(getattr(settings, "concurrency_divisor", 1) or 1))
+            slots = max(1, n // divisor)
+            final = upstream.queue.raise_capacity(slots)
+            logger.info(
+                "后台额度探测完成：额度 {} ÷ {} worker ⇒ {} 槽（planName={}），闸门现为 {} 槽",
+                n, divisor, slots, plan, final,
+            )
+        except Exception as e:  # noqa: BLE001 探测失败不能影响服务
+            logger.warning(
+                "后台额度探测失败（{}: {}）⇒ 保持 {} 槽",
+                type(e).__name__, e, upstream.queue.max_concurrent,
+            )
+        finally:
+            upstream.end_submit()
+
+    threading.Thread(target=run, name="avm-perm-probe", daemon=True).start()
+
+
 def _build_web(
     settings,
     log: Callable[[str], None] | None = None,
     *,
     cookie: str | None = None,
+    probe_concurrency: bool = True,
 ) -> WebUpstream:
     """建一个 web 上游。`cookie=None` 用本进程自己那份（AVM_COOKIE）。
 
@@ -323,7 +376,7 @@ def _build_web(
     )
     queue = WebSubmitQueue(
         client,
-        max_concurrent=resolve_max_concurrent(settings, client),
+        max_concurrent=resolve_max_concurrent(settings, client, probe=probe_concurrency),
         poll_interval=settings.poll_interval,
         # 闸门盯梢（轮询）的总时限，此前只能吃构造默认值 3600
         watch_timeout=settings.watch_timeout,
@@ -359,4 +412,8 @@ def build_web_for_cookie(settings, cookie: str, log: Callable[[str], None] | Non
     就是不同账号。已知限制仍是「同一 cookie 的 2 个槽位是进程内状态」⇒
     多 worker 下同一账号可能同时跑 2×worker 个（见 gunicorn_conf 的说明）。
     """
-    return _build_web(settings, log, cookie=cookie)
+    upstream = _build_web(settings, log, cookie=cookie, probe_concurrency=False)
+    # 只有"要自动探测额度"时才需要补：显式配了 `AVM_MAX_CONCURRENT>0` 的部署额度是已知的
+    if settings.max_concurrent == 0:
+        _probe_capacity_async(upstream, settings)
+    return upstream

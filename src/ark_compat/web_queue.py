@@ -59,6 +59,27 @@ class WebSubmitQueue:
         self.delayed = 0
         self.rejected = 0
 
+    def raise_capacity(self, target: int) -> int:
+        """把并发容量**只往上**调到 `target`，返回最终容量（2026-10-21）。
+
+        用途：透传建实例时不再同步探测账号额度（那一次上游往返把"受理即返"从毫秒
+        拖到 3s），改成先用 fallback 建好闸门立即服务，后台探到额度再**补许可**。
+
+        为什么只放宽、不收紧：
+          · `threading.Semaphore` 没有缩容 API；
+          · 收紧会把已经在跑的任务卡在"额度之外"（它们跑完才释放，期间新任务全等）；
+          · 放宽的最坏后果是上游多接一两个任务 ⇒ 它回 `queue is full`，而我们已经有
+            退避重试兜底（`web_client.retryable_submit_error`）。方向是安全的。
+        """
+        with self._lock:
+            target = max(1, int(target))
+            if target <= self.max_concurrent:
+                return self.max_concurrent
+            for _ in range(target - self.max_concurrent):
+                self._sem.release()
+            self.max_concurrent = target
+            return target
+
     def stats(self) -> dict:
         with self._lock:
             running = list(self._running)

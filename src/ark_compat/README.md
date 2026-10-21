@@ -985,6 +985,8 @@ tests/                       # 见下；`python3 -m unittest discover -s tests`
 │                           读超时与内容审核绝不重发 —— 这条线没有幂等键，判错一边就是重复扣费
 ├── test_submit_speedup.py   提交提速（2026-10-21）：minter 自适应 `?reserve=N`（提前过 CF）、
 │                           闸门探测短缓存 + 空 taskId 强制真探、转存并发与并行预热
+├── test_accept_fast.py      「受理即返」（2026-10-21）：透传**新凭据首条**不再同步等额度探测
+│                           （改后台补许可，`raise_capacity` 只放宽不收紧）
 ├── test_pool_metrics.py     号池指标（凭据原文绝不进遥测，含变异测试）
 ├── test_token_minter.py     铸造服务接线（取不到 token 就如实失败）
 ├── test_minter_chrome_guard.py 铸造器 Chrome 生命周期守卫（绝不叠实例）

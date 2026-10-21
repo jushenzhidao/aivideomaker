@@ -36,6 +36,7 @@
 
 import json
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -352,6 +353,17 @@ class TestJudgement(ChargedTaskCase):
         self.assertEqual(span_attrs["status"], "running")
         self.assertTrue(span_attrs["paid"], "站点记录里已是 paid=true，只是还没进终态")
 
+        # 🔴 **收尾：把站点记录推到终态，让闸门 watcher 退出来**（2026-10-21 实测的 flaky）。
+        #    这条用例的站点记录是 `processing` ⇒ `wait_for_task` 会一直轮询（上限 3600s）。
+        #    测试结束了它还在跑，于是**在后续用例里继续 count_poll** ⇒ 别人的指标断言
+        #    多出一条 `avm.task.poll_requests{status=running, source=watcher}`
+        #    （受害者是 `test_nothing_is_reported_when_logfire_is_down`，偶发红）。
+        self.site.set("model.getModel", site_task(taskStatus="succeed"))
+        for _ in range(300):
+            if self.app.state.upstreams["web"].queue.stats()["running"] == 0:
+                break
+            time.sleep(0.01)
+
     def test_repeat_polling_reports_once(self):
         """同状态重复轮询**不重复上报** —— 判据是同一道产生层闸门（`PollReportGate`）。"""
         tid = self.post_ark()
@@ -414,6 +426,12 @@ class TestJudgement(ChargedTaskCase):
         tid = self.post_ark()
         self.site.set("model.getModel", site_task(paid=True))
         self.assertEqual(self.poll_ark(tid).status_code, 200)
+        # ★ 等闸门 watcher 跑完**再**翻开关：它也是本服务的一部分，若在开关翻回来之后
+        #   才 count_poll，就会被误判成"Logfire 关的时候还在上报"（实测 flaky）。
+        for _ in range(300):
+            if self.app.state.upstreams["web"].queue.stats()["running"] == 0:
+                break
+            time.sleep(0.01)
         O._LOGFIRE_READY = True
 
         self.assertEqual(self.points(), [], "Logfire 没装配时不该产生任何指标")
