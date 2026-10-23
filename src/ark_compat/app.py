@@ -243,10 +243,50 @@ _CONTENT_REJECTION_MARKERS = (
 )
 
 
+#: 内容审核的**上游原话**（2026-10-23 起随响应透传）。
+#: 🔴 只透传这**两句话**，不透传整个 `str(e)`：后者形如 `ai.minimaxH3: Prompt or
+#: Image Sensitive`，前缀是站点内部 procedure 名（= 上游槽位 = 模型路由细节），
+#: 属于`_upstream_client_message` 那套脱敏纪律要挡掉的东西。
+#: 键是**小写匹配子串**，值是对外原话（保留上游的大小写与措辞）。
+_CONTENT_REJECTION_QUOTES = {
+    "prompt or image sensitive": "Prompt or Image Sensitive",
+    "flagged by a content checker": (
+        "The content could not be processed because it contained material flagged by a content checker."
+    ),
+}
+
+
+def _content_rejection_quote(e: BaseException) -> str:
+    """审核类错误的**上游原话**；不是审核/认不出 ⇒ 空串（调用方退回通用句）。"""
+    blob = str(e).lower()
+    for marker, quote in _CONTENT_REJECTION_QUOTES.items():
+        if marker in blob:
+            return quote
+    return ""
+
+
 def _is_content_rejected(e: WebApiError) -> bool:
     """上游因内容策略拒绝本条（**非服务故障**，重试无用）。"""
     blob = str(e).lower()
     return any(marker in blob for marker in _CONTENT_REJECTION_MARKERS)
+
+
+def _submission_patch_fields(e: BaseException) -> dict:
+    """提交失败的**可区分事实**（写回任务记录，供轮询路径组装 `error`）。
+
+    写回两个键：
+      · `submit_error_code`  —— 对外码：审核 = `ContentFiltered`，其余 = `SubmissionFailed`
+        （保持原值 ⇒ 老调用方零感知；新增的只有"审核"这一种值）；
+      · `submit_error_quote` —— 仅审核时非空 = **上游原话**（见 `_CONTENT_REJECTION_QUOTES`）。
+
+    ⚠️ 只有一个对外 `code` 值会让下游无法判断"该不该重试" —— 生产实测（2026-10-23）：
+    59 条审核失败里有 **34 次是调用方盲目重发**（同一条重发 10 次），把失败率从 6.6%
+    抬到 15.7%。`ContentFiltered` 就是给下游的那个"别再试了"的信号。
+    """
+    quote = _content_rejection_quote(e)
+    if quote:
+        return {"submit_error_code": CONTENT_FILTERED_CODE, "submit_error_quote": quote}
+    return {"submit_error_code": SUBMISSION_FAILED_CODE}
 
 
 def _web_http_for(e: WebApiError) -> int:
@@ -467,6 +507,10 @@ _SUBMIT_LEASE_SECONDS = 1200.0
 #: 提交失败时对外给的**错误码**（方舟线查询的 `error.code`）。自造白名单值 ——
 #: 上游原文 code 一律不透传（见 errors.py 的 code 纪律），这里是"我们的"归纳。
 SUBMISSION_FAILED_CODE = "SubmissionFailed"
+#: 内容审核的对外码（2026-10-23 用户口径「上游错误透传一下 尤其是内容审核」）。
+#: 用 `ContentFiltered` 而不是自造新词 —— **同步路径早就用它**（`_web_code_for`），
+#: 下游只要认一个码，不必区分"POST 上拒"还是"轮询里拒"。
+CONTENT_FILTERED_CODE = "ContentFiltered"
 #: 提交失败时对外给的**脱敏通用句**（与 `_upstream_client_message` 同一条纪律）。
 #: 完整归因留在记录的 `submit_error` 里（日志 / span 可查）。
 SUBMISSION_FAILED_MESSAGE = "the task could not be submitted to the upstream"
@@ -1358,7 +1402,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     body=body, request=request, async_accept=True,
                 )
             except BaseException as e:  # noqa: BLE001 与后台路径同一份写回
-                request.app.state.tasks.patch(entry["id"], submit_error=describe_error(e))
+                request.app.state.tasks.patch(
+                    entry["id"], submit_error=describe_error(e), **_submission_patch_fields(e)
+                )
                 if is_ark_line:
                     # 方舟线：还原旧契约 —— 让调用方在 POST 上当场看到
                     raise
@@ -1379,7 +1425,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except BaseException as e:  # noqa: BLE001 后台线程不许死得无声无息
                 err = describe_error(e)
                 logger.error("后台提交失败 ark_id={} — {}", entry_id, err)
-                request.app.state.tasks.patch(entry_id, submit_error=err)
+                request.app.state.tasks.patch(
+                    entry_id, submit_error=err, **_submission_patch_fields(e)
+                )
                 return
             finally:
                 # 🔴 契约：`_submit_ark` 里 `begin_submit()` 记账，这里（两条路径各自）
@@ -1782,10 +1830,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 #    （受理分离推广到方舟线后这条路径的流量大涨，故一并修正）。
                 #    `code` 走**自造白名单**（上游原文 code 一律不透传，见 errors.py）；
                 #    `openai_task_view` 的六字段契约不带 error ⇒ 这句只服务方舟线的查询。
-                stub["error"] = {
-                    "code": SUBMISSION_FAILED_CODE,
-                    "message": SUBMISSION_FAILED_MESSAGE,
-                }
+                # ★ 2026-10-23：**有区分地**透传（用户口径「上游错误透传一下 尤其是内容审核」）
+                #   · 审核 ⇒ `code=ContentFiltered` + **上游原话**（"Prompt or Image Sensitive"
+                #     / "…flagged by a content checker."）—— 调用方据此换素材/文案，且**不该重试**；
+                #   · 其余 ⇒ 保持 `SubmissionFailed` + 通用句（原文里含 procedure / 铸造主机 /
+                #     上游域名，那些仍在 `submit_error` 与 trace 里，不进对外响应）。
+                #   ⚠️ 老记录没有 `submit_error_code` ⇒ 回落到旧行为（不猜）。
+                code = str(entry.get("submit_error_code") or SUBMISSION_FAILED_CODE)
+                quote = str(entry.get("submit_error_quote") or "")
+                if code == CONTENT_FILTERED_CODE and quote:
+                    message = (
+                        f"the upstream rejected this input on content grounds — {quote} "
+                        f"(adjust the prompt or the reference media; repeating the same request "
+                        f"will fail again)"
+                    )
+                else:
+                    code = SUBMISSION_FAILED_CODE
+                    message = SUBMISSION_FAILED_MESSAGE
+                stub["error"] = {"code": code, "message": message}
             return _with_internal_evidence(stub, entry)
         # 先看节流缓存：非终态 TTL 内复用、终态永久复用 —— 轮询的请求量不能
         # 原样打到上游（429 的主要来源，任务出片要 ~60s）。

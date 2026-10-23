@@ -173,9 +173,16 @@ credential 管**上游解析**，两者用途不同、互不替代。
   信息，不是"不知道"）。任务还在跑时，响应可能就只有 `{"status": "queued", "error": null}`
   —— 那是**正确**的，不是字段漏了。
 - 🔴 **提交失败**（受理分离之后才有的一种终态）：`status` 为 `failed`，`error` 是**对象**
-  `{"code": "SubmissionFailed", "message": "<脱敏通用句>"}` —— `code` 是我们的**自造白名单**
-  （上游原文 code 一律不透传，见 `errors.py`），`message` 与 `_upstream_client_message` 同一条
-  脱敏纪律；**完整归因只在日志与 span**（记录的 `submit_error`）。
+  `{"code": ..., "message": ...}`，`code` 是我们的**自造白名单**（上游原文 code 一律不透传，
+  见 `errors.py`）。两种取值（2026-10-23 起）：
+  - **内容审核** ⇒ `code="ContentFiltered"`，`message` **透传上游原话**
+    （`Prompt or Image Sensitive` / `…flagged by a content checker.`）+ 一句"换素材、重试无用"。
+    只透传这两句话、**不含 procedure 前缀**（`ai.minimaxH3:` 是站点内部路由细节）。
+    存在理由：生产实测 59 条审核失败里 **34 次是调用方盲目重发**，它们需要一个能据以
+    "不再重试"的信号；`ContentFiltered` 与**同步路径早就用的那个码**是同一个。
+  - **其它失败** ⇒ `code="SubmissionFailed"` + 通用句（原文含 procedure / 铸造主机 / 上游域名，
+    那些仍只在 `submit_error` 与 trace 里）。
+  **完整归因始终只在日志与 span**（记录的 `submit_error`）。
   ⚠️ 早先这里给的是**裸字符串**，会被出口白名单（`ark_task_view` 对非 Mapping 的值）丢成
   `null` ⇒ "提交失败"只剩 `status=failed`、一句原因都没有；2026-10-12 随方舟线并入受理分离时修。
 - 🔴 `duration` 是 **integer**。站点任务记录里它是**字符串** `"5"` —— 原样透传会让官方
@@ -370,7 +377,7 @@ status 词表：`queued` / `in_progress` / `completed` / `failed`；`progress` �
 |---|---|
 | 受理 | **先落库再返回**：记录在受理时就有了（含凭据绑定），`GET` 立即可查，未提交阶段给 `queued` |
 | 上游侧失败 | 🔴 **不再在 POST 上报错**（旧行为：429 / 502 同步返回）—— 记录转 `failed`，由调用方轮询看到终态；完整归因只在日志与 span。⚠️ **对方舟线是契约变更**：此前 POST 返回时"上游受理已成功/失败当场可知" |
-| 提交失败原因（方舟线） | `error` 是**对象** `{"code":"SubmissionFailed","message":"…"}`；`code` 自造白名单，message 脱敏通用句 |
+| 提交失败原因（方舟线） | `error` 是**对象**：审核 ⇒ `{"code":"ContentFiltered","message":"<上游原话+行动项>"}`；其它 ⇒ `{"code":"SubmissionFailed","message":"<脱敏通用句>"}`。`code` 自造白名单 |
 | 提交失败原因（`/v1/videos`） | **不出响应体**（六字段契约没这个键）；内部归因落在 `submit_error`（日志/span） |
 | 提交线程死了 | 提交**租约** `_SUBMIT_LEASE_SECONDS`（1200s，覆盖最坏 转存 120 + 等槽位 600 + 铸 45）超时仍未提交 ⇒ 轮询判定并标 `failed`，不会永远 queued（**两条线同一套判定**） |
 | 未提交阶段轮询 | **零上游调用**（拿空 taskId 打上游只会得到错误空壳，还会凭空制造假跃迁） |
